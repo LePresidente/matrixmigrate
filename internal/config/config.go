@@ -52,6 +52,16 @@ type MatrixConfig struct {
 	RateLimit  RateLimitConfig  `mapstructure:"rate_limit"`  // Rate limiting configuration
 	AppService AppServiceConfig `mapstructure:"appservice"`  // Application Service for message import
 	MAS        MASConfig        `mapstructure:"mas"`        // Matrix Authentication Service for user creation
+	Import     ImportConfig     `mapstructure:"import"`     // Room/space import options (owner and alias)
+}
+
+// ImportConfig holds options for importing rooms and spaces from Mattermost
+type ImportConfig struct {
+	// PreserveOwnerAndAlias: set room/space owner from Mattermost creator_id and set local alias (team+name)
+	PreserveOwnerAndAlias bool `mapstructure:"preserve_owner_and_alias"`
+	// FallbackRoomCreator: Matrix localpart (username before :domain) when creator_id is empty.
+	// If this user does not exist on the server, the admin account (auth.username) is used.
+	FallbackRoomCreator string `mapstructure:"fallback_room_creator"`
 }
 
 // MASConfig holds Matrix Authentication Service configuration

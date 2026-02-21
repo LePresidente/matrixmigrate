@@ -351,9 +351,15 @@ hs_token: "YOUR_GENERATED_HS_TOKEN"
 sender_localpart: matrixmigrate
 rate_limited: false  # Disable rate limiting for AS
 namespaces:
-  users: []
-  rooms: []
-  aliases: []
+  users:
+    - exclusive: false
+      regex: "@.*:example\\.com"   # Replace example.com with your homeserver domain
+  rooms:
+    - exclusive: false
+      regex: "!.*:example\\.com"
+  aliases:
+    - exclusive: true
+      regex: "#.*:example\\.com"   # Required for room/space aliases when preserve_owner_and_alias is enabled
 ```
 
 ### Step 3: Register with Synapse

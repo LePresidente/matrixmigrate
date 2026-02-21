@@ -103,11 +103,14 @@ matrix:
     # Default: 2000 (2 seconds)
     retry_base_delay_ms: 2000
   
-  # Application Service configuration (required for message import with timestamps)
-  # See appservice-registration.example.yaml for setup instructions
+  # Application Service configuration (required for message import with timestamps and room creator/alias)
+  # See appservice-registration.example.yaml and README for setup instructions.
+  # For preserve_owner_and_alias you must set in the AS registration:
+  #   namespaces.aliases: [ { exclusive: true, regex: "#.*:your\\.domain\\.com" } ]
+  # (replace your.domain.com with your homeserver domain)
   appservice:
-    # Enable Application Service mode for message import
-    # This allows importing messages with their original timestamps
+    # Enable Application Service mode for message import and for room/space creator + alias
+    # This allows importing messages with their original timestamps and creating rooms as the actual owner
     enabled: false
     
     # Environment variable containing the AS token
@@ -116,6 +119,18 @@ matrix:
     
     # Environment variable containing the HS token (optional)
     # hs_token_env: "MATRIX_HS_TOKEN"
+
+  # Room/space import: preserve Mattermost owner and set local room address (team+name)
+  import:
+    # When true, rooms and spaces get: owner from channel/team creator_id (or fallback), alias = team+name
+    preserve_owner_and_alias: false
+    # When creator_id is empty, use this Matrix username (localpart only, e.g. "admin" -> @admin:domain).
+    # If this user does not exist, the admin account (auth.username) is used.
+    # fallback_room_creator: "admin"
+    # For the room creator to be the actual user (not the AS admin), enable appservice above and set as_token_env.
+    # In your Application Service registration you must include an alias namespace, e.g.:
+    #   aliases: [ { exclusive: true, regex: "#.*:domain\\.com" } ]
+    # If you get M_EXCLUSIVE, the tool will retry without alias so migration continues.
 
   # Matrix Authentication Service (MAS) - use MAS for user creation instead of Synapse
   # When enabled, users are created via MAS Admin API so they can log in via SSO/OAuth

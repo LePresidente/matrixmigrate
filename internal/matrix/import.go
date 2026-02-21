@@ -3,10 +3,41 @@ package matrix
 import (
 	"fmt"
 	"strings"
+	"unicode"
 
 	"github.com/aligundogdu/matrixmigrate/internal/logger"
 	"github.com/aligundogdu/matrixmigrate/internal/mattermost"
 )
+
+// RoomImportOptions configures owner and alias when importing rooms/spaces from Mattermost.
+// When PreserveOwnerAndAlias is true, rooms get a local alias (team+name) and owner from creator_id or fallback.
+type RoomImportOptions struct {
+	PreserveOwnerAndAlias bool   // Enable setting owner and room_alias_name from Mattermost data
+	FallbackCreator       string // Matrix localpart when creator_id is empty (e.g. "admin")
+	AdminUserID           string // Full Matrix user ID used when fallback user does not exist
+}
+
+// sanitizeAliasLocalpart returns a Matrix room alias localpart (allowed: 0-9a-zA-Z._=-).
+func sanitizeAliasLocalpart(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if r == '.' || r == '_' || r == '=' || r == '-' || unicode.IsLetter(r) || unicode.IsNumber(r) {
+			b.WriteRune(r)
+		} else if r == ' ' || r == '/' || r == '+' {
+			b.WriteRune('_')
+		}
+	}
+	// Collapse multiple underscores and trim
+	out := b.String()
+	for strings.Contains(out, "__") {
+		out = strings.ReplaceAll(out, "__", "_")
+	}
+	out = strings.Trim(out, "_")
+	if out == "" {
+		out = "room"
+	}
+	return out
+}
 
 // Importer handles importing data to Matrix
 type Importer struct {
@@ -123,11 +154,46 @@ func (i *Importer) ImportUsers(users []mattermost.User, existingMapping map[stri
 	return mapping, stats, nil
 }
 
-// ImportTeamsAsSpaces imports teams from Mattermost as Matrix spaces
-func (i *Importer) ImportTeamsAsSpaces(teams []mattermost.Team, existingMapping map[string]string, progress ImportProgressCallback) (map[string]string, *ImportStats, error) {
+// resolveRoomOwner returns the Matrix user ID to use as room/space owner.
+// Prefer creatorID from mapping; if empty use fallback localpart (if that user exists), else adminUserID.
+func (i *Importer) resolveRoomOwner(mattermostCreatorID string, userMapping map[string]string, opts *RoomImportOptions) string {
+	if opts == nil || !opts.PreserveOwnerAndAlias {
+		return ""
+	}
+	if mattermostCreatorID != "" {
+		if mxID, ok := userMapping[mattermostCreatorID]; ok && mxID != "" {
+			logger.Info("resolveRoomOwner: mattermost creator_id %s -> %s (from user mapping)", mattermostCreatorID, mxID)
+			return mxID
+		}
+		logger.Info("resolveRoomOwner: creator_id %q not in user mapping or empty; trying fallback", mattermostCreatorID)
+	}
+	// No creator_id or not in mapping: use fallback localpart
+	if opts.FallbackCreator != "" {
+		fallbackID := i.client.FormatUserID(opts.FallbackCreator)
+		exists, err := i.client.UserExists(opts.FallbackCreator)
+		if err != nil {
+			logger.Warn("resolveRoomOwner: fallback user %s exists check failed: %v; using admin", opts.FallbackCreator, err)
+		} else if exists {
+			logger.Info("resolveRoomOwner: using fallback_room_creator %s -> %s", opts.FallbackCreator, fallbackID)
+			return fallbackID
+		} else {
+			logger.Info("resolveRoomOwner: fallback user %s does not exist on server; using admin %s", opts.FallbackCreator, opts.AdminUserID)
+		}
+	}
+	logger.Info("resolveRoomOwner: using admin user %s", opts.AdminUserID)
+	return opts.AdminUserID
+}
+
+// ImportTeamsAsSpaces imports teams from Mattermost as Matrix spaces.
+// When opts.PreserveOwnerAndAlias is true, each space gets alias from team name and owner from opts (teams have no creator_id).
+func (i *Importer) ImportTeamsAsSpaces(teams []mattermost.Team, existingMapping map[string]string, userMapping map[string]string, opts *RoomImportOptions, progress ImportProgressCallback) (map[string]string, *ImportStats, error) {
 	mapping := make(map[string]string)
 	stats := &ImportStats{}
 	total := len(teams)
+
+	if opts != nil && opts.PreserveOwnerAndAlias {
+		logger.Info("ImportTeamsAsSpaces: preserve_owner_and_alias enabled; spaces will get alias from team name, owner from fallback or admin")
+	}
 
 	// Copy existing mappings
 	for k, v := range existingMapping {
@@ -152,8 +218,15 @@ func (i *Importer) ImportTeamsAsSpaces(teams []mattermost.Team, existingMapping 
 			continue
 		}
 
+		var roomAlias, owner string
+		if opts != nil && opts.PreserveOwnerAndAlias {
+			roomAlias = sanitizeAliasLocalpart(team.Name)
+			owner = i.resolveRoomOwner("", userMapping, opts) // teams have no creator_id
+			logger.Info("Space '%s' (team %s): alias=%q owner=%s (teams have no creator_id)", team.DisplayName, team.Name, roomAlias, owner)
+		}
+
 		// Create space
-		resp, err := i.client.CreateSpace(team.DisplayName, team.Description, team.IsOpen())
+		resp, err := i.client.CreateSpace(team.DisplayName, team.Description, team.IsOpen(), roomAlias, owner)
 		if err != nil {
 			logger.Error("Failed to create space '%s': %v", team.DisplayName, err)
 			stats.SpacesFailed++
@@ -168,11 +241,62 @@ func (i *Importer) ImportTeamsAsSpaces(teams []mattermost.Team, existingMapping 
 	return mapping, stats, nil
 }
 
-// ImportChannelsAsRooms imports channels from Mattermost as Matrix rooms
-func (i *Importer) ImportChannelsAsRooms(channels []mattermost.Channel, existingMapping map[string]string, progress ImportProgressCallback) (map[string]string, *ImportStats, error) {
+// firstMemberFromGroupDisplayName returns the Matrix user ID for the first *enabled* member in a group channel's display_name (e.g. "user1, user2, user3").
+// Tries each comma-separated name in order; skips deleted/disabled users and uses the next name.
+func firstMemberFromGroupDisplayName(displayName string, users []mattermost.User, userMapping map[string]string) string {
+	parts := strings.Split(displayName, ",")
+	for _, part := range parts {
+		token := strings.TrimSpace(part)
+		if token == "" {
+			continue
+		}
+		mxID := resolveTokenToMatrixID(token, users, userMapping)
+		if mxID != "" {
+			return mxID
+		}
+	}
+	return ""
+}
+
+// resolveTokenToMatrixID resolves a single token (username or display name) to a Matrix user ID.
+// Only returns a user that is not deleted and is in userMapping.
+func resolveTokenToMatrixID(token string, users []mattermost.User, userMapping map[string]string) string {
+	tokenLower := strings.ToLower(token)
+	normalized := strings.ToLower(strings.ReplaceAll(token, " ", "_"))
+
+	for _, u := range users {
+		if u.IsDeleted() {
+			continue
+		}
+		if mxID, ok := userMapping[u.ID]; !ok || mxID == "" {
+			continue
+		}
+		if u.Username == token || strings.ToLower(u.Username) == tokenLower || strings.ToLower(u.Username) == normalized {
+			return userMapping[u.ID]
+		}
+		display := strings.TrimSpace(u.FirstName + " " + u.LastName)
+		if display != "" && (display == token || strings.EqualFold(display, token)) {
+			return userMapping[u.ID]
+		}
+		if u.Nickname != "" && (u.Nickname == token || strings.EqualFold(u.Nickname, token)) {
+			return userMapping[u.ID]
+		}
+	}
+	return ""
+}
+
+// ImportChannelsAsRooms imports channels from Mattermost as Matrix rooms.
+// teamByID maps Mattermost team ID to Team (for alias and name); can be nil if opts.PreserveOwnerAndAlias is false.
+// users is used to build username->MatrixID map for group channel (type G) creator when creator_id is empty.
+// When opts.PreserveOwnerAndAlias is true, each room gets alias teamname-channelname and owner from channel.CreatorID or fallback (or first member for group channels).
+func (i *Importer) ImportChannelsAsRooms(channels []mattermost.Channel, existingMapping map[string]string, teamByID map[string]mattermost.Team, users []mattermost.User, userMapping map[string]string, opts *RoomImportOptions, progress ImportProgressCallback) (map[string]string, *ImportStats, error) {
 	mapping := make(map[string]string)
 	stats := &ImportStats{}
 	total := len(channels)
+
+	if opts != nil && opts.PreserveOwnerAndAlias && teamByID != nil {
+		logger.Info("ImportChannelsAsRooms: preserve_owner_and_alias enabled; rooms will get alias team+channel, owner from creator_id or first member (group) or fallback or admin")
+	}
 
 	// Copy existing mappings
 	for k, v := range existingMapping {
@@ -203,13 +327,35 @@ func (i *Importer) ImportChannelsAsRooms(channels []mattermost.Channel, existing
 			continue
 		}
 
-		// Create room
 		topic := channel.Purpose
 		if topic == "" {
 			topic = channel.Header
 		}
 
-		resp, err := i.client.CreateRegularRoom(channel.DisplayName, topic, channel.IsPublic())
+		var roomAlias, owner string
+		if opts != nil && opts.PreserveOwnerAndAlias && teamByID != nil {
+			if team, ok := teamByID[channel.TeamID]; ok {
+				roomAlias = sanitizeAliasLocalpart(team.Name + "-" + channel.Name)
+			} else {
+				roomAlias = sanitizeAliasLocalpart(channel.Name)
+			}
+			// Group channels (type G) often have empty creator_id; use first member from display_name as creator
+			if channel.IsGroup() && channel.CreatorID == "" {
+				owner = firstMemberFromGroupDisplayName(channel.DisplayName, users, userMapping)
+				if owner != "" {
+					logger.Info("Room '%s' (group channel): alias=%q owner=%s (first member from display_name)", channel.DisplayName, roomAlias, owner)
+				} else {
+					logger.Warn("Room '%s' (group channel): could not resolve any member (all may be disabled or not in mapping) from display_name %q; using fallback", channel.DisplayName, channel.DisplayName)
+					owner = i.resolveRoomOwner("", userMapping, opts)
+					logger.Info("Room '%s' (group channel): alias=%q owner=%s (fallback)", channel.DisplayName, roomAlias, owner)
+				}
+			} else {
+				owner = i.resolveRoomOwner(channel.CreatorID, userMapping, opts)
+				logger.Info("Room '%s' (channel %s): alias=%q owner=%s creator_id=%q", channel.DisplayName, channel.Name, roomAlias, owner, channel.CreatorID)
+			}
+		}
+
+		resp, err := i.client.CreateRegularRoom(channel.DisplayName, topic, channel.IsPublic(), roomAlias, owner)
 		if err != nil {
 			logger.Error("Failed to create room '%s': %v", channel.DisplayName, err)
 			stats.RoomsFailed++
@@ -282,8 +428,11 @@ func (i *Importer) ApplyTeamMemberships(
 	return stats, nil
 }
 
-// ApplyChannelMemberships invites users to rooms based on channel memberships
+// ApplyChannelMemberships invites users to rooms based on channel memberships.
+// For group channels (type G), after inviting all members we set equal power levels (50) for everyone to match Mattermost.
+// channels is used to identify group channels; can be nil (then no equal power levels are set).
 func (i *Importer) ApplyChannelMemberships(
+	channels []mattermost.Channel,
 	memberships []mattermost.ChannelMember,
 	userMapping map[string]string,
 	roomMapping map[string]string,
@@ -291,6 +440,16 @@ func (i *Importer) ApplyChannelMemberships(
 ) (*ImportStats, error) {
 	stats := &ImportStats{}
 	total := len(memberships)
+
+	groupChannelIDs := make(map[string]bool)
+	for _, ch := range channels {
+		if ch.IsGroup() {
+			groupChannelIDs[ch.ID] = true
+		}
+	}
+
+	// Per group-channel room ID, collect Matrix user IDs that were added (for equal power levels later)
+	groupRoomMembers := make(map[string][]string)
 
 	logger.Info("Starting channel membership import: %d memberships to process", total)
 
@@ -316,6 +475,10 @@ func (i *Importer) ApplyChannelMemberships(
 
 		logger.Info("Channel membership %d/%d: inviting %s to room %s", idx+1, total, userID, roomID)
 
+		if groupChannelIDs[membership.ChannelID] {
+			groupRoomMembers[roomID] = append(groupRoomMembers[roomID], userID)
+		}
+
 		// Invite user to room
 		if err := i.client.InviteUser(roomID, userID); err != nil {
 			logger.Error("Channel membership %d/%d failed: %s -> %s: %v", idx+1, total, userID, roomID, err)
@@ -327,7 +490,23 @@ func (i *Importer) ApplyChannelMemberships(
 		stats.MembersAdded++
 	}
 
-	logger.Info("Channel membership import completed: added=%d, skipped=%d, failed=%d", 
+	// For group channels, set equal power levels (50) for all members to match Mattermost
+	for roomID, memberIDs := range groupRoomMembers {
+		if len(memberIDs) == 0 {
+			continue
+		}
+		userLevels := make(map[string]int)
+		for _, u := range memberIDs {
+			userLevels[u] = 50
+		}
+		if err := i.client.SetPowerLevelsBulk(roomID, userLevels); err != nil {
+			logger.Warn("ApplyChannelMemberships: could not set equal power levels for group room %s: %v", roomID, err)
+		} else {
+			logger.Info("ApplyChannelMemberships: set equal power level 50 for %d members in group room %s", len(memberIDs), roomID)
+		}
+	}
+
+	logger.Info("Channel membership import completed: added=%d, skipped=%d, failed=%d",
 		stats.MembersAdded, stats.MembersSkipped, stats.MembersFailed)
 
 	return stats, nil
@@ -396,15 +575,16 @@ type ExistingMappings struct {
 	Rooms    map[string]string
 }
 
-// ImportAssets imports all assets (users, teams as spaces, channels as rooms)
-// If existingMappings is provided, already imported items will be skipped
-func (i *Importer) ImportAssets(assets *mattermost.Assets, existingMappings *ExistingMappings, progress ImportProgressCallback) (*ImportAssetsResult, error) {
+// ImportAssets imports all assets (users, teams as spaces, channels as rooms).
+// If existingMappings is provided, already imported items will be skipped.
+// roomOpts configures owner and local alias for rooms/spaces when PreserveOwnerAndAlias is true.
+func (i *Importer) ImportAssets(assets *mattermost.Assets, existingMappings *ExistingMappings, roomOpts *RoomImportOptions, progress ImportProgressCallback) (*ImportAssetsResult, error) {
 	result := &ImportAssetsResult{
 		Stats: &ImportStats{},
 	}
 
 	logger.Info("=== ImportAssets Started ===")
-	logger.Info("Assets to import: %d users, %d teams, %d channels", 
+	logger.Info("Assets to import: %d users, %d teams, %d channels",
 		len(assets.Users), len(assets.Teams), len(assets.Channels))
 
 	// Initialize empty mappings if not provided
@@ -434,8 +614,8 @@ func (i *Importer) ImportAssets(assets *mattermost.Assets, existingMappings *Exi
 	logger.Info("User import completed: created=%d, skipped=%d, failed=%d",
 		userStats.UsersCreated, userStats.UsersSkipped, userStats.UsersFailed)
 
-	// Import teams as spaces
-	spaceMapping, spaceStats, err := i.ImportTeamsAsSpaces(assets.Teams, existingMappings.Spaces, progress)
+	// Import teams as spaces (with optional owner and alias from roomOpts)
+	spaceMapping, spaceStats, err := i.ImportTeamsAsSpaces(assets.Teams, existingMappings.Spaces, userMapping, roomOpts, progress)
 	if err != nil {
 		return nil, fmt.Errorf("failed to import teams: %w", err)
 	}
@@ -444,8 +624,14 @@ func (i *Importer) ImportAssets(assets *mattermost.Assets, existingMappings *Exi
 	result.Stats.SpacesSkipped = spaceStats.SpacesSkipped
 	result.Stats.SpacesFailed = spaceStats.SpacesFailed
 
-	// Import channels as rooms
-	roomMapping, roomStats, err := i.ImportChannelsAsRooms(assets.Channels, existingMappings.Rooms, progress)
+	// Build teamByID for channel alias (team+name)
+	teamByID := make(map[string]mattermost.Team)
+	for _, t := range assets.Teams {
+		teamByID[t.ID] = t
+	}
+
+	// Import channels as rooms (with optional owner and alias from roomOpts; users used for group channel first-member)
+	roomMapping, roomStats, err := i.ImportChannelsAsRooms(assets.Channels, existingMappings.Rooms, teamByID, assets.Users, userMapping, roomOpts, progress)
 	if err != nil {
 		return nil, fmt.Errorf("failed to import channels: %w", err)
 	}

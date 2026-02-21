@@ -367,9 +367,28 @@ func (c *Client) UserExists(username string) (bool, error) {
 	return exists, nil
 }
 
-// CreateRoom creates a new room
+// CreateRoom creates a new room (as the authenticated user, i.e. admin or AS sender).
+// To create the room as a specific user (so they are the creator), use CreateRoomAsUser.
 func (c *Client) CreateRoom(req *CreateRoomRequest) (*CreateRoomResponse, error) {
-	body, statusCode, err := c.doRequest("POST", "/_matrix/client/v3/createRoom", req)
+	return c.CreateRoomAsUser(req, "")
+}
+
+// CreateRoomAsUser creates a new room. When creatorUserID is non-empty and an AS token is set,
+// the request is made with the AS token and ?user_id=creatorUserID so the room creator is that user.
+// Otherwise the room is created as the current authenticated user (admin).
+func (c *Client) CreateRoomAsUser(req *CreateRoomRequest, creatorUserID string) (*CreateRoomResponse, error) {
+	endpoint := "/_matrix/client/v3/createRoom"
+	token := c.adminToken
+	if creatorUserID != "" && c.asToken != "" {
+		token = c.asToken
+		params := url.Values{}
+		params.Set("user_id", creatorUserID)
+		endpoint = endpoint + "?" + params.Encode()
+		logger.Info("CreateRoom: using AS token with user_id=%s (room creator will be this user)", creatorUserID)
+	} else if creatorUserID != "" {
+		logger.Info("CreateRoom: no AS token; creating as admin then will invite and set power level for owner %s", creatorUserID)
+	}
+	body, statusCode, err := c.doRequestWithToken("POST", endpoint, req, token)
 	if err != nil {
 		return nil, err
 	}
@@ -386,8 +405,11 @@ func (c *Client) CreateRoom(req *CreateRoomRequest) (*CreateRoomResponse, error)
 	return &resp, nil
 }
 
-// CreateSpace creates a new space (a room with m.space type)
-func (c *Client) CreateSpace(name, topic string, public bool) (*CreateRoomResponse, error) {
+// CreateSpace creates a new space (a room with m.space type).
+// roomAliasLocalPart is optional; when set, the room gets #roomAliasLocalPart:homeserver.
+// ownerUserID is optional; when set, that user is the room creator (using AS token with user_id when available).
+// When appservice is enabled, the alias is sent; AS registration must include alias_namespaces for your domain.
+func (c *Client) CreateSpace(name, topic string, public bool, roomAliasLocalPart, ownerUserID string) (*CreateRoomResponse, error) {
 	visibility := VisibilityPrivate
 	preset := PresetPrivateChat
 	if public {
@@ -404,12 +426,41 @@ func (c *Client) CreateSpace(name, topic string, public bool) (*CreateRoomRespon
 			"type": SpaceType,
 		},
 	}
+	if roomAliasLocalPart != "" {
+		req.RoomAliasName = roomAliasLocalPart
+	}
 
-	return c.CreateRoom(req)
+	// When AS token is set and ownerUserID is set, create as that user so they are the actual creator.
+	// Otherwise create as admin and then invite/set power levels.
+	if ownerUserID != "" {
+		logger.Info("CreateSpace: name=%q alias=%q owner=%s", name, req.RoomAliasName, ownerUserID)
+	}
+	resp, err := c.CreateRoomAsUser(req, ownerUserID)
+	if err != nil && strings.Contains(err.Error(), "M_EXCLUSIVE") && req.RoomAliasName != "" {
+		logger.Warn("CreateSpace: M_EXCLUSIVE for alias %q (AS alias namespace may need exclusive: true or regex fix); retrying without alias", req.RoomAliasName)
+		reqNoAlias := *req
+		reqNoAlias.RoomAliasName = ""
+		resp, err = c.CreateRoomAsUser(&reqNoAlias, ownerUserID)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if ownerUserID != "" && !c.createdAsUser(ownerUserID) {
+		logger.Info("CreateSpace: room %s created as admin; inviting %s and setting power level 100", resp.RoomID, ownerUserID)
+		if err := c.ensureRoomOwner(resp.RoomID, ownerUserID); err != nil {
+			logger.Warn("CreateSpace: could not set room owner %s: %v", ownerUserID, err)
+		} else {
+			logger.Info("CreateSpace: owner %s invited and set to power level 100", ownerUserID)
+		}
+	}
+	return resp, nil
 }
 
-// CreateRegularRoom creates a regular room (not a space)
-func (c *Client) CreateRegularRoom(name, topic string, public bool) (*CreateRoomResponse, error) {
+// CreateRegularRoom creates a regular room (not a space).
+// roomAliasLocalPart is optional; when set, the room gets #roomAliasLocalPart:homeserver.
+// ownerUserID is optional; when set, that user is the room creator (using AS token with user_id when available).
+// When appservice is enabled, the alias is sent; AS registration must include alias_namespaces for your domain.
+func (c *Client) CreateRegularRoom(name, topic string, public bool, roomAliasLocalPart, ownerUserID string) (*CreateRoomResponse, error) {
 	visibility := VisibilityPrivate
 	preset := PresetPrivateChat
 	if public {
@@ -423,8 +474,120 @@ func (c *Client) CreateRegularRoom(name, topic string, public bool) (*CreateRoom
 		Visibility: string(visibility),
 		Preset:     string(preset),
 	}
+	if roomAliasLocalPart != "" {
+		req.RoomAliasName = roomAliasLocalPart
+	}
 
-	return c.CreateRoom(req)
+	// When AS token is set and ownerUserID is set, create as that user so they are the actual creator.
+	if ownerUserID != "" {
+		logger.Info("CreateRegularRoom: name=%q alias=%q owner=%s", name, req.RoomAliasName, ownerUserID)
+	}
+	resp, err := c.CreateRoomAsUser(req, ownerUserID)
+	if err != nil && strings.Contains(err.Error(), "M_EXCLUSIVE") && req.RoomAliasName != "" {
+		logger.Warn("CreateRegularRoom: M_EXCLUSIVE for alias %q (AS alias namespace may need exclusive: true or regex fix); retrying without alias", req.RoomAliasName)
+		reqNoAlias := *req
+		reqNoAlias.RoomAliasName = ""
+		resp, err = c.CreateRoomAsUser(&reqNoAlias, ownerUserID)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if ownerUserID != "" && !c.createdAsUser(ownerUserID) {
+		logger.Info("CreateRegularRoom: room %s created as admin; inviting %s and setting power level 100", resp.RoomID, ownerUserID)
+		if err := c.ensureRoomOwner(resp.RoomID, ownerUserID); err != nil {
+			logger.Warn("CreateRegularRoom: could not set room owner %s: %v", ownerUserID, err)
+		} else {
+			logger.Info("CreateRegularRoom: owner %s invited and set to power level 100", ownerUserID)
+		}
+	}
+	return resp, nil
+}
+
+// createdAsUser returns true if we would have created the room as the given user (AS token + user_id).
+func (c *Client) createdAsUser(ownerUserID string) bool {
+	return ownerUserID != "" && c.asToken != ""
+}
+
+// ensureRoomOwner invites ownerUserID to the room (if not already the sender) and sets their power level to 100.
+func (c *Client) ensureRoomOwner(roomID, ownerUserID string) error {
+	me, err := c.WhoAmI()
+	if err != nil || me == nil {
+		return fmt.Errorf("whoami: %w", err)
+	}
+	if ownerUserID == me.UserID {
+		logger.Info("ensureRoomOwner: owner %s is current user, no invite needed", ownerUserID)
+		return nil
+	}
+	logger.Info("ensureRoomOwner: inviting %s to room %s", ownerUserID, roomID)
+	if err := c.InviteUser(roomID, ownerUserID); err != nil {
+		return fmt.Errorf("invite owner: %w", err)
+	}
+	logger.Info("ensureRoomOwner: setting power level 100 for %s in room %s", ownerUserID, roomID)
+	return c.SetPowerLevels(roomID, ownerUserID, 100)
+}
+
+// SetPowerLevels sets a user's power level in a room (e.g. 100 for owner).
+// The current user and the target user are both set to the given level so the target becomes an owner.
+func (c *Client) SetPowerLevels(roomID, userID string, level int) error {
+	me, err := c.WhoAmI()
+	if err != nil || me == nil {
+		return fmt.Errorf("whoami: %w", err)
+	}
+	content := &PowerLevelsContent{
+		Users:         map[string]int{me.UserID: 100, userID: level},
+		UsersDefault:  0,
+		EventsDefault: 0,
+		StateDefault:  50,
+		Ban:           50,
+		Kick:          50,
+		Redact:        50,
+	}
+	endpoint := fmt.Sprintf("/_matrix/client/v3/rooms/%s/state/m.room.power_levels/", url.PathEscape(roomID))
+	body, statusCode, err := c.doRequest("PUT", endpoint, content)
+	if err != nil {
+		return err
+	}
+	if statusCode != http.StatusOK {
+		var resp GenericResponse
+		json.Unmarshal(body, &resp)
+		return fmt.Errorf("API error (%d): %s - %s", statusCode, resp.Errcode, resp.Error)
+	}
+	logger.Info("SetPowerLevels: set %s to level %d in room %s", userID, level, roomID)
+	return nil
+}
+
+// SetPowerLevelsBulk sets power levels for multiple users in a room (e.g. all to the same level for equal membership).
+// The current user (admin) is kept at 100 so the state event can be sent. userLevels maps userID -> level.
+func (c *Client) SetPowerLevelsBulk(roomID string, userLevels map[string]int) error {
+	me, err := c.WhoAmI()
+	if err != nil || me == nil {
+		return fmt.Errorf("whoami: %w", err)
+	}
+	content := &PowerLevelsContent{
+		Users:         make(map[string]int),
+		UsersDefault:  0,
+		EventsDefault: 0,
+		StateDefault:  50,
+		Ban:           50,
+		Kick:          50,
+		Redact:        50,
+	}
+	content.Users[me.UserID] = 100
+	for u, level := range userLevels {
+		content.Users[u] = level
+	}
+	endpoint := fmt.Sprintf("/_matrix/client/v3/rooms/%s/state/m.room.power_levels/", url.PathEscape(roomID))
+	body, statusCode, err := c.doRequest("PUT", endpoint, content)
+	if err != nil {
+		return err
+	}
+	if statusCode != http.StatusOK {
+		var resp GenericResponse
+		json.Unmarshal(body, &resp)
+		return fmt.Errorf("API error (%d): %s - %s", statusCode, resp.Errcode, resp.Error)
+	}
+	logger.Info("SetPowerLevelsBulk: set %d users in room %s", len(userLevels), roomID)
+	return nil
 }
 
 // InviteUser invites a user to a room

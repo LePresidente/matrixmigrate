@@ -113,6 +113,18 @@ type RoomTopicContent struct {
 	Topic string `json:"topic"`
 }
 
+// PowerLevelsContent is the content for m.room.power_levels state events
+type PowerLevelsContent struct {
+	Users         map[string]int            `json:"users,omitempty"`
+	UsersDefault  int                       `json:"users_default,omitempty"`
+	EventsDefault int                       `json:"events_default,omitempty"`
+	StateDefault  int                       `json:"state_default,omitempty"`
+	Ban           int                       `json:"ban,omitempty"`
+	Kick          int                       `json:"kick,omitempty"`
+	Redact        int                       `json:"redact,omitempty"`
+	Events        map[string]int            `json:"events,omitempty"`
+}
+
 // ImportResult represents the result of an import operation
 type ImportResult struct {
 	UserID       string `json:"user_id,omitempty"`

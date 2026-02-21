@@ -309,6 +309,12 @@ func (o *Orchestrator) ConnectMatrix() error {
 		logger.Info("Matrix Authentication Service enabled for user creation")
 	}
 
+	// Set AS token early so room/space creation can use it to create as the actual owner (creator)
+	if o.config.UseAppService() {
+		client.SetASToken(o.config.GetASToken())
+		logger.Info("Application Service token set for room creator and message import")
+	}
+
 	o.mxClient = client
 	o.state.MatrixHost = cfg.SSH.Host
 	return nil
@@ -443,6 +449,37 @@ func (o *Orchestrator) ImportAssets(progress ProgressCallback) (*OperationResult
 		}
 	}
 
+	// Build room import options (owner + local alias) from config
+	var roomOpts *matrix.RoomImportOptions
+	if o.config.Matrix.Import.PreserveOwnerAndAlias {
+		logger.Info("Room/space import: preserve_owner_and_alias is enabled; will set alias (team+name) and owner from creator_id or fallback")
+		adminUserID := o.config.FormatUserID(o.config.Matrix.Auth.Username)
+		if adminUserID == "" || o.config.Matrix.Auth.Username == "" {
+			if who, err := o.mxClient.WhoAmI(); err == nil && who != nil {
+				adminUserID = who.UserID
+				logger.Info("Room/space import: admin user ID from WhoAmI: %s", adminUserID)
+			}
+			if adminUserID == "" {
+				adminUserID = o.config.FormatUserID("admin")
+				logger.Warn("Room/space import: could not get admin user ID, using fallback @admin:%s", o.config.Matrix.Homeserver)
+			}
+		}
+		roomOpts = &matrix.RoomImportOptions{
+			PreserveOwnerAndAlias: true,
+			FallbackCreator:      o.config.Matrix.Import.FallbackRoomCreator,
+			AdminUserID:          adminUserID,
+		}
+		if roomOpts.FallbackCreator == "" {
+			roomOpts.FallbackCreator = o.config.Matrix.Auth.Username
+		}
+		logger.Info("Room/space import: fallback_room_creator=%q, admin_user_id=%s", roomOpts.FallbackCreator, roomOpts.AdminUserID)
+		if o.mxClient.HasASToken() {
+			logger.Info("Room/space import: Application Service token is set; rooms/spaces will be created with creator = owner (actual user)")
+		} else {
+			logger.Warn("Room/space import: no Application Service token; rooms will be created by admin then owner will be invited and granted power level 100 (creator will remain admin)")
+		}
+	}
+
 	// Create importer
 	importer := matrix.NewImporter(o.mxClient)
 
@@ -455,8 +492,8 @@ func (o *Orchestrator) ImportAssets(progress ProgressCallback) (*OperationResult
 		}
 	}
 
-	// Import assets (passing existing mappings to skip duplicates)
-	importResult, err := importer.ImportAssets(&assets, existingMappings, importProgress)
+	// Import assets (passing existing mappings to skip duplicates, and optional room owner/alias options)
+	importResult, err := importer.ImportAssets(&assets, existingMappings, roomOpts, importProgress)
 	if err != nil {
 		o.state.FailStep(StepImportAssets, err)
 		o.SaveState()
@@ -628,8 +665,18 @@ func (o *Orchestrator) ImportMemberships(progress ProgressCallback) (*OperationR
 		o.SaveState()
 		return nil, fmt.Errorf("failed to load mapping: %w", err)
 	}
-	logger.Info("Loaded mapping: %d users, %d teams, %d channels", 
+	logger.Info("Loaded mapping: %d users, %d teams, %d channels",
 		len(mapping.Users), len(mapping.Teams), len(mapping.Channels))
+
+	// Load assets to get channel list (needed for group channel equal power levels)
+	var channels []mattermost.Channel
+	if assetFile := o.state.GetStepOutputFile(StepExportAssets); assetFile != "" {
+		var assets mattermost.Assets
+		if err := archive.LoadGzipJSON(assetFile, &assets); err == nil {
+			channels = assets.Channels
+			logger.Info("Loaded %d channels from assets for group channel handling", len(channels))
+		}
+	}
 
 	// Create importer
 	importer := matrix.NewImporter(o.mxClient)
@@ -658,7 +705,7 @@ func (o *Orchestrator) ImportMemberships(progress ProgressCallback) (*OperationR
 	if progress != nil {
 		progress("channel_memberships", 0, len(memberships.ChannelMembers), "")
 	}
-	channelStats, err := importer.ApplyChannelMemberships(memberships.ChannelMembers, mapping.Users, mapping.Channels, importProgress)
+	channelStats, err := importer.ApplyChannelMemberships(channels, memberships.ChannelMembers, mapping.Users, mapping.Channels, importProgress)
 	if err != nil {
 		o.state.FailStep(StepImportMemberships, err)
 		o.SaveState()
