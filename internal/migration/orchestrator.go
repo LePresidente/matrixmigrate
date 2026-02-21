@@ -1,4 +1,4 @@
-﻿package migration
+package migration
 
 import (
 	"fmt"
@@ -284,9 +284,29 @@ func (o *Orchestrator) ConnectMatrix() error {
 	if err != nil {
 		logger.Warn("Could not auto-detect homeserver: %v, using configured value: %s", err, cfg.Homeserver)
 	} else if detectedHomeserver != cfg.Homeserver {
-		logger.Info("Auto-detected homeserver '%s' differs from configured '%s', using detected value", 
+		logger.Info("Auto-detected homeserver '%s' differs from configured '%s', using detected value",
 			detectedHomeserver, cfg.Homeserver)
 		client.SetHomeserver(detectedHomeserver)
+	}
+
+	// When MAS is enabled, use it for user creation so users can log in via SSO/OAuth
+	if o.config.Matrix.MAS.Enabled {
+		clientID := o.config.GetMASClientID()
+		clientSecret := o.config.GetMASClientSecret()
+		if clientID == "" || clientSecret == "" {
+			o.tunnelManager.CloseTunnel("matrix")
+			return fmt.Errorf("matrix.mas is enabled but %s and/or %s are not set",
+				o.config.Matrix.MAS.ClientIDEnv, o.config.Matrix.MAS.ClientSecretEnv)
+		}
+		homeserver := client.GetHomeserver()
+		masClient := matrix.NewMASClient(
+			o.config.Matrix.MAS.Endpoint,
+			clientID,
+			clientSecret,
+			homeserver,
+		)
+		client.SetMASClient(masClient)
+		logger.Info("Matrix Authentication Service enabled for user creation")
 	}
 
 	o.mxClient = client

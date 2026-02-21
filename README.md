@@ -1,4 +1,4 @@
-﻿# MatrixMigrate
+# MatrixMigrate
 
 A CLI tool for migrating from Mattermost to Matrix Synapse with multi-step, resumable migration support.
 
@@ -17,6 +17,7 @@ A CLI tool for migrating from Mattermost to Matrix Synapse with multi-step, resu
 - **Resumable**: Checkpoint-based migration that can be paused and resumed
 - **Mapping Files**: Generates mapping files to track Mattermost → Matrix entity relationships
 - **Application Service Support**: Import messages with original timestamps
+- **Matrix Authentication Service (MAS)**: Create users via MAS so they can log in via SSO/OAuth
 
 ## Screenshots
 
@@ -232,6 +233,8 @@ The connection test provides detailed step-by-step diagnostics:
 | `MATRIX_ADMIN_PASSWORD` | Matrix admin password for login | Yes (if using auth) |
 | `MATRIX_ADMIN_TOKEN` | Alternative: existing admin token | No |
 | `MATRIX_AS_TOKEN` | Application Service token for message import | Yes (for messages) |
+| `MAS_CLIENT_ID` | MAS OAuth client ID (admin client) when `matrix.mas.enabled` is true | Yes (if using MAS) |
+| `MAS_CLIENT_SECRET` | MAS OAuth client secret when `matrix.mas.enabled` is true | Yes (if using MAS) |
 | `MM_SSH_PASSWORD` | Mattermost SSH password | No (if using key) |
 | `MX_SSH_PASSWORD` | Matrix SSH password | No (if using key) |
 | `SSH_KEY_PASSPHRASE` | SSH key passphrase (if encrypted) | No |
@@ -392,6 +395,47 @@ export MATRIX_AS_TOKEN="YOUR_GENERATED_AS_TOKEN"
 ```
 
 **Note:** The AS token allows the migration tool to send messages on behalf of users with their original timestamps. This is the only way to preserve message history accurately.
+
+## Matrix Authentication Service (MAS)
+
+If your Synapse server uses the **Matrix Authentication Service (MAS)** for SSO/OAuth, users created directly via the Synapse Admin API cannot be linked to MAS and will get "Localpart not available" when logging in. Enabling MAS in MatrixMigrate creates users through the MAS Admin API instead, so they can sign in via SSO.
+
+### When to use MAS
+
+- Your homeserver is configured to use MAS for authentication (OAuth/SSO).
+- You see "Localpart not available" or similar errors when migrated users try to log in.
+- You want migrated users to use the same SSO flow as existing users.
+
+### Configuration
+
+1. **Enable the Admin API in MAS**  
+   In your MAS config, add the `adminapi` resource to an HTTP listener (see [MAS Admin API docs](https://matrix-org.github.io/matrix-authentication-service/topics/admin-api.html)).
+
+2. **Create an admin OAuth client**  
+   Register a client in MAS and add its `client_id` to `policy.data.admin_clients` so it can use the client_credentials grant with scope `urn:mas:admin`.
+
+3. **Configure MatrixMigrate**  
+   In `config.yaml`:
+
+```yaml
+matrix:
+  # ... ssh, api, auth, homeserver ...
+  mas:
+    enabled: true
+    endpoint: "http://mas.example.com:8080"   # or http://localhost:8080 if you tunnel MAS
+    client_id_env: "MAS_CLIENT_ID"
+    client_secret_env: "MAS_CLIENT_SECRET"
+```
+
+4. **Set environment variables**  
+   Before running import:
+
+```bash
+export MAS_CLIENT_ID="your-mas-admin-client-id"
+export MAS_CLIENT_SECRET="your-mas-admin-client-secret"
+```
+
+When MAS is enabled, **user import** (e.g. `import assets`) creates users via the MAS Admin API and sets a temporary password; all other steps (spaces, rooms, memberships, messages) still use the Synapse API as before.
 
 ---
 

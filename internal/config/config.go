@@ -1,4 +1,4 @@
-﻿package config
+package config
 
 import (
 	"fmt"
@@ -51,6 +51,17 @@ type MatrixConfig struct {
 	Homeserver string           `mapstructure:"homeserver"`
 	RateLimit  RateLimitConfig  `mapstructure:"rate_limit"`  // Rate limiting configuration
 	AppService AppServiceConfig `mapstructure:"appservice"`  // Application Service for message import
+	MAS        MASConfig        `mapstructure:"mas"`        // Matrix Authentication Service for user creation
+}
+
+// MASConfig holds Matrix Authentication Service configuration
+// When enabled, users are created via MAS Admin API so they can log in via SSO/OAuth
+// without "Localpart not available" errors.
+type MASConfig struct {
+	Enabled        bool   `mapstructure:"enabled"`
+	Endpoint       string `mapstructure:"endpoint"`          // MAS API base URL (e.g. http://mas.example.com:8080)
+	ClientIDEnv    string `mapstructure:"client_id_env"`     // Env var for OAuth client ID (admin client)
+	ClientSecretEnv string `mapstructure:"client_secret_env"` // Env var for OAuth client secret
 }
 
 // AppServiceConfig holds Application Service configuration for message import
@@ -245,6 +256,16 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	// Validate MAS config when enabled
+	if c.Matrix.MAS.Enabled {
+		if c.Matrix.MAS.Endpoint == "" {
+			return fmt.Errorf("matrix.mas.endpoint is required when mas is enabled")
+		}
+		if c.Matrix.MAS.ClientIDEnv == "" || c.Matrix.MAS.ClientSecretEnv == "" {
+			return fmt.Errorf("matrix.mas.client_id_env and matrix.mas.client_secret_env are required when mas is enabled")
+		}
+	}
+
 	return nil
 }
 
@@ -375,6 +396,28 @@ func (c *Config) GetHSToken() string {
 // UseAppService returns true if Application Service mode is enabled
 func (c *Config) UseAppService() bool {
 	return c.Matrix.AppService.Enabled && c.GetASToken() != ""
+}
+
+// UseMAS returns true if Matrix Authentication Service is enabled for user creation
+func (c *Config) UseMAS() bool {
+	return c.Matrix.MAS.Enabled && c.Matrix.MAS.Endpoint != "" &&
+		c.GetMASClientID() != "" && c.GetMASClientSecret() != ""
+}
+
+// GetMASClientID returns the MAS OAuth client ID from environment
+func (c *Config) GetMASClientID() string {
+	if c.Matrix.MAS.ClientIDEnv == "" {
+		return ""
+	}
+	return os.Getenv(c.Matrix.MAS.ClientIDEnv)
+}
+
+// GetMASClientSecret returns the MAS OAuth client secret from environment
+func (c *Config) GetMASClientSecret() string {
+	if c.Matrix.MAS.ClientSecretEnv == "" {
+		return ""
+	}
+	return os.Getenv(c.Matrix.MAS.ClientSecretEnv)
 }
 
 // GetFileMode returns the file migration mode (link, upload, or skip)

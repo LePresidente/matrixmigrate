@@ -1,4 +1,4 @@
-﻿package matrix
+package matrix
 
 // User represents a Matrix user
 type User struct {
@@ -12,6 +12,7 @@ type User struct {
 type CreateUserRequest struct {
 	Password    string `json:"password,omitempty"`
 	DisplayName string `json:"displayname,omitempty"`
+	Email       string `json:"-"` // Used for Synapse profile (threepids); not sent in JSON body
 	Admin       bool   `json:"admin"`
 	Deactivated bool   `json:"deactivated"`
 }

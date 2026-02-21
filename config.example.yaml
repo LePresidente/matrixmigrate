@@ -1,4 +1,4 @@
-﻿# MatrixMigrate Configuration Example
+# MatrixMigrate Configuration Example
 # Copy this file to config.yaml and update with your settings
 
 # Language setting (default: en)
@@ -116,6 +116,19 @@ matrix:
     
     # Environment variable containing the HS token (optional)
     # hs_token_env: "MATRIX_HS_TOKEN"
+
+  # Matrix Authentication Service (MAS) - use MAS for user creation instead of Synapse
+  # When enabled, users are created via MAS Admin API so they can log in via SSO/OAuth
+  # without "Localpart not available" errors. Requires MAS with admin API enabled.
+  mas:
+    enabled: false
+    
+    # MAS API base URL (e.g. http://mas.example.com:8080 or http://localhost:8080 if tunneled)
+    # endpoint: "http://mas.example.com:8080"
+    
+    # OAuth client credentials - must be an admin client in MAS policy.data.admin_clients
+    # client_id_env: "MAS_CLIENT_ID"
+    # client_secret_env: "MAS_CLIENT_SECRET"
 
 # Data storage paths
 data:

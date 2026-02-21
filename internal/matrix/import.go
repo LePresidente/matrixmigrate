@@ -1,4 +1,4 @@
-﻿package matrix
+package matrix
 
 import (
 	"fmt"
@@ -95,6 +95,7 @@ func (i *Importer) ImportUsers(users []mattermost.User, existingMapping map[stri
 		req := &CreateUserRequest{
 			Password:    GenerateRandomPassword(),
 			DisplayName: displayName,
+			Email:       strings.TrimSpace(user.Email),
 			Admin:       false,
 			Deactivated: false,
 		}

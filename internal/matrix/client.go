@@ -1,4 +1,4 @@
-﻿package matrix
+package matrix
 
 import (
 	"bytes"
@@ -37,17 +37,20 @@ type Client struct {
 	adminToken string
 	httpClient *http.Client
 	homeserver string
-	
+
+	// Matrix Authentication Service - when set, user creation uses MAS instead of Synapse
+	masClient *MASClient
+
 	// Application Service support
-	asToken    string // AS token for message import with timestamps
-	
+	asToken string // AS token for message import with timestamps
+
 	// Rate limiting
-	lastRequest     time.Time
-	rateLimit       time.Duration
-	maxRetries      int
-	retryBaseDelay  time.Duration
-	mu              sync.Mutex
-	
+	lastRequest    time.Time
+	rateLimit      time.Duration
+	maxRetries     int
+	retryBaseDelay time.Duration
+	mu             sync.Mutex
+
 	// Transaction ID counter for messages
 	txnCounter int64
 }
@@ -90,6 +93,18 @@ func NewClientWithRateLimit(baseURL, adminToken, homeserver string, rlConfig Rat
 // SetHomeserver updates the homeserver domain
 func (c *Client) SetHomeserver(homeserver string) {
 	c.homeserver = homeserver
+	if c.masClient != nil {
+		c.masClient.SetHomeserver(homeserver)
+	}
+}
+
+// SetMASClient sets the Matrix Authentication Service client for user creation.
+// When set, CreateUser and UserExists use MAS instead of Synapse Admin API.
+func (c *Client) SetMASClient(mas *MASClient) {
+	c.masClient = mas
+	if mas != nil {
+		mas.SetHomeserver(c.homeserver)
+	}
 }
 
 // GetHomeserver returns the current homeserver domain
@@ -235,8 +250,21 @@ func (c *Client) TestConnection() error {
 	return err
 }
 
-// CreateUser creates or updates a user via the Admin API
+// CreateUser creates or updates a user via the Admin API (or MAS when configured)
 func (c *Client) CreateUser(username string, req *CreateUserRequest) (*UserResponse, error) {
+	if c.masClient != nil {
+		resp, err := c.masClient.CreateUser(username, req)
+		if err != nil {
+			return nil, err
+		}
+		// MAS only stores the user; set display name and email on Synapse
+		if resp != nil && (req != nil && (req.DisplayName != "" || req.Email != "")) {
+			if err := c.updateUserProfile(resp.UserID, req.DisplayName, req.Email); err != nil {
+				logger.Warn("Failed to set display name/email for %s: %v", resp.UserID, err)
+			}
+		}
+		return resp, nil
+	}
 	userID := fmt.Sprintf("@%s:%s", username, c.homeserver)
 	endpoint := fmt.Sprintf("/_synapse/admin/v2/users/%s", url.PathEscape(userID))
 
@@ -296,8 +324,37 @@ func (c *Client) GetUser(userID string) (*UserResponse, error) {
 	return &resp, nil
 }
 
+// updateUserProfile sets display name and email (threepids) on Synapse for a user.
+// Used after MAS user creation so the profile is stored on the homeserver.
+func (c *Client) updateUserProfile(userID, displayName, email string) error {
+	if displayName == "" && email == "" {
+		return nil
+	}
+	endpoint := fmt.Sprintf("/_synapse/admin/v2/users/%s", url.PathEscape(userID))
+	body := make(map[string]interface{})
+	if displayName != "" {
+		body["displayname"] = displayName
+	}
+	if email != "" {
+		body["threepids"] = []map[string]string{
+			{"medium": "email", "address": email},
+		}
+	}
+	_, statusCode, err := c.doRequest("PUT", endpoint, body)
+	if err != nil {
+		return err
+	}
+	if statusCode != http.StatusOK && statusCode != http.StatusCreated {
+		return fmt.Errorf("profile update returned status %d", statusCode)
+	}
+	return nil
+}
+
 // UserExists checks if a user exists
 func (c *Client) UserExists(username string) (bool, error) {
+	if c.masClient != nil {
+		return c.masClient.UserExists(username)
+	}
 	userID := fmt.Sprintf("@%s:%s", username, c.homeserver)
 	logger.Info("Checking if user exists: %s", userID)
 	user, err := c.GetUser(userID)
@@ -473,6 +530,9 @@ func (c *Client) SetRoomParent(roomID, spaceID string, canonical bool) error {
 
 // FormatUserID formats a username as a full Matrix user ID
 func (c *Client) FormatUserID(username string) string {
+	if c.masClient != nil {
+		return c.masClient.FormatUserID(username)
+	}
 	return fmt.Sprintf("@%s:%s", username, c.homeserver)
 }
 
