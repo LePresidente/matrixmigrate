@@ -62,6 +62,9 @@ type ImportConfig struct {
 	// FallbackRoomCreator: Matrix localpart (username before :domain) when creator_id is empty.
 	// If this user does not exist on the server, the admin account (auth.username) is used.
 	FallbackRoomCreator string `mapstructure:"fallback_room_creator"`
+	// ForceJoin: when true, add users to rooms/spaces via Synapse admin API (joined directly).
+	// When false, users are invited and must accept. Enable for migrations where users are already members.
+	ForceJoin bool `mapstructure:"force_join"`
 }
 
 // MASConfig holds Matrix Authentication Service configuration
@@ -185,6 +188,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("matrix.rate_limit.requests_per_second", 5.0)  // 5 req/sec (200ms between requests)
 	v.SetDefault("matrix.rate_limit.max_retries", 5)            // 5 retries before giving up
 	v.SetDefault("matrix.rate_limit.retry_base_delay_ms", 2000) // 2 second base delay
+	v.SetDefault("matrix.import.force_join", false)
 	v.SetDefault("data.assets_dir", "./data/assets")
 	v.SetDefault("data.mappings_dir", "./data/mappings")
 	v.SetDefault("data.state_file", "./data/state.json")

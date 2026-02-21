@@ -124,6 +124,9 @@ matrix:
   import:
     # When true, rooms and spaces get: owner from channel/team creator_id (or fallback), alias = team+name
     preserve_owner_and_alias: false
+    # When true, users are added to rooms/spaces via Synapse admin API (joined directly, no invite to accept).
+    # Use for migrations where users are already members. Default: false (invite; users must accept).
+    # force_join: false
     # When creator_id is empty, use this Matrix username (localpart only, e.g. "admin" -> @admin:domain).
     # If this user does not exist, the admin account (auth.username) is used.
     # fallback_room_creator: "admin"

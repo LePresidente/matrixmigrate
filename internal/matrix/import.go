@@ -409,10 +409,12 @@ func (i *Importer) ApplyTeamMemberships(
 			continue
 		}
 
-		logger.Info("Team membership %d/%d: inviting %s to space %s", idx+1, total, userID, spaceID)
-
-		// Invite user to space
-		if err := i.client.InviteUser(spaceID, userID); err != nil {
+		if i.client.ForceJoinEnabled() {
+			logger.Info("Team membership %d/%d: force-joining %s to space %s", idx+1, total, userID, spaceID)
+		} else {
+			logger.Info("Team membership %d/%d: inviting %s to space %s", idx+1, total, userID, spaceID)
+		}
+		if err := i.client.AddUserToRoom(spaceID, userID); err != nil {
 			logger.Error("Team membership %d/%d failed: %s -> %s: %v", idx+1, total, userID, spaceID, err)
 			stats.MembersFailed++
 			continue
@@ -473,14 +475,17 @@ func (i *Importer) ApplyChannelMemberships(
 			continue
 		}
 
-		logger.Info("Channel membership %d/%d: inviting %s to room %s", idx+1, total, userID, roomID)
+		if i.client.ForceJoinEnabled() {
+			logger.Info("Channel membership %d/%d: force-joining %s to room %s", idx+1, total, userID, roomID)
+		} else {
+			logger.Info("Channel membership %d/%d: inviting %s to room %s", idx+1, total, userID, roomID)
+		}
 
 		if groupChannelIDs[membership.ChannelID] {
 			groupRoomMembers[roomID] = append(groupRoomMembers[roomID], userID)
 		}
 
-		// Invite user to room
-		if err := i.client.InviteUser(roomID, userID); err != nil {
+		if err := i.client.AddUserToRoom(roomID, userID); err != nil {
 			logger.Error("Channel membership %d/%d failed: %s -> %s: %v", idx+1, total, userID, roomID, err)
 			stats.MembersFailed++
 			continue

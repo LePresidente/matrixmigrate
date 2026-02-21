@@ -315,6 +315,12 @@ func (o *Orchestrator) ConnectMatrix() error {
 		logger.Info("Application Service token set for room creator and message import")
 	}
 
+	// Force-join: add users to rooms/spaces via Synapse admin API (no invite to accept)
+	client.SetForceJoin(o.config.Matrix.Import.ForceJoin)
+	if o.config.Matrix.Import.ForceJoin {
+		logger.Info("Force-join enabled: users will be added to rooms/spaces directly (no invite acceptance required)")
+	}
+
 	o.mxClient = client
 	o.state.MatrixHost = cfg.SSH.Host
 	return nil

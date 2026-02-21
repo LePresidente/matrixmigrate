@@ -53,6 +53,9 @@ type Client struct {
 
 	// Transaction ID counter for messages
 	txnCounter int64
+
+	// ForceJoin: when true, add users via Synapse admin API (joined directly) instead of invite
+	forceJoin bool
 }
 
 // NewClient creates a new Matrix API client with default rate limiting
@@ -110,6 +113,16 @@ func (c *Client) SetMASClient(mas *MASClient) {
 // GetHomeserver returns the current homeserver domain
 func (c *Client) GetHomeserver() string {
 	return c.homeserver
+}
+
+// SetForceJoin sets whether to add users via Synapse admin API (force-join) instead of invite.
+func (c *Client) SetForceJoin(forceJoin bool) {
+	c.forceJoin = forceJoin
+}
+
+// ForceJoinEnabled returns true if force-join mode is enabled.
+func (c *Client) ForceJoinEnabled() bool {
+	return c.forceJoin
 }
 
 // DetectHomeserver detects the homeserver from the authenticated user ID
@@ -518,9 +531,13 @@ func (c *Client) ensureRoomOwner(roomID, ownerUserID string) error {
 		logger.Info("ensureRoomOwner: owner %s is current user, no invite needed", ownerUserID)
 		return nil
 	}
-	logger.Info("ensureRoomOwner: inviting %s to room %s", ownerUserID, roomID)
-	if err := c.InviteUser(roomID, ownerUserID); err != nil {
-		return fmt.Errorf("invite owner: %w", err)
+	if c.forceJoin {
+		logger.Info("ensureRoomOwner: force-joining %s to room %s", ownerUserID, roomID)
+	} else {
+		logger.Info("ensureRoomOwner: inviting %s to room %s", ownerUserID, roomID)
+	}
+	if err := c.AddUserToRoom(roomID, ownerUserID); err != nil {
+		return fmt.Errorf("add owner to room: %w", err)
 	}
 	logger.Info("ensureRoomOwner: setting power level 100 for %s in room %s", ownerUserID, roomID)
 	return c.SetPowerLevels(roomID, ownerUserID, 100)
@@ -619,6 +636,31 @@ func (c *Client) InviteUser(roomID, userID string) error {
 	}
 
 	return nil
+}
+
+// ForceJoinUser adds a user to a room or space via Synapse admin API (user is joined directly, no invite to accept).
+// Only works for local users. Requires admin token. The server admin must be in the room.
+func (c *Client) ForceJoinUser(roomID, userID string) error {
+	endpoint := fmt.Sprintf("/_synapse/admin/v1/join/%s", url.PathEscape(roomID))
+	req := &InviteRequest{UserID: userID}
+	body, statusCode, err := c.doRequest("POST", endpoint, req)
+	if err != nil {
+		return err
+	}
+	if statusCode != http.StatusOK {
+		var resp GenericResponse
+		json.Unmarshal(body, &resp)
+		return fmt.Errorf("API error (%d): %s - %s", statusCode, resp.Errcode, resp.Error)
+	}
+	return nil
+}
+
+// AddUserToRoom adds a user to a room: force-join via Synapse admin API if ForceJoin is enabled, otherwise invite.
+func (c *Client) AddUserToRoom(roomID, userID string) error {
+	if c.forceJoin {
+		return c.ForceJoinUser(roomID, userID)
+	}
+	return c.InviteUser(roomID, userID)
 }
 
 // JoinRoom makes the admin user join a room (needed before inviting others in some cases)
