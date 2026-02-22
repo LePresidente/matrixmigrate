@@ -491,6 +491,12 @@ func (c *Client) CreateSpace(name, topic string, public bool, roomAliasLocalPart
 			logger.Info("CreateSpace: owner %s invited and set to power level 100", ownerUserID)
 		}
 	}
+	if ownerUserID != "" && c.createdAsUser(ownerUserID) && c.asToken != "" {
+		// Space was created as owner (AS); add admin with PL 50 so linking rooms to space works later.
+		if err := c.ensureAdminInSpaceWithPower(resp.RoomID, 50); err != nil {
+			logger.Warn("CreateSpace: could not add admin to space for linking: %v", err)
+		}
+	}
 	return resp, nil
 }
 
@@ -539,6 +545,118 @@ func (c *Client) CreateRegularRoom(name, topic string, public bool, roomAliasLoc
 		}
 	}
 	return resp, nil
+}
+
+// CreateDirectRoom creates a DM room between creatorUserID and otherUserID.
+// Room is created as creatorUserID (using AS when available) so it shows under "People" for both.
+// Sets m.direct account_data for both users so clients show the room as a DM.
+// The AS user is not added to the room; only the two users are members.
+func (c *Client) CreateDirectRoom(creatorUserID, otherUserID string) (*CreateRoomResponse, error) {
+	req := &CreateRoomRequest{
+		Preset:     string(PresetTrustedPrivateChat),
+		Visibility: string(VisibilityPrivate),
+		IsDirect:   true,
+		Invite:     []string{otherUserID},
+	}
+	logger.Info("CreateDirectRoom: creator=%s other=%s (is_direct=true)", creatorUserID, otherUserID)
+	resp, err := c.CreateRoomAsUser(req, creatorUserID)
+	if err != nil {
+		return nil, fmt.Errorf("create DM room: %w", err)
+	}
+	// Ensure other user is in the room (invite or force-join)
+	if c.forceJoin {
+		logger.Info("CreateDirectRoom: force-joining %s to DM %s", otherUserID, resp.RoomID)
+	} else {
+		logger.Info("CreateDirectRoom: inviting %s to DM %s", otherUserID, resp.RoomID)
+	}
+	if err := c.AddUserToRoom(resp.RoomID, otherUserID); err != nil {
+		logger.Warn("CreateDirectRoom: failed to add %s to room (may already be invited): %v", otherUserID, err)
+		// Continue to set m.direct so room still shows as DM
+	}
+	// Set m.direct for both users so the room appears under "People" for both (requires AS)
+	if err := c.setDirectRoomForUser(creatorUserID, otherUserID, resp.RoomID); err != nil {
+		logger.Warn("CreateDirectRoom: failed to set m.direct for %s: %v", creatorUserID, err)
+	}
+	if err := c.setDirectRoomForUser(otherUserID, creatorUserID, resp.RoomID); err != nil {
+		logger.Warn("CreateDirectRoom: failed to set m.direct for %s: %v", otherUserID, err)
+	}
+	return resp, nil
+}
+
+// setDirectRoomForUser updates userID's m.direct account_data to include roomID under otherUserID.
+// Requires Application Service token (sets account_data on behalf of userID).
+func (c *Client) setDirectRoomForUser(userID, otherUserID, roomID string) error {
+	if c.asToken == "" {
+		return fmt.Errorf("setting m.direct requires Application Service token")
+	}
+	existing, _ := c.GetAccountData(userID, "m.direct")
+	direct, _ := existing.(map[string]interface{})
+	if direct == nil {
+		direct = make(map[string]interface{})
+	}
+	var list []interface{}
+	if l, ok := direct[otherUserID].([]interface{}); ok {
+		list = l
+	}
+	for _, r := range list {
+		if s, _ := r.(string); s == roomID {
+			logger.Info("setDirectRoomForUser: %s already has room %s for %s", userID, roomID, otherUserID)
+			return nil
+		}
+	}
+	list = append(list, roomID)
+	direct[otherUserID] = list
+	return c.SetAccountData(userID, "m.direct", direct)
+}
+
+// GetAccountData retrieves account_data for a user. Requires AS token and user_id query param.
+func (c *Client) GetAccountData(userID, key string) (interface{}, error) {
+	if c.asToken == "" {
+		return nil, fmt.Errorf("getting account_data for user requires Application Service token")
+	}
+	endpoint := fmt.Sprintf("/_matrix/client/v3/user/%s/account_data/%s", url.PathEscape(userID), url.PathEscape(key))
+	params := url.Values{}
+	params.Set("user_id", userID)
+	endpoint += "?" + params.Encode()
+	body, statusCode, err := c.doRequestWithToken("GET", endpoint, nil, c.asToken)
+	if err != nil {
+		return nil, err
+	}
+	if statusCode == http.StatusNotFound {
+		return nil, nil
+	}
+	if statusCode != http.StatusOK {
+		var resp GenericResponse
+		json.Unmarshal(body, &resp)
+		return nil, fmt.Errorf("API error (%d): %s - %s", statusCode, resp.Errcode, resp.Error)
+	}
+	var content interface{}
+	if err := json.Unmarshal(body, &content); err != nil {
+		return nil, err
+	}
+	return content, nil
+}
+
+// SetAccountData sets account_data for a user. Requires AS token and user_id query param.
+func (c *Client) SetAccountData(userID, key string, content interface{}) error {
+	if c.asToken == "" {
+		return fmt.Errorf("setting account_data for user requires Application Service token")
+	}
+	endpoint := fmt.Sprintf("/_matrix/client/v3/user/%s/account_data/%s", url.PathEscape(userID), url.PathEscape(key))
+	params := url.Values{}
+	params.Set("user_id", userID)
+	endpoint += "?" + params.Encode()
+	body, statusCode, err := c.doRequestWithToken("PUT", endpoint, content, c.asToken)
+	if err != nil {
+		return err
+	}
+	if statusCode != http.StatusOK {
+		var resp GenericResponse
+		json.Unmarshal(body, &resp)
+		return fmt.Errorf("API error (%d): %s - %s", statusCode, resp.Errcode, resp.Error)
+	}
+	logger.Info("SetAccountData: set %s for user %s", key, userID)
+	return nil
 }
 
 // createdAsUser returns true if we would have created the room as the given user (AS token + user_id).
@@ -693,13 +811,27 @@ func (c *Client) ensureAdminInRoom(roomID string) error {
 	if alreadyJoined {
 		return nil
 	}
-	if err := c.JoinRoom(roomID); err != nil {
-		return fmt.Errorf("admin join room (required for force-join): %w", err)
+	err := c.JoinRoom(roomID)
+	if err == nil {
+		c.joinedRoomsMu.Lock()
+		c.joinedRooms[roomID] = struct{}{}
+		c.joinedRoomsMu.Unlock()
+		return nil
 	}
-	c.joinedRoomsMu.Lock()
-	c.joinedRooms[roomID] = struct{}{}
-	c.joinedRoomsMu.Unlock()
-	return nil
+	// Invite-only rooms: client join fails with "not invited". Try Synapse admin API to add ourselves (may work on some setups).
+	me, whoErr := c.WhoAmI()
+	if whoErr == nil && me != nil {
+		if joinErr := c.ForceJoinUser(roomID, me.UserID); joinErr == nil {
+			c.joinedRoomsMu.Lock()
+			c.joinedRooms[roomID] = struct{}{}
+			c.joinedRoomsMu.Unlock()
+			return nil
+		}
+	}
+	if strings.Contains(err.Error(), "not invited") || strings.Contains(err.Error(), "M_FORBIDDEN") {
+		return fmt.Errorf("room is invite-only or restricted; admin cannot join to link it: %w", err)
+	}
+	return fmt.Errorf("admin join room: %w", err)
 }
 
 // AddUserToRoom adds a user to a room: force-join via Synapse admin API if ForceJoin is enabled, otherwise invite.
@@ -732,8 +864,86 @@ func (c *Client) JoinRoom(roomID string) error {
 	return nil
 }
 
-// AddRoomToSpace adds a room as a child of a space
+// ensureAdminInSpaceWithPower adds the admin to a space (created as owner via AS) with the given power level
+// so that the admin can later link rooms to the space. Uses AS token to invite and set power levels.
+func (c *Client) ensureAdminInSpaceWithPower(spaceID string, powerLevel int) error {
+	me, err := c.WhoAmI()
+	if err != nil || me == nil {
+		return fmt.Errorf("whoami: %w", err)
+	}
+	if c.asToken == "" {
+		return fmt.Errorf("no AS token; cannot add admin to space created as owner")
+	}
+	// Owner (AS) invites admin
+	endpoint := fmt.Sprintf("/_matrix/client/v3/rooms/%s/invite", url.PathEscape(spaceID))
+	body, statusCode, err := c.doRequestWithToken("POST", endpoint, &InviteRequest{UserID: me.UserID}, c.asToken)
+	if err != nil {
+		return err
+	}
+	if statusCode != http.StatusOK {
+		var resp GenericResponse
+		json.Unmarshal(body, &resp)
+		return fmt.Errorf("invite admin to space: %s - %s", resp.Errcode, resp.Error)
+	}
+	// Admin accepts invite
+	if err := c.JoinRoom(spaceID); err != nil {
+		return fmt.Errorf("admin join space: %w", err)
+	}
+	// Get current power levels (admin is in room now)
+	pl, err := c.getPowerLevels(spaceID)
+	if err != nil {
+		return fmt.Errorf("get power levels: %w", err)
+	}
+	if pl.Users == nil {
+		pl.Users = make(map[string]int)
+	}
+	pl.Users[me.UserID] = powerLevel
+	// Owner (AS) sets power levels so admin can send state when linking
+	if err := c.setPowerLevelsWithToken(spaceID, pl, c.asToken); err != nil {
+		return fmt.Errorf("set admin power level in space: %w", err)
+	}
+	return nil
+}
+
+func (c *Client) getPowerLevels(roomID string) (*PowerLevelsContent, error) {
+	endpoint := fmt.Sprintf("/_matrix/client/v3/rooms/%s/state/m.room.power_levels/", url.PathEscape(roomID))
+	body, statusCode, err := c.doRequest("GET", endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	if statusCode != http.StatusOK {
+		return nil, fmt.Errorf("GET power_levels: %d", statusCode)
+	}
+	var content PowerLevelsContent
+	if err := json.Unmarshal(body, &content); err != nil {
+		return nil, err
+	}
+	return &content, nil
+}
+
+func (c *Client) setPowerLevelsWithToken(roomID string, content *PowerLevelsContent, token string) error {
+	endpoint := fmt.Sprintf("/_matrix/client/v3/rooms/%s/state/m.room.power_levels/", url.PathEscape(roomID))
+	body, statusCode, err := c.doRequestWithToken("PUT", endpoint, content, token)
+	if err != nil {
+		return err
+	}
+	if statusCode != http.StatusOK {
+		var resp GenericResponse
+		json.Unmarshal(body, &resp)
+		return fmt.Errorf("API error (%d): %s - %s", statusCode, resp.Errcode, resp.Error)
+	}
+	return nil
+}
+
+// AddRoomToSpace adds a room as a child of a space.
+// The sender must be in both the space and the room (Synapse returns M_FORBIDDEN otherwise).
 func (c *Client) AddRoomToSpace(spaceID, roomID string, suggested bool) error {
+	if err := c.ensureAdminInRoom(spaceID); err != nil {
+		return fmt.Errorf("admin join space: %w", err)
+	}
+	if err := c.ensureAdminInRoom(roomID); err != nil {
+		return fmt.Errorf("admin join room: %w", err)
+	}
 	endpoint := fmt.Sprintf("/_matrix/client/v3/rooms/%s/state/%s/%s",
 		url.PathEscape(spaceID),
 		EventTypeSpaceChild,
