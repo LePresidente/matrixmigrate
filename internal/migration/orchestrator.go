@@ -535,7 +535,7 @@ func (o *Orchestrator) ImportAssets(progress ProgressCallback) (*OperationResult
 	if progress != nil {
 		progress("linking", 0, len(assets.Channels), "")
 	}
-	linkResult, err := importer.LinkRoomsToSpaces(assets.Channels, importResult.SpaceMapping, importResult.RoomMapping, importProgress)
+	linkResult, err := importer.LinkRoomsToSpaces(assets.Channels, importResult.SpaceMapping, importResult.RoomMapping, o.config.GetPublicRoomJoinRules(), importProgress)
 	if err == nil && linkResult != nil {
 		result.RoomsLinked = linkResult.RoomsLinked
 	}

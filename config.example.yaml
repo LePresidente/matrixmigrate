@@ -127,6 +127,10 @@ matrix:
     # When true, users are added to rooms/spaces via Synapse admin API (joined directly, no invite to accept).
     # Use for migrations where users are already members. Default: false (invite; users must accept).
     # force_join: false
+    # Public room join rules (who can join public Mattermost channels in Matrix). Default: "space_members"
+    #   "space_members" - Only members of the parent space/team can join (restricted join rule; recommended).
+    #   "public"        - Anyone can join (leave default Matrix join rule).
+    # public_room_join_rules: "space_members"
     # When creator_id is empty, use this Matrix username (localpart only, e.g. "admin" -> @admin:domain).
     # If this user does not exist, the admin account (auth.username) is used.
     # fallback_room_creator: "admin"

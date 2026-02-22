@@ -276,6 +276,11 @@ func (c *Client) CreateUser(username string, req *CreateUserRequest) (*UserRespo
 				logger.Warn("Failed to set display name/email for %s: %v", resp.UserID, err)
 			}
 		}
+		if resp != nil && req != nil && req.Deactivated {
+			if err := c.SetUserDeactivated(resp.UserID, true); err != nil {
+				logger.Warn("Failed to set deactivated (locked) for %s: %v", resp.UserID, err)
+			}
+		}
 		return resp, nil
 	}
 	userID := fmt.Sprintf("@%s:%s", username, c.homeserver)
@@ -335,6 +340,22 @@ func (c *Client) GetUser(userID string) (*UserResponse, error) {
 	}
 
 	return &resp, nil
+}
+
+// SetUserDeactivated sets or clears the deactivated (locked) flag on Synapse for a user.
+// Deactivated users appear as locked in tools like synapse-admin and cannot log in.
+func (c *Client) SetUserDeactivated(userID string, deactivated bool) error {
+	endpoint := fmt.Sprintf("/_synapse/admin/v2/users/%s", url.PathEscape(userID))
+	body := map[string]interface{}{"deactivated": deactivated}
+	_, statusCode, err := c.doRequest("PUT", endpoint, body)
+	if err != nil {
+		return err
+	}
+	if statusCode != http.StatusOK && statusCode != http.StatusCreated {
+		return fmt.Errorf("SetUserDeactivated returned status %d", statusCode)
+	}
+	logger.Info("SetUserDeactivated: %s -> %v", userID, deactivated)
+	return nil
 }
 
 // updateUserProfile sets display name and email (threepids) on Synapse for a user.
@@ -730,6 +751,34 @@ func (c *Client) SetRoomParent(roomID, spaceID string, canonical bool) error {
 		return fmt.Errorf("API error (%d): %s - %s", statusCode, resp.Errcode, resp.Error)
 	}
 
+	return nil
+}
+
+// SetJoinRulesRestricted sets the room's join_rules to "restricted" so only members of the given space can join.
+// Requires room version 8+. Used for public rooms so access is "Space members" of the parent team/space.
+func (c *Client) SetJoinRulesRestricted(roomID, spaceID string) error {
+	// Empty state_key: PUT /rooms/{roomId}/state/{eventType} (no stateKey segment)
+	endpoint := fmt.Sprintf("/_matrix/client/v3/rooms/%s/state/%s",
+		url.PathEscape(roomID),
+		EventTypeJoinRules)
+
+	content := &JoinRulesContent{
+		JoinRule: "restricted",
+		Allow:    []JoinRulesAllowEntry{{Type: "m.space", RoomID: spaceID}},
+	}
+
+	body, statusCode, err := c.doRequest("PUT", endpoint, content)
+	if err != nil {
+		return err
+	}
+
+	if statusCode != http.StatusOK {
+		var resp GenericResponse
+		json.Unmarshal(body, &resp)
+		return fmt.Errorf("API error (%d): %s - %s", statusCode, resp.Errcode, resp.Error)
+	}
+
+	logger.Info("SetJoinRulesRestricted: room %s now restricted to space %s", roomID, spaceID)
 	return nil
 }
 

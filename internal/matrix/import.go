@@ -79,12 +79,8 @@ func (i *Importer) ImportUsers(users []mattermost.User, existingMapping map[stri
 			progress("users", idx+1, total, user.Username)
 		}
 
-		// Skip deleted users
-		if user.IsDeleted() {
-			logger.Info("User '%s' is deleted, skipping", user.Username)
-			stats.UsersSkipped++
-			continue
-		}
+		// Deleted/locked users are imported as deactivated so they exist for channel history and show as locked in synapse-admin
+		deactivated := user.IsDeleted()
 
 		// Skip if already in mapping
 		if _, exists := existingMapping[user.ID]; exists {
@@ -110,8 +106,17 @@ func (i *Importer) ImportUsers(users []mattermost.User, existingMapping map[stri
 		}
 
 		if exists {
-			// User already exists, just add to mapping
-			mapping[user.ID] = i.client.FormatUserID(user.Username)
+			// User already exists, add to mapping
+			mxID := i.client.FormatUserID(user.Username)
+			mapping[user.ID] = mxID
+			// Keep them deactivated if they are deleted/locked in Mattermost
+			if deactivated {
+				if err := i.client.SetUserDeactivated(mxID, true); err != nil {
+					logger.Warn("Failed to set existing user '%s' as deactivated: %v", user.Username, err)
+				} else {
+					logger.Info("User '%s' already exists; set deactivated (locked) to match Mattermost", user.Username)
+				}
+			}
 			logger.Info("User '%s' already exists, skipped", user.Username)
 			stats.UsersSkipped++
 			continue
@@ -128,7 +133,10 @@ func (i *Importer) ImportUsers(users []mattermost.User, existingMapping map[stri
 			DisplayName: displayName,
 			Email:       strings.TrimSpace(user.Email),
 			Admin:       false,
-			Deactivated: false,
+			Deactivated: deactivated,
+		}
+		if deactivated {
+			logger.Info("User '%s' is deleted/locked in Mattermost; creating in Matrix as deactivated (locked)", user.Username)
 		}
 
 		resp, err := i.client.CreateUser(user.Username, req)
@@ -517,11 +525,13 @@ func (i *Importer) ApplyChannelMemberships(
 	return stats, nil
 }
 
-// LinkRoomsToSpaces links rooms to their parent spaces based on channel-team relationships
+// LinkRoomsToSpaces links rooms to their parent spaces based on channel-team relationships.
+// publicRoomJoinRules: "space_members" (default) sets public rooms to restricted join so only space members can join; "public" leaves join rule as-is.
 func (i *Importer) LinkRoomsToSpaces(
 	channels []mattermost.Channel,
 	spaceMapping map[string]string,
 	roomMapping map[string]string,
+	publicRoomJoinRules string,
 	progress ImportProgressCallback,
 ) (*ImportStats, error) {
 	stats := &ImportStats{}
@@ -556,6 +566,15 @@ func (i *Importer) LinkRoomsToSpaces(
 		if err := i.client.SetRoomParent(roomID, spaceID, true); err != nil {
 			// Non-critical error, room is still linked as child
 			logger.Warn("Failed to set parent for room '%s': %v", channel.DisplayName, err)
+		}
+
+		// Public rooms: optionally set join_rules to "restricted" so only space members can join
+		if channel.IsPublic() && publicRoomJoinRules == "space_members" {
+			if err := i.client.SetJoinRulesRestricted(roomID, spaceID); err != nil {
+				logger.Warn("Failed to set join_rules (Space members) for public room '%s': %v", channel.DisplayName, err)
+			} else {
+				logger.Info("Set join_rules to Space members for public room '%s'", channel.DisplayName)
+			}
 		}
 
 		logger.Success("Linked room '%s' to space", channel.DisplayName)

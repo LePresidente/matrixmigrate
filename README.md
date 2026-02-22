@@ -108,6 +108,16 @@ matrix:
 
 **Matrix**: The tool logs in with username/password to get an access token. Alternatively, you can provide an existing admin token via `MATRIX_ADMIN_TOKEN` environment variable.
 
+### Matrix import options
+
+Under `matrix.import` in `config.yaml` you can set:
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `preserve_owner_and_alias` | `false` | Set room/space owner from Mattermost creator and set local alias (e.g. `#team-channel:domain`). Requires Application Service for room creation. |
+| `force_join` | `false` | Add users to rooms/spaces via Synapse admin API (joined directly, no invite to accept). Use when users are already expected to be members. |
+| **`public_room_join_rules`** | **`space_members`** | Who can join public (Mattermost) channels in Matrix. **`space_members`**: only members of the parent space/team can join (restricted join rule). **`public`**: anyone can join (default Matrix join rule). |
+
 ## Usage
 
 ### Interactive Mode (TUI)

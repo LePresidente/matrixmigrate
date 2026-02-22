@@ -173,12 +173,25 @@ const (
 // SpaceType is the type identifier for spaces
 const SpaceType = "m.space"
 
+// JoinRulesAllowEntry is one entry in m.room.join_rules "allow" (restricted join rule)
+type JoinRulesAllowEntry struct {
+	Type   string `json:"type"`   // "m.space"
+	RoomID string `json:"room_id"`
+}
+
+// JoinRulesContent is the content for m.room.join_rules state events
+type JoinRulesContent struct {
+	JoinRule string               `json:"join_rule"` // "restricted" for space members
+	Allow    []JoinRulesAllowEntry `json:"allow,omitempty"`
+}
+
 // EventTypes
 const (
 	EventTypeSpaceChild  = "m.space.child"
 	EventTypeSpaceParent = "m.space.parent"
 	EventTypeRoomName    = "m.room.name"
 	EventTypeRoomTopic   = "m.room.topic"
+	EventTypeJoinRules   = "m.room.join_rules"
 )
 
 

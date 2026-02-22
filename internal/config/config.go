@@ -65,6 +65,10 @@ type ImportConfig struct {
 	// ForceJoin: when true, add users to rooms/spaces via Synapse admin API (joined directly).
 	// When false, users are invited and must accept. Enable for migrations where users are already members.
 	ForceJoin bool `mapstructure:"force_join"`
+	// PublicRoomJoinRules: who can join public (Mattermost) rooms in Matrix.
+	// "space_members" (default): only members of the parent space/team can join (restricted join rule).
+	// "public": anyone can join (leave default Matrix join rule; room remains openly joinable).
+	PublicRoomJoinRules string `mapstructure:"public_room_join_rules"`
 }
 
 // MASConfig holds Matrix Authentication Service configuration
@@ -189,6 +193,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("matrix.rate_limit.max_retries", 5)            // 5 retries before giving up
 	v.SetDefault("matrix.rate_limit.retry_base_delay_ms", 2000) // 2 second base delay
 	v.SetDefault("matrix.import.force_join", false)
+	v.SetDefault("matrix.import.public_room_join_rules", "space_members")
 	v.SetDefault("data.assets_dir", "./data/assets")
 	v.SetDefault("data.mappings_dir", "./data/mappings")
 	v.SetDefault("data.state_file", "./data/state.json")
@@ -270,6 +275,14 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	// Validate public_room_join_rules
+	switch c.Matrix.Import.PublicRoomJoinRules {
+	case "", "space_members", "public":
+		// valid
+	default:
+		return fmt.Errorf("matrix.import.public_room_join_rules must be \"space_members\" or \"public\", got %q", c.Matrix.Import.PublicRoomJoinRules)
+	}
+
 	// Validate MAS config when enabled
 	if c.Matrix.MAS.Enabled {
 		if c.Matrix.MAS.Endpoint == "" {
@@ -317,6 +330,16 @@ func (c *Config) GetMatrixPassword() string {
 // UseTokenAuth returns true if admin token should be used instead of login
 func (c *Config) UseTokenAuth() bool {
 	return c.GetMatrixAdminToken() != ""
+}
+
+// GetPublicRoomJoinRules returns the effective public room join rules: "space_members" or "public".
+// Empty config is treated as "space_members" (default).
+func (c *Config) GetPublicRoomJoinRules() string {
+	s := c.Matrix.Import.PublicRoomJoinRules
+	if s == "" {
+		return "space_members"
+	}
+	return s
 }
 
 // GetSSHKeyPassphrase returns the SSH key passphrase from environment
