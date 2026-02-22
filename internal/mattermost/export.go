@@ -1,4 +1,4 @@
-﻿package mattermost
+package mattermost
 
 import (
 	"fmt"
@@ -123,18 +123,16 @@ func (e *Exporter) GetCounts() (users, teams, channels int, err error) {
 	return users, teams, channels, nil
 }
 
-// FilterActiveAssets filters out deleted items from assets
+// FilterActiveAssets filters out deleted teams and channels from assets.
+// All users are kept (including deleted/deactivated) so they can be imported into Matrix as deactivated for channel history.
 func FilterActiveAssets(assets *Assets) *Assets {
 	filtered := &Assets{
 		ExportedAt: assets.ExportedAt,
 		Version:    assets.Version,
 	}
 
-	for _, u := range assets.Users {
-		if !u.IsDeleted() {
-			filtered.Users = append(filtered.Users, u)
-		}
-	}
+	// Keep all users (deleted users are imported into Matrix as deactivated for message attribution)
+	filtered.Users = assets.Users
 
 	for _, t := range assets.Teams {
 		if !t.IsDeleted() {
