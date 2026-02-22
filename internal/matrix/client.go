@@ -56,6 +56,10 @@ type Client struct {
 
 	// ForceJoin: when true, add users via Synapse admin API (joined directly) instead of invite
 	forceJoin bool
+
+	// joinedRooms: room IDs the admin has already joined (Synapse admin join API requires admin in room)
+	joinedRooms   map[string]struct{}
+	joinedRoomsMu sync.Mutex
 }
 
 // NewClient creates a new Matrix API client with default rate limiting
@@ -660,7 +664,7 @@ func (c *Client) InviteUser(roomID, userID string) error {
 }
 
 // ForceJoinUser adds a user to a room or space via Synapse admin API (user is joined directly, no invite to accept).
-// Only works for local users. Requires admin token. The server admin must be in the room.
+// Only works for local users. Requires admin token. The server admin must be in the room (call ensureAdminInRoom first).
 func (c *Client) ForceJoinUser(roomID, userID string) error {
 	endpoint := fmt.Sprintf("/_synapse/admin/v1/join/%s", url.PathEscape(roomID))
 	req := &InviteRequest{UserID: userID}
@@ -676,9 +680,35 @@ func (c *Client) ForceJoinUser(roomID, userID string) error {
 	return nil
 }
 
+// ensureAdminInRoom ensures the admin user has joined the room. Required before ForceJoinUser (Synapse requires admin in room).
+// Joins are cached per room so each room is only joined once.
+func (c *Client) ensureAdminInRoom(roomID string) error {
+	c.joinedRoomsMu.Lock()
+	if c.joinedRooms == nil {
+		c.joinedRooms = make(map[string]struct{})
+	}
+	_, alreadyJoined := c.joinedRooms[roomID]
+	c.joinedRoomsMu.Unlock()
+
+	if alreadyJoined {
+		return nil
+	}
+	if err := c.JoinRoom(roomID); err != nil {
+		return fmt.Errorf("admin join room (required for force-join): %w", err)
+	}
+	c.joinedRoomsMu.Lock()
+	c.joinedRooms[roomID] = struct{}{}
+	c.joinedRoomsMu.Unlock()
+	return nil
+}
+
 // AddUserToRoom adds a user to a room: force-join via Synapse admin API if ForceJoin is enabled, otherwise invite.
+// When force-join is used, the admin is joined to the room first (Synapse requirement).
 func (c *Client) AddUserToRoom(roomID, userID string) error {
 	if c.forceJoin {
+		if err := c.ensureAdminInRoom(roomID); err != nil {
+			return err
+		}
 		return c.ForceJoinUser(roomID, userID)
 	}
 	return c.InviteUser(roomID, userID)
