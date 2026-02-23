@@ -5,6 +5,10 @@
 # Supported: en, tr
 language: en
 
+# Enable debug-level logging to migration.log (function names, room/space IDs) to trace errors
+# Set to true when diagnosing "admin in room", "link room to space", or membership failures
+debug: false
+
 # Mattermost server configuration
 mattermost:
   ssh:
@@ -124,6 +128,9 @@ matrix:
   import:
     # When true, rooms and spaces get: owner from channel/team creator_id (or fallback), alias = team+name
     preserve_owner_and_alias: false
+    # When true, Mattermost direct message channels (D type) are exported and imported as Matrix DMs.
+    # They show under "People" for both users. Requires Application Service (appservice.enabled) for setting m.direct.
+    # import_direct_messages: false
     # When true, users are added to rooms/spaces via Synapse admin API (joined directly, no invite to accept).
     # Use for migrations where users are already members. Default: false (invite; users must accept).
     # force_join: false

@@ -18,8 +18,9 @@ func NewExporter(client *Client) *Exporter {
 // ExportProgressCallback is called to report export progress
 type ExportProgressCallback func(stage string, current, total int)
 
-// ExportAssets exports all assets (users, teams, channels)
-func (e *Exporter) ExportAssets(progress ExportProgressCallback) (*Assets, error) {
+// ExportAssets exports all assets (users, teams, channels). When includeDirectMessages is true,
+// also exports direct message channels (type D) into assets.DirectChannels.
+func (e *Exporter) ExportAssets(progress ExportProgressCallback, includeDirectMessages bool) (*Assets, error) {
 	assets := &Assets{
 		ExportedAt: time.Now().UnixMilli(),
 		Version:    "1.0",
@@ -51,17 +52,23 @@ func (e *Exporter) ExportAssets(progress ExportProgressCallback) (*Assets, error
 		progress("teams", len(teams), len(teams))
 	}
 
-	// Export channels
+	// Export channels (O, P, G, and optionally D via GetChannels(includeDirect))
 	if progress != nil {
 		progress("channels", 0, 0)
 	}
-	channels, err := e.client.GetChannels()
+	allChannels, err := e.client.GetChannels(includeDirectMessages)
 	if err != nil {
 		return nil, fmt.Errorf("failed to export channels: %w", err)
 	}
-	assets.Channels = channels
+	for _, ch := range allChannels {
+		if ch.IsDirect() {
+			assets.DirectChannels = append(assets.DirectChannels, ch)
+		} else {
+			assets.Channels = append(assets.Channels, ch)
+		}
+	}
 	if progress != nil {
-		progress("channels", len(channels), len(channels))
+		progress("channels", len(allChannels), len(allChannels))
 	}
 
 	return assets, nil
@@ -143,6 +150,12 @@ func FilterActiveAssets(assets *Assets) *Assets {
 	for _, c := range assets.Channels {
 		if !c.IsDeleted() {
 			filtered.Channels = append(filtered.Channels, c)
+		}
+	}
+
+	for _, c := range assets.DirectChannels {
+		if !c.IsDeleted() {
+			filtered.DirectChannels = append(filtered.DirectChannels, c)
 		}
 	}
 

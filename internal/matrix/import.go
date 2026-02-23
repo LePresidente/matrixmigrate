@@ -440,35 +440,53 @@ func (i *Importer) ApplyTeamMemberships(
 
 // ApplyChannelMemberships invites users to rooms based on channel memberships.
 // For group channels (type G), after inviting all members we set equal power levels (50) for everyone to match Mattermost.
-// channels is used to identify group channels; can be nil (then no equal power levels are set).
+// Direct channels (type D) are skipped: both participants were already added during ImportDirectChannelsAsDMs (CreateDirectRoom).
+// When force_join is enabled and the client has an AS token, for group (G) and private (P) rooms the admin is invited by the room owner,
+// joins with power level 100, force-joins members, then leaves. defaultRoomOwnerID is used when channel has no creator_id (e.g. group channels).
+// channels is used to identify group and direct channels; can be nil (then no equal power levels, and no DM skip).
 func (i *Importer) ApplyChannelMemberships(
 	channels []mattermost.Channel,
 	memberships []mattermost.ChannelMember,
 	userMapping map[string]string,
 	roomMapping map[string]string,
+	defaultRoomOwnerID string,
 	progress ImportProgressCallback,
 ) (*ImportStats, error) {
 	stats := &ImportStats{}
 	total := len(memberships)
 
+	channelByID := make(map[string]mattermost.Channel)
 	groupChannelIDs := make(map[string]bool)
+	directChannelIDs := make(map[string]bool)
 	for _, ch := range channels {
+		channelByID[ch.ID] = ch
 		if ch.IsGroup() {
 			groupChannelIDs[ch.ID] = true
+		}
+		if ch.IsDirect() {
+			directChannelIDs[ch.ID] = true
 		}
 	}
 
 	// Per group-channel room ID, collect Matrix user IDs that were added (for equal power levels later)
 	groupRoomMembers := make(map[string][]string)
 
-	logger.Info("Starting channel membership import: %d memberships to process", total)
+	// When force_join + AS: rooms we joined (via owner invite) so we can leave after processing all memberships
+	roomsToLeaveAfter := make(map[string]struct{})
+	ensuredRoomsForForceJoin := make(map[string]struct{})
+
+	logger.Info("Starting channel membership import: %d memberships to process (%d DM channels will be skipped)", total, len(directChannelIDs))
 
 	for idx, membership := range memberships {
 		if progress != nil {
 			progress("channel_memberships", idx+1, total, "")
 		}
 
-		// Get Matrix IDs
+		if directChannelIDs[membership.ChannelID] {
+			stats.MembersSkipped++
+			continue
+		}
+
 		userID, userExists := userMapping[membership.UserID]
 		roomID, roomExists := roomMapping[membership.ChannelID]
 
@@ -483,11 +501,35 @@ func (i *Importer) ApplyChannelMemberships(
 			continue
 		}
 
+		// For group (G) and private (P) rooms with force_join: ensure admin is in the room once (owner invites, admin joins with PL 100).
+		channel := channelByID[membership.ChannelID]
+		if i.client.ForceJoinEnabled() && i.client.HasASToken() && (channel.IsGroup() || channel.IsPrivate()) {
+			if _, already := ensuredRoomsForForceJoin[roomID]; !already {
+				roomOwnerID := defaultRoomOwnerID
+				if channel.CreatorID != "" {
+					if mx, ok := userMapping[channel.CreatorID]; ok && mx != "" {
+						roomOwnerID = mx
+					}
+				}
+				if roomOwnerID != "" {
+					logger.Debug("ApplyChannelMemberships: ensuring admin in room %s (owner %s) for membership %s -> room", roomID, roomOwnerID, userID)
+					if err := i.client.ensureAdminInRoomWithPower(roomID, roomOwnerID, 100); err != nil {
+						logger.Warn("ApplyChannelMemberships: could not ensure admin in room %s (owner %s): %v", roomID, roomOwnerID, err)
+					} else {
+						ensuredRoomsForForceJoin[roomID] = struct{}{}
+						roomsToLeaveAfter[roomID] = struct{}{}
+						logger.Info("ApplyChannelMemberships: admin joined room %s (PL 100) for force-join", roomID)
+					}
+				}
+			}
+		}
+
 		if i.client.ForceJoinEnabled() {
 			logger.Info("Channel membership %d/%d: force-joining %s to room %s", idx+1, total, userID, roomID)
 		} else {
 			logger.Info("Channel membership %d/%d: inviting %s to room %s", idx+1, total, userID, roomID)
 		}
+		logger.Debug("ApplyChannelMemberships: AddUserToRoom room=%s user=%s (membership %d/%d)", roomID, userID, idx+1, total)
 
 		if groupChannelIDs[membership.ChannelID] {
 			groupRoomMembers[roomID] = append(groupRoomMembers[roomID], userID)
@@ -501,6 +543,16 @@ func (i *Importer) ApplyChannelMemberships(
 
 		logger.Success("Channel membership %d/%d: %s added to room", idx+1, total, userID)
 		stats.MembersAdded++
+	}
+
+	// Leave rooms we joined for force-join so the admin is not left in group/private rooms
+	for roomID := range roomsToLeaveAfter {
+		logger.Debug("ApplyChannelMemberships: LeaveRoom %s (admin leaving after force-join)", roomID)
+		if err := i.client.LeaveRoom(roomID); err != nil {
+			logger.Warn("ApplyChannelMemberships: admin leave room %s after force-join: %v", roomID, err)
+		} else {
+			logger.Info("ApplyChannelMemberships: admin left room %s", roomID)
+		}
 	}
 
 	// For group channels, set equal power levels (50) for all members to match Mattermost
@@ -525,29 +577,135 @@ func (i *Importer) ApplyChannelMemberships(
 	return stats, nil
 }
 
+// ImportDirectChannelsAsDMs imports Mattermost direct message channels (type D) as Matrix DMs.
+// Room creator is preferred as a real user (not the AS); is_direct and m.direct are set so both users see the room under "People".
+// When channel has no creator_id, name format is "senderID_receiverID" (first = sender, second = receiver); sender is used as room creator.
+func (i *Importer) ImportDirectChannelsAsDMs(
+	directChannels []mattermost.Channel,
+	userMapping map[string]string,
+	existingMapping map[string]string,
+	progress ImportProgressCallback,
+) (map[string]string, *ImportStats, error) {
+	mapping := make(map[string]string)
+	stats := &ImportStats{}
+	total := len(directChannels)
+
+	for k, v := range existingMapping {
+		mapping[k] = v
+	}
+
+	if !i.client.HasASToken() {
+		logger.Warn("ImportDirectChannelsAsDMs: Application Service token not set; DMs will be created but m.direct (People list) cannot be set for users")
+	}
+
+	logger.Info("ImportDirectChannelsAsDMs: processing %d direct channels", total)
+
+	for idx, channel := range directChannels {
+		if progress != nil {
+			progress("dm_rooms", idx+1, total, channel.ID)
+		}
+
+		if channel.IsDeleted() {
+			logger.Info("DM channel %s deleted, skipping", channel.ID)
+			stats.RoomsSkipped++
+			continue
+		}
+
+		if _, exists := existingMapping[channel.ID]; exists {
+			logger.Info("DM channel %s already imported, skipping", channel.ID)
+			stats.RoomsSkipped++
+			continue
+		}
+
+		// Resolve the two Matrix user IDs for this DM
+		senderID, receiverID, err := channel.DMParticipantIDs()
+		if err != nil {
+			logger.Error("ImportDirectChannelsAsDMs: channel %s: %v", channel.ID, err)
+			stats.RoomsFailed++
+			continue
+		}
+		creatorMX, ok1 := userMapping[senderID]
+		otherMX, ok2 := userMapping[receiverID]
+		if !ok1 || !ok2 {
+			if !ok1 {
+				logger.Warn("ImportDirectChannelsAsDMs: channel %s sender %s not in user mapping, skipping", channel.ID, senderID)
+			}
+			if !ok2 {
+				logger.Warn("ImportDirectChannelsAsDMs: channel %s receiver %s not in user mapping, skipping", channel.ID, receiverID)
+			}
+			stats.RoomsSkipped++
+			continue
+		}
+		// When Mattermost has creator_id, use it as room creator; other participant is the one from name that isn't creator
+		if channel.CreatorID != "" {
+			if mx, ok := userMapping[channel.CreatorID]; ok {
+				creatorMX = mx
+				if channel.CreatorID == senderID {
+					otherMX = userMapping[receiverID]
+				} else {
+					otherMX = userMapping[senderID]
+				}
+			}
+		}
+
+		if creatorMX == "" || otherMX == "" {
+			logger.Warn("ImportDirectChannelsAsDMs: channel %s could not resolve both users (creator=%q other=%q), skipping", channel.ID, creatorMX, otherMX)
+			stats.RoomsSkipped++
+			continue
+		}
+		if creatorMX == otherMX {
+			logger.Warn("ImportDirectChannelsAsDMs: channel %s same user for both sides, skipping", channel.ID)
+			stats.RoomsSkipped++
+			continue
+		}
+
+		resp, err := i.client.CreateDirectRoom(creatorMX, otherMX)
+		if err != nil {
+			logger.Error("ImportDirectChannelsAsDMs: failed to create DM for channel %s (%s <-> %s): %v", channel.ID, creatorMX, otherMX, err)
+			stats.RoomsFailed++
+			continue
+		}
+
+		logger.Success("ImportDirectChannelsAsDMs: created DM %s for channel %s (%s <-> %s)", resp.RoomID, channel.ID, creatorMX, otherMX)
+		mapping[channel.ID] = resp.RoomID
+		stats.RoomsCreated++
+	}
+
+	logger.Info("ImportDirectChannelsAsDMs completed: created=%d, skipped=%d, failed=%d",
+		stats.RoomsCreated, stats.RoomsSkipped, stats.RoomsFailed)
+
+	return mapping, stats, nil
+}
+
 // LinkRoomsToSpaces links rooms to their parent spaces based on channel-team relationships.
+// When userMapping and defaultSpaceOwnerID are provided and the client has an AS token, the admin is invited
+// into each space and room (by the owner) with power level 50 before linking, so invite-only/restricted rooms work.
 // publicRoomJoinRules: "space_members" (default) sets public rooms to restricted join so only space members can join; "public" leaves join rule as-is.
 func (i *Importer) LinkRoomsToSpaces(
 	channels []mattermost.Channel,
 	spaceMapping map[string]string,
 	roomMapping map[string]string,
+	userMapping map[string]string,
+	defaultSpaceOwnerID string,
 	publicRoomJoinRules string,
 	progress ImportProgressCallback,
 ) (*ImportStats, error) {
 	stats := &ImportStats{}
 	total := len(channels)
+	ensuredSpaceIDs := make(map[string]struct{})
 
 	for idx, channel := range channels {
 		if progress != nil {
 			progress("linking", idx+1, total, channel.DisplayName)
 		}
 
-		// Skip if no team association
 		if channel.TeamID == "" {
 			continue
 		}
+		if channel.IsDirect() {
+			continue // DMs are not linked to spaces
+		}
 
-		// Get Matrix IDs
 		spaceID, spaceExists := spaceMapping[channel.TeamID]
 		roomID, roomExists := roomMapping[channel.ID]
 
@@ -555,7 +713,30 @@ func (i *Importer) LinkRoomsToSpaces(
 			continue
 		}
 
-		// Add room as child of space
+		// When rooms/spaces were created as owner via AS, admin must be invited (by owner) and given power before linking.
+		if i.client.HasASToken() && defaultSpaceOwnerID != "" {
+			if _, done := ensuredSpaceIDs[spaceID]; !done {
+				logger.Debug("LinkRoomsToSpaces: ensuring admin in space %s (room %q)", spaceID, channel.DisplayName)
+				if err := i.client.ensureAdminInSpaceWithPower(spaceID, defaultSpaceOwnerID, 50); err != nil {
+					logger.Warn("LinkRoomsToSpaces: could not ensure admin in space %s: %v (linking may fail)", spaceID, err)
+				} else {
+					logger.Info("LinkRoomsToSpaces: admin ensured in space %s", spaceID)
+				}
+				ensuredSpaceIDs[spaceID] = struct{}{}
+			}
+			roomOwnerID := defaultSpaceOwnerID
+			if channel.CreatorID != "" && userMapping != nil {
+				if mx, ok := userMapping[channel.CreatorID]; ok && mx != "" {
+					roomOwnerID = mx
+				}
+			}
+			logger.Debug("LinkRoomsToSpaces: ensuring admin in room %s (owner %s) for room %q", roomID, roomOwnerID, channel.DisplayName)
+			if err := i.client.ensureAdminInRoomWithPower(roomID, roomOwnerID, 50); err != nil {
+				logger.Warn("LinkRoomsToSpaces: could not ensure admin in room %s (owner %s): %v", roomID, roomOwnerID, err)
+			}
+		}
+
+		logger.Debug("LinkRoomsToSpaces: AddRoomToSpace room %q -> space %s", channel.DisplayName, spaceID)
 		if err := i.client.AddRoomToSpace(spaceID, roomID, true); err != nil {
 			logger.Error("Failed to link room '%s' to space: %v", channel.DisplayName, err)
 			stats.RoomsLinkFailed++
@@ -563,6 +744,7 @@ func (i *Importer) LinkRoomsToSpaces(
 		}
 
 		// Set space as parent of room
+		logger.Debug("LinkRoomsToSpaces: SetRoomParent room %q roomID=%s spaceID=%s", channel.DisplayName, roomID, spaceID)
 		if err := i.client.SetRoomParent(roomID, spaceID, true); err != nil {
 			// Non-critical error, room is still linked as child
 			logger.Warn("Failed to set parent for room '%s': %v", channel.DisplayName, err)
@@ -570,6 +752,7 @@ func (i *Importer) LinkRoomsToSpaces(
 
 		// Public rooms: optionally set join_rules to "restricted" so only space members can join
 		if channel.IsPublic() && publicRoomJoinRules == "space_members" {
+			logger.Debug("LinkRoomsToSpaces: SetJoinRulesRestricted room %q", channel.DisplayName)
 			if err := i.client.SetJoinRulesRestricted(roomID, spaceID); err != nil {
 				logger.Warn("Failed to set join_rules (Space members) for public room '%s': %v", channel.DisplayName, err)
 			} else {

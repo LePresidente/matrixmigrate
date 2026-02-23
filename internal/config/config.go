@@ -12,6 +12,7 @@ import (
 // Config represents the main configuration structure
 type Config struct {
 	Language   string           `mapstructure:"language"`
+	Debug      bool             `mapstructure:"debug"` // Enable debug-level logging to migration.log
 	Mattermost MattermostConfig `mapstructure:"mattermost"`
 	Matrix     MatrixConfig     `mapstructure:"matrix"`
 	Data       DataConfig       `mapstructure:"data"`
@@ -69,6 +70,9 @@ type ImportConfig struct {
 	// "space_members" (default): only members of the parent space/team can join (restricted join rule).
 	// "public": anyone can join (leave default Matrix join rule; room remains openly joinable).
 	PublicRoomJoinRules string `mapstructure:"public_room_join_rules"`
+	// ImportDirectMessages: when true, export and import Mattermost direct message channels (D type) as Matrix DMs.
+	// Rooms appear under "People" for both users with is_direct set. Requires Application Service for m.direct account_data.
+	ImportDirectMessages bool `mapstructure:"import_direct_messages"`
 }
 
 // MASConfig holds Matrix Authentication Service configuration
@@ -181,6 +185,7 @@ func Load(cfgFile string) (*Config, error) {
 // setDefaults sets default configuration values
 func setDefaults(v *viper.Viper) {
 	v.SetDefault("language", "en")
+	v.SetDefault("debug", false)
 	v.SetDefault("mattermost.ssh.port", 22)
 	v.SetDefault("mattermost.config_path", "/opt/mattermost/config/config.json")
 	v.SetDefault("mattermost.database.host", "localhost")

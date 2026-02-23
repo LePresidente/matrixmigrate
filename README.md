@@ -117,6 +117,21 @@ Under `matrix.import` in `config.yaml` you can set:
 | `preserve_owner_and_alias` | `false` | Set room/space owner from Mattermost creator and set local alias (e.g. `#team-channel:domain`). Requires Application Service for room creation. |
 | `force_join` | `false` | Add users to rooms/spaces via Synapse admin API (joined directly, no invite to accept). Use when users are already expected to be members. |
 | **`public_room_join_rules`** | **`space_members`** | Who can join public (Mattermost) channels in Matrix. **`space_members`**: only members of the parent space/team can join (restricted join rule). **`public`**: anyone can join (default Matrix join rule). |
+| `import_direct_messages` | `false` | Export and import Mattermost **direct message** channels (D type) as Matrix DMs. Rooms appear under **People** for both users. See [Direct messages import](#direct-messages-import) below. |
+
+#### Direct messages import
+
+When `import_direct_messages` is `true`:
+
+- **Export**: In addition to public/private/group channels, the tool exports Mattermost **direct message** channels (type `D`). For D channels without a `creator_id`, the channel name is expected in the form `senderID_receiverID` (first ID = sender, second = receiver); both users are resolved from the user mapping and the room is created between them.
+- **Import**: Each D channel is created as a **Matrix DM** (private room with `is_direct` set). The room is created as one of the two users (preferably not the Application Service bot) so it shows under **People** for both participants. The Application Service is used only when needed (e.g. to set `m.direct` account_data so clients list the room under People, and to send messages with original timestamps); the AS user is **not** added as a member of the DM.
+- **Requirements**:
+  - **Application Service** must be enabled (`matrix.appservice.enabled: true`) and `as_token_env` set. This is required to set `m.direct` for both users so the room appears under People for both, and for message import with correct senders and timestamps.
+  - Both participants must exist in the user mapping (i.e. they must have been imported in the “Import assets” step).
+- **Troubleshooting**:
+  - If DMs are created but do not show under People for a user, ensure the Application Service token is valid and the AS registration allows the `user_id` query parameter for account_data.
+  - Check logs for `ImportDirectChannelsAsDMs` and `CreateDirectRoom` to see which channels were skipped (e.g. missing user mapping, duplicate users, or API errors).
+  - “Sender/receiver” from the Mattermost name format is used only when `creator_id` is empty; when `creator_id` is set, that user is used as the room creator and the other participant is taken from the channel name.
 
 ## Usage
 

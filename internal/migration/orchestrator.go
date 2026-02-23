@@ -30,6 +30,10 @@ func NewOrchestrator(cfg *config.Config) (*Orchestrator, error) {
 	if err := logger.Init(cfg.Data.AssetsDir); err != nil {
 		// Non-fatal, continue without logging
 	}
+	logger.SetDebug(cfg.Debug)
+	if cfg.Debug {
+		logger.Info("Debug logging enabled")
+	}
 
 	// Load or create state
 	state, err := LoadState(cfg.Data.StateFile)
@@ -358,8 +362,12 @@ func (o *Orchestrator) ExportAssets(progress ProgressCallback) (*OperationResult
 		}
 	}
 
-	// Export assets
-	assets, err := exporter.ExportAssets(exportProgress)
+	// Export assets (include direct message channels when import_direct_messages is enabled)
+	includeDirectMessages := o.config.Matrix.Import.ImportDirectMessages
+	if includeDirectMessages {
+		logger.Info("Export assets: import_direct_messages is enabled; will export D type channels for DM import")
+	}
+	assets, err := exporter.ExportAssets(exportProgress, includeDirectMessages)
 	if err != nil {
 		o.state.FailStep(StepExportAssets, err)
 		o.SaveState()
@@ -372,7 +380,7 @@ func (o *Orchestrator) ExportAssets(progress ProgressCallback) (*OperationResult
 	// Count exported items
 	result.UsersExported = len(assets.Users)
 	result.TeamsExported = len(assets.Teams)
-	result.ChannelsExported = len(assets.Channels)
+	result.ChannelsExported = len(assets.Channels) + len(assets.DirectChannels)
 
 	// Generate filename
 	timestamp := time.Now().Format("20060102-150405")
@@ -506,6 +514,29 @@ func (o *Orchestrator) ImportAssets(progress ProgressCallback) (*OperationResult
 		return nil, fmt.Errorf("import failed: %w", err)
 	}
 
+	// Import direct message channels as Matrix DMs when enabled
+	if o.config.Matrix.Import.ImportDirectMessages && len(assets.DirectChannels) > 0 {
+		logger.Info("Import direct messages: processing %d direct channels as DMs", len(assets.DirectChannels))
+		existingRoomMapping := make(map[string]string)
+		if existingMappings != nil {
+			existingRoomMapping = existingMappings.Rooms
+		}
+		dmMapping, dmStats, err := importer.ImportDirectChannelsAsDMs(assets.DirectChannels, importResult.UserMapping, existingRoomMapping, importProgress)
+		if err != nil {
+			logger.Error("Import direct messages failed: %v", err)
+			o.state.FailStep(StepImportAssets, err)
+			o.SaveState()
+			return nil, fmt.Errorf("import direct messages failed: %w", err)
+		}
+		for k, v := range dmMapping {
+			importResult.RoomMapping[k] = v
+		}
+		importResult.Stats.RoomsCreated += dmStats.RoomsCreated
+		importResult.Stats.RoomsSkipped += dmStats.RoomsSkipped
+		importResult.Stats.RoomsFailed += dmStats.RoomsFailed
+		logger.Info("Import direct messages: created=%d, skipped=%d, failed=%d", dmStats.RoomsCreated, dmStats.RoomsSkipped, dmStats.RoomsFailed)
+	}
+
 	// Fill result stats
 	result.UsersCreated = importResult.Stats.UsersCreated
 	result.UsersSkipped = importResult.Stats.UsersSkipped
@@ -531,11 +562,15 @@ func (o *Orchestrator) ImportAssets(progress ProgressCallback) (*OperationResult
 		return nil, fmt.Errorf("failed to save mapping: %w", err)
 	}
 
-	// Link rooms to spaces
+	// Link rooms to spaces (pass userMapping and defaultSpaceOwnerID so admin can be invited into spaces/rooms before linking)
+	defaultSpaceOwnerID := ""
+	if roomOpts != nil {
+		defaultSpaceOwnerID = roomOpts.AdminUserID
+	}
 	if progress != nil {
 		progress("linking", 0, len(assets.Channels), "")
 	}
-	linkResult, err := importer.LinkRoomsToSpaces(assets.Channels, importResult.SpaceMapping, importResult.RoomMapping, o.config.GetPublicRoomJoinRules(), importProgress)
+	linkResult, err := importer.LinkRoomsToSpaces(assets.Channels, importResult.SpaceMapping, importResult.RoomMapping, importResult.UserMapping, defaultSpaceOwnerID, o.config.GetPublicRoomJoinRules(), importProgress)
 	if err == nil && linkResult != nil {
 		result.RoomsLinked = linkResult.RoomsLinked
 	}
@@ -674,13 +709,13 @@ func (o *Orchestrator) ImportMemberships(progress ProgressCallback) (*OperationR
 	logger.Info("Loaded mapping: %d users, %d teams, %d channels",
 		len(mapping.Users), len(mapping.Teams), len(mapping.Channels))
 
-	// Load assets to get channel list (needed for group channel equal power levels)
+	// Load assets to get channel list (needed for group channel equal power levels and DM memberships)
 	var channels []mattermost.Channel
 	if assetFile := o.state.GetStepOutputFile(StepExportAssets); assetFile != "" {
 		var assets mattermost.Assets
 		if err := archive.LoadGzipJSON(assetFile, &assets); err == nil {
-			channels = assets.Channels
-			logger.Info("Loaded %d channels from assets for group channel handling", len(channels))
+			channels = append(assets.Channels, assets.DirectChannels...)
+			logger.Info("Loaded %d channels (%d regular + %d direct) from assets for membership import", len(channels), len(assets.Channels), len(assets.DirectChannels))
 		}
 	}
 
@@ -707,11 +742,23 @@ func (o *Orchestrator) ImportMemberships(progress ProgressCallback) (*OperationR
 		return nil, fmt.Errorf("failed to apply team memberships: %w", err)
 	}
 
+	// Default room owner for group/private rooms when creator_id is empty (used when force_join + AS to invite admin into room)
+	defaultRoomOwnerID := ""
+	if who, err := o.mxClient.WhoAmI(); err == nil && who != nil {
+		defaultRoomOwnerID = who.UserID
+	}
+	if defaultRoomOwnerID == "" {
+		defaultRoomOwnerID = o.config.FormatUserID(o.config.Matrix.Auth.Username)
+	}
+	if defaultRoomOwnerID == "" {
+		defaultRoomOwnerID = o.config.FormatUserID("admin")
+	}
+
 	// Apply channel memberships
 	if progress != nil {
 		progress("channel_memberships", 0, len(memberships.ChannelMembers), "")
 	}
-	channelStats, err := importer.ApplyChannelMemberships(channels, memberships.ChannelMembers, mapping.Users, mapping.Channels, importProgress)
+	channelStats, err := importer.ApplyChannelMemberships(channels, memberships.ChannelMembers, mapping.Users, mapping.Channels, defaultRoomOwnerID, importProgress)
 	if err != nil {
 		o.state.FailStep(StepImportMemberships, err)
 		o.SaveState()

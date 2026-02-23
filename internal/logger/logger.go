@@ -16,9 +16,28 @@ type Logger struct {
 }
 
 var (
-	instance *Logger
-	once     sync.Once
+	instance     *Logger
+	once         sync.Once
+	debugEnabled bool
+	debugMu      sync.Mutex
 )
+
+// SetDebug enables or disables debug-level logging. Call after Init.
+func SetDebug(enabled bool) {
+	debugMu.Lock()
+	defer debugMu.Unlock()
+	debugEnabled = enabled
+}
+
+// Debug logs a debug message only when debug logging is enabled.
+func Debug(format string, args ...interface{}) {
+	debugMu.Lock()
+	enabled := debugEnabled
+	debugMu.Unlock()
+	if enabled && instance != nil {
+		instance.write("DEBUG", fmt.Sprintf(format, args...))
+	}
+}
 
 // Init initializes the global logger
 func Init(dataDir string) error {

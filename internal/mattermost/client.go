@@ -1,4 +1,4 @@
-﻿package mattermost
+package mattermost
 
 import (
 	"database/sql"
@@ -130,8 +130,15 @@ func (c *Client) GetTeams() ([]Team, error) {
 	return teams, nil
 }
 
-// GetChannels retrieves all channels from the database
-func (c *Client) GetChannels() ([]Channel, error) {
+// GetChannels retrieves all channels from the database.
+// When includeDirect is false, returns only O, P, G (public, private, group).
+// When includeDirect is true, also returns D (direct message) channels.
+// DM channel name format when creator_id is empty: "senderID_receiverID" (first = sender, second = receiver).
+func (c *Client) GetChannels(includeDirect bool) ([]Channel, error) {
+	typeFilter := "('O', 'P', 'G')"
+	if includeDirect {
+		typeFilter = "('O', 'P', 'G', 'D')"
+	}
 	query := `
 		SELECT 
 			id, 
@@ -144,7 +151,7 @@ func (c *Client) GetChannels() ([]Channel, error) {
 			COALESCE(creatorid, '') as creatorid,
 			COALESCE(totalmsgcount, 0) as totalmsgcount
 		FROM channels
-		WHERE type IN ('O', 'P', 'G')
+		WHERE type IN ` + typeFilter + `
 		ORDER BY createat ASC
 	`
 

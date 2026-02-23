@@ -1,6 +1,10 @@
-﻿package mattermost
+package mattermost
 
-import "time"
+import (
+	"fmt"
+	"strings"
+	"time"
+)
 
 // User represents a Mattermost user
 type User struct {
@@ -97,6 +101,34 @@ func (c *Channel) IsGroup() bool {
 	return c.Type == "G"
 }
 
+// DMParticipantIDs returns the two Mattermost user IDs for a direct message channel.
+// When creator_id is set, the other participant is derived from the channel name.
+// Name format is "senderID__receiverID" (double underscore separator) or "senderID_receiverID" (single).
+// Returns (senderID, receiverID, nil) or error if not a D channel or name cannot be parsed.
+func (c *Channel) DMParticipantIDs() (senderID, receiverID string, err error) {
+	if c.Type != "D" {
+		return "", "", fmt.Errorf("channel %s is not a direct channel (type %s)", c.ID, c.Type)
+	}
+	name := strings.TrimSpace(c.Name)
+	if name == "" {
+		return "", "", fmt.Errorf("direct channel %s has empty name", c.ID)
+	}
+	// Mattermost uses double underscore as separator (e.g. id1__id2); fall back to single underscore
+	parts := strings.SplitN(name, "__", 2)
+	if len(parts) != 2 {
+		parts = strings.SplitN(name, "_", 2)
+	}
+	if len(parts) != 2 {
+		return "", "", fmt.Errorf("direct channel %s name %q does not match sender_receiver format", c.ID, name)
+	}
+	id1, id2 := strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
+	if id1 == "" || id2 == "" {
+		return "", "", fmt.Errorf("direct channel %s name %q has empty participant ID", c.ID, name)
+	}
+	// Mattermost format: first ID = sender, second = receiver
+	return id1, id2, nil
+}
+
 // TeamMember represents a user's membership in a team
 type TeamMember struct {
 	TeamID   string `json:"team_id" db:"teamid"`
@@ -133,11 +165,12 @@ func (cm *ChannelMember) IsAdmin() bool {
 
 // Assets represents all exportable data from Mattermost
 type Assets struct {
-	ExportedAt int64     `json:"exported_at"`
-	Version    string    `json:"version"`
-	Users      []User    `json:"users"`
-	Teams      []Team    `json:"teams"`
-	Channels   []Channel `json:"channels"`
+	ExportedAt     int64     `json:"exported_at"`
+	Version        string    `json:"version"`
+	Users          []User    `json:"users"`
+	Teams          []Team    `json:"teams"`
+	Channels       []Channel `json:"channels"`        // O, P, G (public, private, group)
+	DirectChannels []Channel `json:"direct_channels"` // D (direct messages), when import_direct_messages is enabled
 }
 
 // Memberships represents all membership data from Mattermost
