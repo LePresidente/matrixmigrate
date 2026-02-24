@@ -972,6 +972,11 @@ func (c *Client) ensureAdminInSpaceWithPower(spaceID, ownerUserID string, powerL
 	if err != nil {
 		return fmt.Errorf("get power levels: %w", err)
 	}
+	currentLevel := powerLevelForUser(pl, me.UserID)
+	if currentLevel >= powerLevel {
+		logger.Debug("ensureAdminInSpaceWithPower: admin already has level %d in space=%s (needed=%d)", currentLevel, spaceID, powerLevel)
+		return nil
+	}
 	if pl.Users == nil {
 		pl.Users = make(map[string]int)
 	}
@@ -1013,6 +1018,11 @@ func (c *Client) ensureAdminInRoomWithPower(roomID, ownerUserID string, powerLev
 	pl, err := c.getPowerLevels(roomID)
 	if err != nil {
 		return fmt.Errorf("get power levels: %w", err)
+	}
+	currentLevel := powerLevelForUser(pl, me.UserID)
+	if currentLevel >= powerLevel {
+		logger.Debug("ensureAdminInRoomWithPower: admin already has level %d in room=%s (needed=%d)", currentLevel, roomID, powerLevel)
+		return nil
 	}
 	if pl.Users == nil {
 		pl.Users = make(map[string]int)
@@ -1062,6 +1072,18 @@ func (c *Client) getPowerLevels(roomID string) (*PowerLevelsContent, error) {
 		return nil, err
 	}
 	return &content, nil
+}
+
+func powerLevelForUser(content *PowerLevelsContent, userID string) int {
+	if content == nil {
+		return 0
+	}
+	if content.Users != nil {
+		if level, ok := content.Users[userID]; ok {
+			return level
+		}
+	}
+	return content.UsersDefault
 }
 
 func (c *Client) setPowerLevelsWithToken(roomID string, content *PowerLevelsContent, token string) error {

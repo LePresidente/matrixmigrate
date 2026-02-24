@@ -565,7 +565,14 @@ func (o *Orchestrator) ImportAssets(progress ProgressCallback) (*OperationResult
 	// Link rooms to spaces (pass userMapping and defaultSpaceOwnerID so admin can be invited into spaces/rooms before linking)
 	defaultSpaceOwnerID := ""
 	if roomOpts != nil {
-		defaultSpaceOwnerID = roomOpts.AdminUserID
+		// Teams have no creator_id, so spaces are created using fallback_room_creator when available.
+		// Use the same fallback owner here so owner-invite flow targets the actual space owner.
+		if roomOpts.FallbackCreator != "" {
+			defaultSpaceOwnerID = o.config.FormatUserID(roomOpts.FallbackCreator)
+		}
+		if defaultSpaceOwnerID == "" {
+			defaultSpaceOwnerID = roomOpts.AdminUserID
+		}
 	}
 	if progress != nil {
 		progress("linking", 0, len(assets.Channels), "")
@@ -743,12 +750,18 @@ func (o *Orchestrator) ImportMemberships(progress ProgressCallback) (*OperationR
 	}
 
 	// Default room owner for group/private rooms when creator_id is empty (used when force_join + AS to invite admin into room)
+	// Prefer fallback_room_creator because room import uses that as owner when creator_id is missing.
 	defaultRoomOwnerID := ""
-	if who, err := o.mxClient.WhoAmI(); err == nil && who != nil {
-		defaultRoomOwnerID = who.UserID
+	if o.config.Matrix.Import.FallbackRoomCreator != "" {
+		defaultRoomOwnerID = o.config.FormatUserID(o.config.Matrix.Import.FallbackRoomCreator)
 	}
 	if defaultRoomOwnerID == "" {
 		defaultRoomOwnerID = o.config.FormatUserID(o.config.Matrix.Auth.Username)
+	}
+	if defaultRoomOwnerID == "" {
+		if who, err := o.mxClient.WhoAmI(); err == nil && who != nil {
+			defaultRoomOwnerID = who.UserID
+		}
 	}
 	if defaultRoomOwnerID == "" {
 		defaultRoomOwnerID = o.config.FormatUserID("admin")

@@ -506,15 +506,26 @@ func (i *Importer) ApplyChannelMemberships(
 		if i.client.ForceJoinEnabled() && i.client.HasASToken() && (channel.IsGroup() || channel.IsPrivate()) {
 			if _, already := ensuredRoomsForForceJoin[roomID]; !already {
 				roomOwnerID := defaultRoomOwnerID
+				ownerFromCreator := false
 				if channel.CreatorID != "" {
 					if mx, ok := userMapping[channel.CreatorID]; ok && mx != "" {
 						roomOwnerID = mx
+						ownerFromCreator = true
 					}
 				}
 				if roomOwnerID != "" {
 					logger.Debug("ApplyChannelMemberships: ensuring admin in room %s (owner %s) for membership %s -> room", roomID, roomOwnerID, userID)
-					if err := i.client.ensureAdminInRoomWithPower(roomID, roomOwnerID, 100); err != nil {
-						logger.Warn("ApplyChannelMemberships: could not ensure admin in room %s (owner %s): %v", roomID, roomOwnerID, err)
+					roomEnsureErr := i.client.ensureAdminInRoomWithPower(roomID, roomOwnerID, 100)
+					if roomEnsureErr != nil && ownerFromCreator && defaultRoomOwnerID != "" && defaultRoomOwnerID != roomOwnerID {
+						logger.Debug("ApplyChannelMemberships: retry ensure admin in room %s with fallback owner %s (primary owner %s failed)", roomID, defaultRoomOwnerID, roomOwnerID)
+						if retryErr := i.client.ensureAdminInRoomWithPower(roomID, defaultRoomOwnerID, 100); retryErr == nil {
+							roomEnsureErr = nil
+						} else {
+							roomEnsureErr = retryErr
+						}
+					}
+					if roomEnsureErr != nil {
+						logger.Warn("ApplyChannelMemberships: could not ensure admin in room %s (owner %s): %v", roomID, roomOwnerID, roomEnsureErr)
 					} else {
 						ensuredRoomsForForceJoin[roomID] = struct{}{}
 						roomsToLeaveAfter[roomID] = struct{}{}
@@ -725,14 +736,25 @@ func (i *Importer) LinkRoomsToSpaces(
 				ensuredSpaceIDs[spaceID] = struct{}{}
 			}
 			roomOwnerID := defaultSpaceOwnerID
+			ownerFromCreator := false
 			if channel.CreatorID != "" && userMapping != nil {
 				if mx, ok := userMapping[channel.CreatorID]; ok && mx != "" {
 					roomOwnerID = mx
+					ownerFromCreator = true
 				}
 			}
 			logger.Debug("LinkRoomsToSpaces: ensuring admin in room %s (owner %s) for room %q", roomID, roomOwnerID, channel.DisplayName)
-			if err := i.client.ensureAdminInRoomWithPower(roomID, roomOwnerID, 50); err != nil {
-				logger.Warn("LinkRoomsToSpaces: could not ensure admin in room %s (owner %s): %v", roomID, roomOwnerID, err)
+			roomEnsureErr := i.client.ensureAdminInRoomWithPower(roomID, roomOwnerID, 50)
+			if roomEnsureErr != nil && ownerFromCreator && defaultSpaceOwnerID != "" && defaultSpaceOwnerID != roomOwnerID {
+				logger.Debug("LinkRoomsToSpaces: retry ensure admin in room %s with fallback owner %s (primary owner %s failed)", roomID, defaultSpaceOwnerID, roomOwnerID)
+				if retryErr := i.client.ensureAdminInRoomWithPower(roomID, defaultSpaceOwnerID, 50); retryErr == nil {
+					roomEnsureErr = nil
+				} else {
+					roomEnsureErr = retryErr
+				}
+			}
+			if roomEnsureErr != nil {
+				logger.Warn("LinkRoomsToSpaces: could not ensure admin in room %s (owner %s): %v", roomID, roomOwnerID, roomEnsureErr)
 			}
 		}
 
