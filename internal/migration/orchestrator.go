@@ -484,8 +484,11 @@ func (o *Orchestrator) ImportAssets(progress ProgressCallback) (*OperationResult
 		}
 	}
 
-	// Build room import options (owner + local alias) from config
-	var roomOpts *matrix.RoomImportOptions
+	// Build room import options from config.
+	// Space visibility is always applied; owner/alias options are applied when preserve_owner_and_alias is enabled.
+	roomOpts := &matrix.RoomImportOptions{
+		SpaceVisibility: o.config.GetSpaceVisibility(),
+	}
 	if o.config.Matrix.Import.PreserveOwnerAndAlias {
 		logger.Info("Room/space import: preserve_owner_and_alias is enabled; will set alias (team+name) and owner from creator_id or fallback")
 		adminUserID := o.config.FormatUserID(o.config.Matrix.Auth.Username)
@@ -499,11 +502,9 @@ func (o *Orchestrator) ImportAssets(progress ProgressCallback) (*OperationResult
 				logger.Warn("Room/space import: could not get admin user ID, using fallback @admin:%s", o.config.Matrix.Homeserver)
 			}
 		}
-		roomOpts = &matrix.RoomImportOptions{
-			PreserveOwnerAndAlias: true,
-			FallbackCreator:       o.config.Matrix.Import.FallbackRoomCreator,
-			AdminUserID:           adminUserID,
-		}
+		roomOpts.PreserveOwnerAndAlias = true
+		roomOpts.FallbackCreator = o.config.Matrix.Import.FallbackRoomCreator
+		roomOpts.AdminUserID = adminUserID
 		if roomOpts.FallbackCreator == "" {
 			roomOpts.FallbackCreator = o.config.Matrix.Auth.Username
 		}

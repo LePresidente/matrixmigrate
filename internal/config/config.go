@@ -73,6 +73,11 @@ type ImportConfig struct {
 	// "space_members" (default): only members of the parent space/team can join (restricted join rule).
 	// "public": anyone can join (leave default Matrix join rule; room remains openly joinable).
 	PublicRoomJoinRules string `mapstructure:"public_room_join_rules"`
+	// SpaceVisibility: default visibility for Matrix spaces created from Mattermost teams.
+	// "invite_only" (default): create private/invite-only spaces.
+	// "public": create public/joinable spaces.
+	// "from_mattermost": derive from team.Type (O=public, I=invite-only).
+	SpaceVisibility string `mapstructure:"space_visibility"`
 	// ImportDirectMessages: when true, export and import Mattermost direct message channels (D type) as Matrix DMs.
 	// Rooms appear under "People" for both users with is_direct set. Requires Application Service for m.direct account_data.
 	ImportDirectMessages bool `mapstructure:"import_direct_messages"`
@@ -202,6 +207,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("matrix.rate_limit.retry_base_delay_ms", 2000) // 2 second base delay
 	v.SetDefault("matrix.import.force_join", false)
 	v.SetDefault("matrix.import.public_room_join_rules", "space_members")
+	v.SetDefault("matrix.import.space_visibility", "invite_only")
 	v.SetDefault("data.assets_dir", "./data/assets")
 	v.SetDefault("data.mappings_dir", "./data/mappings")
 	v.SetDefault("data.state_file", "./data/state.json")
@@ -290,6 +296,13 @@ func (c *Config) Validate() error {
 	default:
 		return fmt.Errorf("matrix.import.public_room_join_rules must be \"space_members\" or \"public\", got %q", c.Matrix.Import.PublicRoomJoinRules)
 	}
+	// Validate space_visibility
+	switch c.Matrix.Import.SpaceVisibility {
+	case "", "invite_only", "public", "from_mattermost":
+		// valid
+	default:
+		return fmt.Errorf("matrix.import.space_visibility must be \"invite_only\", \"public\", or \"from_mattermost\", got %q", c.Matrix.Import.SpaceVisibility)
+	}
 
 	// Validate MAS config when enabled
 	if c.Matrix.MAS.Enabled {
@@ -346,6 +359,16 @@ func (c *Config) GetPublicRoomJoinRules() string {
 	s := c.Matrix.Import.PublicRoomJoinRules
 	if s == "" {
 		return "space_members"
+	}
+	return s
+}
+
+// GetSpaceVisibility returns the default space visibility mode.
+// Empty config is treated as "invite_only" (Mattermost teams are invite-only by default).
+func (c *Config) GetSpaceVisibility() string {
+	s := c.Matrix.Import.SpaceVisibility
+	if s == "" {
+		return "invite_only"
 	}
 	return s
 }

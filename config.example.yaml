@@ -144,6 +144,11 @@ matrix:
     #   "space_members" - Only members of the parent space/team can join (restricted join rule; recommended).
     #   "public"        - Anyone can join (leave default Matrix join rule).
     # public_room_join_rules: "space_members"
+    # Default visibility for Matrix spaces created from Mattermost teams. Default: "invite_only"
+    #   "invite_only"     - Spaces are private/invite-only (recommended; matches Mattermost team behavior).
+    #   "public"          - Spaces are public/joinable.
+    #   "from_mattermost" - Derive from team type (O=public, I=invite-only).
+    # space_visibility: "invite_only"
     # When creator_id is empty, use this Matrix username (localpart only, e.g. "admin" -> @admin:domain).
     # If this user does not exist, the admin account (auth.username) is used.
     # fallback_room_creator: "admin"

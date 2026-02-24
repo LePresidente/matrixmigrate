@@ -15,6 +15,7 @@ type RoomImportOptions struct {
 	PreserveOwnerAndAlias bool   // Enable setting owner and room_alias_name from Mattermost data
 	FallbackCreator       string // Matrix localpart when creator_id is empty (e.g. "admin")
 	AdminUserID           string // Full Matrix user ID used when fallback user does not exist
+	SpaceVisibility       string // "invite_only" (default), "public", "from_mattermost"
 }
 
 // sanitizeAliasLocalpart returns a Matrix room alias localpart (allowed: 0-9a-zA-Z._=-).
@@ -261,8 +262,18 @@ func (i *Importer) ImportTeamsAsSpaces(teams []mattermost.Team, existingMapping 
 			logger.Info("Space '%s' (team %s): alias=%q owner=%s (teams have no creator_id)", team.DisplayName, team.Name, roomAlias, owner)
 		}
 
+		spacePublic := false // default: invite-only (private)
+		if opts != nil {
+			switch opts.SpaceVisibility {
+			case "public":
+				spacePublic = true
+			case "from_mattermost":
+				spacePublic = team.IsOpen()
+			}
+		}
+
 		// Create space
-		resp, err := i.client.CreateSpace(team.DisplayName, team.Description, team.IsOpen(), roomAlias, owner)
+		resp, err := i.client.CreateSpace(team.DisplayName, team.Description, spacePublic, roomAlias, owner)
 		if err != nil {
 			logger.Error("Failed to create space '%s': %v", team.DisplayName, err)
 			stats.SpacesFailed++
