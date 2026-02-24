@@ -2,9 +2,12 @@ package matrix
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -197,6 +200,12 @@ func (c *Client) doRequestWithRetry(method, endpoint string, body interface{}, r
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
+		if shouldRetryRequestErr(err) && retryCount < c.maxRetries {
+			retryAfter := retryDelay(c.retryBaseDelay, retryCount)
+			logger.Warn("Request transport error, retrying in %v (%d/%d): %v", retryAfter, retryCount+1, c.maxRetries, err)
+			time.Sleep(retryAfter)
+			return c.doRequestWithRetry(method, endpoint, body, retryCount+1)
+		}
 		return nil, 0, fmt.Errorf("request failed: %w", err)
 	}
 	defer resp.Body.Close()
@@ -1439,6 +1448,12 @@ func (c *Client) doRequestWithTokenAndRetry(method, endpoint string, body interf
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
+		if shouldRetryRequestErr(err) && retryCount < c.maxRetries {
+			retryAfter := retryDelay(c.retryBaseDelay, retryCount)
+			logger.Warn("Request transport error, retrying in %v (%d/%d): %v", retryAfter, retryCount+1, c.maxRetries, err)
+			time.Sleep(retryAfter)
+			return c.doRequestWithTokenAndRetry(method, endpoint, body, token, retryCount+1)
+		}
 		return nil, 0, fmt.Errorf("request failed: %w", err)
 	}
 	defer resp.Body.Close()
@@ -1476,6 +1491,36 @@ func (c *Client) doRequestWithTokenAndRetry(method, endpoint string, body interf
 	}
 
 	return respBody, resp.StatusCode, nil
+}
+
+func retryDelay(base time.Duration, retryCount int) time.Duration {
+	retryAfter := base * time.Duration(1<<uint(retryCount))
+	if retryAfter > 60*time.Second {
+		return 60 * time.Second
+	}
+	if retryAfter <= 0 {
+		return 1 * time.Second
+	}
+	return retryAfter
+}
+
+func shouldRetryRequestErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && (netErr.Timeout() || netErr.Temporary()) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "context deadline exceeded") ||
+		strings.Contains(msg, "timeout") ||
+		strings.Contains(msg, "connection reset") ||
+		strings.Contains(msg, "broken pipe") ||
+		strings.Contains(msg, "eof")
 }
 
 // UploadMediaResponse represents the response from media upload

@@ -58,6 +58,27 @@ func GenerateRandomPassword() string {
 	return "ChangeMe123!" // Placeholder - users should change this
 }
 
+func isNumericOnlyUsername(username string) bool {
+	name := strings.TrimSpace(username)
+	if name == "" {
+		return false
+	}
+	for _, r := range name {
+		if !unicode.IsDigit(r) {
+			return false
+		}
+	}
+	return true
+}
+
+func isUserNotFoundErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "m_not_found") && strings.Contains(msg, "user not found")
+}
+
 // ImportUsers imports users from Mattermost to Matrix
 func (i *Importer) ImportUsers(users []mattermost.User, existingMapping map[string]string, progress ImportProgressCallback) (map[string]string, *ImportStats, error) {
 	mapping := make(map[string]string)
@@ -81,6 +102,13 @@ func (i *Importer) ImportUsers(users []mattermost.User, existingMapping map[stri
 
 		// Deleted/locked users are imported as deactivated so they exist for channel history and show as locked in synapse-admin
 		deactivated := user.IsDeleted()
+
+		// Synapse reserves all-numeric localparts for guest accounts.
+		if isNumericOnlyUsername(user.Username) {
+			logger.Warn("User '%s' skipped: numeric-only usernames are reserved for guests in Matrix", user.Username)
+			stats.UsersSkipped++
+			continue
+		}
 
 		// Skip if already in mapping
 		if _, exists := existingMapping[user.ID]; exists {
@@ -451,6 +479,11 @@ func (i *Importer) ApplyTeamMemberships(
 			logger.Info("Team membership %d/%d: inviting %s to space %s", idx+1, total, userID, spaceID)
 		}
 		if err := i.client.AddUserToRoom(spaceID, userID); err != nil {
+			if isUserNotFoundErr(err) {
+				logger.Warn("Team membership %d/%d skipped: %s not found in Matrix (%v)", idx+1, total, userID, err)
+				stats.MembersSkipped++
+				continue
+			}
 			logger.Error("Team membership %d/%d failed: %s -> %s: %v", idx+1, total, userID, spaceID, err)
 			stats.MembersFailed++
 			continue
@@ -517,6 +550,14 @@ func (i *Importer) ApplyChannelMemberships(
 	ensuredRoomsForForceJoin := make(map[string]struct{})
 	recoveryAttemptedRooms := make(map[string]struct{})
 	unjoinableRooms := make(map[string]struct{})
+	adminUserID := ""
+	if i.client.ForceJoinEnabled() && i.client.HasASToken() {
+		if who, err := i.client.WhoAmI(); err == nil && who != nil && who.UserID != "" {
+			adminUserID = who.UserID
+		} else if err != nil {
+			logger.Warn("ApplyChannelMemberships: could not resolve AS admin user ID via whoami: %v", err)
+		}
+	}
 
 	logger.Info("Starting channel membership import: %d memberships to process (%d DM channels will be skipped)", total, len(directChannelIDs))
 
@@ -578,10 +619,21 @@ func (i *Importer) ApplyChannelMemberships(
 						ownerFromCreator = true
 					}
 				}
+				if roomOwnerID == "" && adminUserID != "" {
+					roomOwnerID = adminUserID
+				}
 				if roomOwnerID != "" {
 					logger.Debug("ApplyChannelMemberships: ensuring admin in room %s (owner %s) for membership %s -> room", roomID, roomOwnerID, userID)
 					roomEnsureErr := i.client.ensureAdminInRoomWithPower(roomID, roomOwnerID, 100)
-					if roomEnsureErr != nil && ownerFromCreator && defaultRoomOwnerID != "" && defaultRoomOwnerID != roomOwnerID {
+					if roomEnsureErr != nil && ownerFromCreator && adminUserID != "" && adminUserID != roomOwnerID {
+						logger.Debug("ApplyChannelMemberships: retry ensure admin in room %s with AS admin owner %s (primary owner %s failed)", roomID, adminUserID, roomOwnerID)
+						if retryErr := i.client.ensureAdminInRoomWithPower(roomID, adminUserID, 100); retryErr == nil {
+							roomEnsureErr = nil
+						} else {
+							roomEnsureErr = retryErr
+						}
+					}
+					if roomEnsureErr != nil && defaultRoomOwnerID != "" && defaultRoomOwnerID != roomOwnerID && defaultRoomOwnerID != adminUserID {
 						logger.Debug("ApplyChannelMemberships: retry ensure admin in room %s with fallback owner %s (primary owner %s failed)", roomID, defaultRoomOwnerID, roomOwnerID)
 						if retryErr := i.client.ensureAdminInRoomWithPower(roomID, defaultRoomOwnerID, 100); retryErr == nil {
 							roomEnsureErr = nil
@@ -595,7 +647,11 @@ func (i *Importer) ApplyChannelMemberships(
 						// promote fallback owner and tag room name so it is easy to find.
 						if _, attempted := recoveryAttemptedRooms[roomID]; !attempted {
 							recoveryAttemptedRooms[roomID] = struct{}{}
-							recoverErr := i.client.TryRecoverUnjoinableRoom(roomID, channel.DisplayName, defaultRoomOwnerID)
+							recoveryOwnerID := adminUserID
+							if recoveryOwnerID == "" {
+								recoveryOwnerID = defaultRoomOwnerID
+							}
+							recoverErr := i.client.TryRecoverUnjoinableRoom(roomID, channel.DisplayName, recoveryOwnerID)
 							if recoverErr != nil {
 								logger.Warn("ApplyChannelMemberships: recovery failed for room %s: %v", roomID, recoverErr)
 							} else {
@@ -629,6 +685,12 @@ func (i *Importer) ApplyChannelMemberships(
 		logger.Debug("ApplyChannelMemberships: AddUserToRoom room=%s user=%s (membership %d/%d)", roomID, userID, idx+1, total)
 
 		if err := i.client.AddUserToRoom(roomID, userID); err != nil {
+			if isUserNotFoundErr(err) {
+				logger.Warn("Channel membership %d/%d skipped: %s not found in Matrix (%v)", idx+1, total, userID, err)
+				bump(skippedByType, channelType)
+				stats.MembersSkipped++
+				continue
+			}
 			logger.Error("Channel membership %d/%d failed [type=%s]: %s -> %s: %v", idx+1, total, channelType, userID, roomID, err)
 			bump(failedByType, channelType)
 			stats.MembersFailed++
@@ -645,22 +707,6 @@ func (i *Importer) ApplyChannelMemberships(
 		logger.Success("Channel membership %d/%d: %s added to room", idx+1, total, userID)
 		stats.MembersAdded++
 	}
-
-	// Leave rooms we joined for force-join so the admin is not left in group/private rooms
-	leftChannels := 0
-	failedLeaveChannels := 0
-	for roomID := range roomsToLeaveAfter {
-		logger.Debug("ApplyChannelMemberships: LeaveRoom %s (admin leaving after force-join)", roomID)
-		if err := i.client.LeaveRoom(roomID); err != nil {
-			logger.Warn("ApplyChannelMemberships: admin leave room %s after force-join: %v", roomID, err)
-			failedLeaveChannels++
-		} else {
-			logger.Info("ApplyChannelMemberships: admin left room %s", roomID)
-			leftChannels++
-		}
-	}
-	logger.Info("ApplyChannelMemberships: admin cleanup completed: left_channels=%d leave_failures=%d attempted=%d",
-		leftChannels, failedLeaveChannels, len(roomsToLeaveAfter))
 
 	// For group channels, set equal power levels (50) for all members to match Mattermost
 	for roomID, memberIDs := range groupRoomMembers {
@@ -694,6 +740,23 @@ func (i *Importer) ApplyChannelMemberships(
 			}
 		}
 	}
+
+	// Leave rooms we joined for force-join so the admin is not left in group/private rooms.
+	// This runs after group power-level updates so admin is still present to send PL state.
+	leftChannels := 0
+	failedLeaveChannels := 0
+	for roomID := range roomsToLeaveAfter {
+		logger.Debug("ApplyChannelMemberships: LeaveRoom %s (admin leaving after force-join)", roomID)
+		if err := i.client.LeaveRoom(roomID); err != nil {
+			logger.Warn("ApplyChannelMemberships: admin leave room %s after force-join: %v", roomID, err)
+			failedLeaveChannels++
+		} else {
+			logger.Info("ApplyChannelMemberships: admin left room %s", roomID)
+			leftChannels++
+		}
+	}
+	logger.Info("ApplyChannelMemberships: admin cleanup completed: left_channels=%d leave_failures=%d attempted=%d",
+		leftChannels, failedLeaveChannels, len(roomsToLeaveAfter))
 
 	logger.Info("Channel membership import completed: added=%d, skipped=%d, failed=%d",
 		stats.MembersAdded, stats.MembersSkipped, stats.MembersFailed)

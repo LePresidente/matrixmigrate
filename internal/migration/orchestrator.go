@@ -788,6 +788,10 @@ func (o *Orchestrator) ImportMemberships(progress ProgressCallback) (*OperationR
 	if defaultRoomOwnerID == "" {
 		defaultRoomOwnerID = o.config.FormatUserID("admin")
 	}
+	defaultChannelOwnerID := defaultRoomOwnerID
+	if who, err := o.mxClient.WhoAmI(); err == nil && who != nil && who.UserID != "" {
+		defaultChannelOwnerID = who.UserID
+	}
 
 	// Apply team memberships
 	if progress != nil {
@@ -804,7 +808,7 @@ func (o *Orchestrator) ImportMemberships(progress ProgressCallback) (*OperationR
 	if progress != nil {
 		progress("channel_memberships", 0, len(memberships.ChannelMembers), "")
 	}
-	channelStats, err := importer.ApplyChannelMemberships(channels, memberships.ChannelMembers, mapping.Users, mapping.Channels, defaultRoomOwnerID, importProgress)
+	channelStats, err := importer.ApplyChannelMemberships(channels, memberships.ChannelMembers, mapping.Users, mapping.Channels, defaultChannelOwnerID, importProgress)
 	if err != nil {
 		o.state.FailStep(StepImportMemberships, err)
 		o.SaveState()
