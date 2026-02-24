@@ -7,8 +7,8 @@ import (
 
 	"github.com/aligundogdu/matrixmigrate/internal/config"
 	"github.com/aligundogdu/matrixmigrate/internal/logger"
-	"github.com/aligundogdu/matrixmigrate/internal/mattermost"
 	"github.com/aligundogdu/matrixmigrate/internal/matrix"
+	"github.com/aligundogdu/matrixmigrate/internal/mattermost"
 	"github.com/aligundogdu/matrixmigrate/internal/ssh"
 	"github.com/aligundogdu/matrixmigrate/pkg/archive"
 )
@@ -18,10 +18,10 @@ type Orchestrator struct {
 	config        *config.Config
 	state         *MigrationState
 	tunnelManager *ssh.TunnelManager
-	
-	mmClient      *mattermost.Client
-	mxClient      *matrix.Client
-	mxToken       string // Matrix access token (from login or config)
+
+	mmClient *mattermost.Client
+	mxClient *matrix.Client
+	mxToken  string // Matrix access token (from login or config)
 }
 
 // NewOrchestrator creates a new migration orchestrator
@@ -62,10 +62,10 @@ func (o *Orchestrator) waitForTunnel(baseURL string, timeout time.Duration) erro
 	client := &http.Client{
 		Timeout: 2 * time.Second,
 	}
-	
+
 	deadline := time.Now().Add(timeout)
 	var lastErr error
-	
+
 	for time.Now().Before(deadline) {
 		// Try to connect to the Matrix server's version endpoint
 		resp, err := client.Get(baseURL + "/_matrix/client/versions")
@@ -77,7 +77,7 @@ func (o *Orchestrator) waitForTunnel(baseURL string, timeout time.Duration) erro
 		lastErr = err
 		time.Sleep(500 * time.Millisecond)
 	}
-	
+
 	return fmt.Errorf("timeout waiting for tunnel: %w", lastErr)
 }
 
@@ -102,16 +102,16 @@ type OperationResult struct {
 	ChannelsExported int
 
 	// Import stats
-	UsersCreated   int
-	UsersSkipped   int
-	UsersFailed    int
-	SpacesCreated  int
-	SpacesSkipped  int
-	SpacesFailed   int
-	RoomsCreated   int
-	RoomsSkipped   int
-	RoomsFailed    int
-	RoomsLinked    int
+	UsersCreated  int
+	UsersSkipped  int
+	UsersFailed   int
+	SpacesCreated int
+	SpacesSkipped int
+	SpacesFailed  int
+	RoomsCreated  int
+	RoomsSkipped  int
+	RoomsFailed   int
+	RoomsLinked   int
 
 	// Membership stats
 	TeamMembershipsExported    int
@@ -248,7 +248,7 @@ func (o *Orchestrator) ConnectMatrix() error {
 
 	// Get access token (either from config or via login)
 	var accessToken string
-	
+
 	if o.config.UseTokenAuth() {
 		// Use provided admin token
 		accessToken = o.config.GetMatrixAdminToken()
@@ -377,6 +377,16 @@ func (o *Orchestrator) ExportAssets(progress ProgressCallback) (*OperationResult
 	// Filter to active assets only
 	assets = mattermost.FilterActiveAssets(assets)
 
+	// Optionally skip configured Mattermost users (e.g., bot/service accounts)
+	if len(o.config.Mattermost.IgnoredUsers) > 0 {
+		before := len(assets.Users)
+		assets = mattermost.FilterIgnoredUsersFromAssets(assets, o.config.Mattermost.IgnoredUsers)
+		ignored := before - len(assets.Users)
+		if ignored > 0 {
+			logger.Info("Export assets: ignored %d users via mattermost.ignored_users", ignored)
+		}
+	}
+
 	// Count exported items
 	result.UsersExported = len(assets.Users)
 	result.TeamsExported = len(assets.Teams)
@@ -434,6 +444,17 @@ func (o *Orchestrator) ImportAssets(progress ProgressCallback) (*OperationResult
 		return nil, fmt.Errorf("failed to load assets: %w", err)
 	}
 
+	// Optionally skip configured Mattermost users before import.
+	if len(o.config.Mattermost.IgnoredUsers) > 0 {
+		before := len(assets.Users)
+		filtered := mattermost.FilterIgnoredUsersFromAssets(&assets, o.config.Mattermost.IgnoredUsers)
+		assets = *filtered
+		ignored := before - len(assets.Users)
+		if ignored > 0 {
+			logger.Info("Import assets: ignored %d users via mattermost.ignored_users", ignored)
+		}
+	}
+
 	// Try to load existing mapping to skip already imported items
 	var existingMappings *matrix.ExistingMappings
 	existingMappingFile := o.state.GetStepOutputFile(StepImportAssets)
@@ -480,8 +501,8 @@ func (o *Orchestrator) ImportAssets(progress ProgressCallback) (*OperationResult
 		}
 		roomOpts = &matrix.RoomImportOptions{
 			PreserveOwnerAndAlias: true,
-			FallbackCreator:      o.config.Matrix.Import.FallbackRoomCreator,
-			AdminUserID:          adminUserID,
+			FallbackCreator:       o.config.Matrix.Import.FallbackRoomCreator,
+			AdminUserID:           adminUserID,
 		}
 		if roomOpts.FallbackCreator == "" {
 			roomOpts.FallbackCreator = o.config.Matrix.Auth.Username
@@ -701,7 +722,7 @@ func (o *Orchestrator) ImportMemberships(progress ProgressCallback) (*OperationR
 		o.SaveState()
 		return nil, fmt.Errorf("failed to load memberships: %w", err)
 	}
-	logger.Info("Loaded %d team memberships, %d channel memberships", 
+	logger.Info("Loaded %d team memberships, %d channel memberships",
 		len(memberships.TeamMembers), len(memberships.ChannelMembers))
 
 	// Load mapping
@@ -717,12 +738,24 @@ func (o *Orchestrator) ImportMemberships(progress ProgressCallback) (*OperationR
 		len(mapping.Users), len(mapping.Teams), len(mapping.Channels))
 
 	// Load assets to get channel list (needed for group channel equal power levels and DM memberships)
+	// and to resolve ignored usernames -> user IDs for membership filtering.
 	var channels []mattermost.Channel
 	if assetFile := o.state.GetStepOutputFile(StepExportAssets); assetFile != "" {
 		var assets mattermost.Assets
 		if err := archive.LoadGzipJSON(assetFile, &assets); err == nil {
 			channels = append(assets.Channels, assets.DirectChannels...)
 			logger.Info("Loaded %d channels (%d regular + %d direct) from assets for membership import", len(channels), len(assets.Channels), len(assets.DirectChannels))
+
+			if len(o.config.Mattermost.IgnoredUsers) > 0 {
+				ignoredUserIDs := mattermost.GetIgnoredUserIDs(assets.Users, o.config.Mattermost.IgnoredUsers)
+				beforeTeam := len(memberships.TeamMembers)
+				beforeChannel := len(memberships.ChannelMembers)
+				memberships = *mattermost.FilterMembershipsByIgnoredUserIDs(&memberships, ignoredUserIDs)
+				ignoredMemberships := (beforeTeam - len(memberships.TeamMembers)) + (beforeChannel - len(memberships.ChannelMembers))
+				if ignoredMemberships > 0 {
+					logger.Info("Import memberships: ignored %d memberships for configured users", ignoredMemberships)
+				}
+			}
 		}
 	}
 
@@ -738,19 +771,8 @@ func (o *Orchestrator) ImportMemberships(progress ProgressCallback) (*OperationR
 		}
 	}
 
-	// Apply team memberships
-	if progress != nil {
-		progress("team_memberships", 0, len(memberships.TeamMembers), "")
-	}
-	teamStats, err := importer.ApplyTeamMemberships(memberships.TeamMembers, mapping.Users, mapping.Teams, importProgress)
-	if err != nil {
-		o.state.FailStep(StepImportMemberships, err)
-		o.SaveState()
-		return nil, fmt.Errorf("failed to apply team memberships: %w", err)
-	}
-
-	// Default room owner for group/private rooms when creator_id is empty (used when force_join + AS to invite admin into room)
-	// Prefer fallback_room_creator because room import uses that as owner when creator_id is missing.
+	// Default owner for spaces/rooms when creator_id is empty.
+	// Prefer fallback_room_creator because room/space import uses that as owner when creator_id is missing.
 	defaultRoomOwnerID := ""
 	if o.config.Matrix.Import.FallbackRoomCreator != "" {
 		defaultRoomOwnerID = o.config.FormatUserID(o.config.Matrix.Import.FallbackRoomCreator)
@@ -767,6 +789,17 @@ func (o *Orchestrator) ImportMemberships(progress ProgressCallback) (*OperationR
 		defaultRoomOwnerID = o.config.FormatUserID("admin")
 	}
 
+	// Apply team memberships
+	if progress != nil {
+		progress("team_memberships", 0, len(memberships.TeamMembers), "")
+	}
+	teamStats, spacesToLeaveAfterMembershipImport, err := importer.ApplyTeamMemberships(memberships.TeamMembers, mapping.Users, mapping.Teams, defaultRoomOwnerID, importProgress)
+	if err != nil {
+		o.state.FailStep(StepImportMemberships, err)
+		o.SaveState()
+		return nil, fmt.Errorf("failed to apply team memberships: %w", err)
+	}
+
 	// Apply channel memberships
 	if progress != nil {
 		progress("channel_memberships", 0, len(memberships.ChannelMembers), "")
@@ -778,13 +811,28 @@ func (o *Orchestrator) ImportMemberships(progress ProgressCallback) (*OperationR
 		return nil, fmt.Errorf("failed to apply channel memberships: %w", err)
 	}
 
+	// Final cleanup for membership import:
+	// remove admin from spaces that were joined for force-join/bootstrap.
+	leftSpaces := 0
+	failedLeaveSpaces := 0
+	for _, spaceID := range spacesToLeaveAfterMembershipImport {
+		if err := o.mxClient.LeaveRoom(spaceID); err != nil {
+			logger.Warn("Import memberships cleanup: admin leave space %s failed: %v", spaceID, err)
+			failedLeaveSpaces++
+		} else {
+			leftSpaces++
+		}
+	}
+	logger.Info("Import memberships cleanup: admin left spaces=%d leave_failures=%d attempted=%d",
+		leftSpaces, failedLeaveSpaces, len(spacesToLeaveAfterMembershipImport))
+
 	// Fill result stats
 	result.MembersAdded = teamStats.MembersAdded + channelStats.MembersAdded
 	result.MembersSkipped = teamStats.MembersSkipped + channelStats.MembersSkipped
 	result.MembersFailed = teamStats.MembersFailed + channelStats.MembersFailed
 
 	logger.Info("=== ImportMemberships Completed ===")
-	logger.Info("Total: added=%d, skipped=%d, failed=%d", 
+	logger.Info("Total: added=%d, skipped=%d, failed=%d",
 		result.MembersAdded, result.MembersSkipped, result.MembersFailed)
 	logger.Success("Membership import completed successfully")
 
@@ -977,7 +1025,7 @@ func (o *Orchestrator) ImportMessages(progress matrix.MessageImportCallback) (*I
 	// Load or create message mapping for resume support
 	msgMappingFile, _ := GetLatestMessageMappingFile(o.config.Data.MappingsDir)
 	var msgMapping *MessageMapping
-	
+
 	if msgMappingFile != "" {
 		msgMapping, err = LoadMessageMapping(msgMappingFile)
 		if err != nil {
@@ -1018,11 +1066,11 @@ func (o *Orchestrator) ImportMessages(progress matrix.MessageImportCallback) (*I
 	// Import messages with files
 	result, err := importer.ImportMessagesWithFiles(
 		messages.Posts,
-		assetMapping.Channels,  // channelID -> roomID
-		assetMapping.Users,     // userID -> matrixUserID
-		existingMapping,        // existing message mapping
-		filesByPost,            // post ID -> files
-		fileConfig,             // file migration settings
+		assetMapping.Channels, // channelID -> roomID
+		assetMapping.Users,    // userID -> matrixUserID
+		existingMapping,       // existing message mapping
+		filesByPost,           // post ID -> files
+		fileConfig,            // file migration settings
 		progress,
 	)
 	if err != nil {

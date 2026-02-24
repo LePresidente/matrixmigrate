@@ -108,6 +108,14 @@ matrix:
 
 **Matrix**: The tool logs in with username/password to get an access token. Alternatively, you can provide an existing admin token via `MATRIX_ADMIN_TOKEN` environment variable.
 
+### Mattermost import options
+
+Under `mattermost` in `config.yaml` you can set:
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `ignored_users` | `[]` | List of Mattermost usernames to skip during import (case-insensitive). Useful for bot/service accounts. Ignored users are not created in Matrix, and their team/channel memberships are skipped. |
+
 ### Matrix import options
 
 Under `matrix.import` in `config.yaml` you can set:

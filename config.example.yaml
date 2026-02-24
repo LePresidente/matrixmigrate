@@ -36,6 +36,12 @@ mattermost:
   #   name: "mattermost"
   #   user: "mmuser"
   #   password_env: "MM_DB_PASSWORD"
+
+  # Optional: Mattermost usernames to ignore during import (case-insensitive).
+  # Useful for skipping bot/service accounts.
+  # ignored_users:
+  #   - "my-bot"
+  #   - "jira"
   
   # File attachment migration settings
   files:

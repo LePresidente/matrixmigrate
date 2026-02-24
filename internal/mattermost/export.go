@@ -2,6 +2,7 @@ package mattermost
 
 import (
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -181,6 +182,87 @@ func FilterActiveMemberships(memberships *Memberships) *Memberships {
 	return filtered
 }
 
+func normalizeIgnoredUsers(ignoredUsers []string) map[string]struct{} {
+	ignored := make(map[string]struct{}, len(ignoredUsers))
+	for _, username := range ignoredUsers {
+		u := strings.ToLower(strings.TrimSpace(username))
+		if u == "" {
+			continue
+		}
+		ignored[u] = struct{}{}
+	}
+	return ignored
+}
+
+// GetIgnoredUserIDs resolves configured ignored usernames to Mattermost user IDs.
+func GetIgnoredUserIDs(users []User, ignoredUsers []string) map[string]struct{} {
+	ignoredByName := normalizeIgnoredUsers(ignoredUsers)
+	ignoredIDs := make(map[string]struct{})
+	if len(ignoredByName) == 0 {
+		return ignoredIDs
+	}
+
+	for _, user := range users {
+		if _, ok := ignoredByName[strings.ToLower(user.Username)]; ok {
+			ignoredIDs[user.ID] = struct{}{}
+		}
+	}
+	return ignoredIDs
+}
+
+// FilterIgnoredUsersFromAssets removes users that match configured ignored usernames.
+func FilterIgnoredUsersFromAssets(assets *Assets, ignoredUsers []string) *Assets {
+	filtered := &Assets{
+		ExportedAt:     assets.ExportedAt,
+		Version:        assets.Version,
+		Teams:          assets.Teams,
+		Channels:       assets.Channels,
+		DirectChannels: assets.DirectChannels,
+	}
+
+	ignoredByName := normalizeIgnoredUsers(ignoredUsers)
+	if len(ignoredByName) == 0 {
+		filtered.Users = assets.Users
+		return filtered
+	}
+
+	for _, user := range assets.Users {
+		if _, ignore := ignoredByName[strings.ToLower(user.Username)]; ignore {
+			continue
+		}
+		filtered.Users = append(filtered.Users, user)
+	}
+	return filtered
+}
+
+// FilterMembershipsByIgnoredUserIDs removes team/channel memberships for ignored users.
+func FilterMembershipsByIgnoredUserIDs(memberships *Memberships, ignoredUserIDs map[string]struct{}) *Memberships {
+	filtered := &Memberships{
+		ExportedAt: memberships.ExportedAt,
+		Version:    memberships.Version,
+	}
+
+	if len(ignoredUserIDs) == 0 {
+		filtered.TeamMembers = memberships.TeamMembers
+		filtered.ChannelMembers = memberships.ChannelMembers
+		return filtered
+	}
+
+	for _, tm := range memberships.TeamMembers {
+		if _, ignore := ignoredUserIDs[tm.UserID]; ignore {
+			continue
+		}
+		filtered.TeamMembers = append(filtered.TeamMembers, tm)
+	}
+	for _, cm := range memberships.ChannelMembers {
+		if _, ignore := ignoredUserIDs[cm.UserID]; ignore {
+			continue
+		}
+		filtered.ChannelMembers = append(filtered.ChannelMembers, cm)
+	}
+	return filtered
+}
+
 // ExportMessages exports all messages (posts) and file attachments
 func (e *Exporter) ExportMessages(progress ExportProgressCallback) (*Messages, error) {
 	messages := &Messages{
@@ -213,7 +295,7 @@ func (e *Exporter) ExportMessages(progress ExportProgressCallback) (*Messages, e
 	if progress != nil {
 		progress("files", 0, 0)
 	}
-	
+
 	files, err := e.client.GetFileInfos()
 	if err != nil {
 		// Non-fatal: continue without files
@@ -237,7 +319,3 @@ func (e *Exporter) GetMessageCount() (int, error) {
 func (e *Exporter) GetFileCount() (int, error) {
 	return e.client.GetFileInfoCount()
 }
-
-
-
-

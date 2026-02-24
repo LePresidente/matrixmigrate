@@ -17,17 +17,17 @@ import (
 
 // RateLimitConfig holds rate limiting settings
 type RateLimitConfig struct {
-	RequestsPerSecond float64 // Max requests per second (0 = no limit)
-	MaxRetries        int     // Max retries on 429 error
+	RequestsPerSecond float64       // Max requests per second (0 = no limit)
+	MaxRetries        int           // Max retries on 429 error
 	RetryBaseDelay    time.Duration // Base delay for exponential backoff
 }
 
 // DefaultRateLimitConfig returns default rate limiting settings
 func DefaultRateLimitConfig() RateLimitConfig {
 	return RateLimitConfig{
-		RequestsPerSecond: 5.0,               // 5 req/sec
-		MaxRetries:        5,                 // 5 retries
-		RetryBaseDelay:    2 * time.Second,   // 2 second base delay
+		RequestsPerSecond: 5.0,             // 5 req/sec
+		MaxRetries:        5,               // 5 retries
+		RetryBaseDelay:    2 * time.Second, // 2 second base delay
 	}
 }
 
@@ -73,21 +73,21 @@ func NewClientWithRateLimit(baseURL, adminToken, homeserver string, rlConfig Rat
 	if rlConfig.RequestsPerSecond > 0 {
 		rateLimit = time.Duration(float64(time.Second) / rlConfig.RequestsPerSecond)
 	}
-	
+
 	maxRetries := rlConfig.MaxRetries
 	if maxRetries <= 0 {
 		maxRetries = 5
 	}
-	
+
 	retryBaseDelay := rlConfig.RetryBaseDelay
 	if retryBaseDelay <= 0 {
 		retryBaseDelay = 2 * time.Second
 	}
-	
+
 	return &Client{
-		baseURL:        baseURL,
-		adminToken:     adminToken,
-		homeserver:     homeserver,
+		baseURL:    baseURL,
+		adminToken: adminToken,
+		homeserver: homeserver,
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
 		},
@@ -211,7 +211,7 @@ func (c *Client) doRequestWithRetry(method, endpoint string, body interface{}, r
 		if retryCount >= c.maxRetries {
 			return nil, resp.StatusCode, fmt.Errorf("rate limit exceeded after %d retries", c.maxRetries)
 		}
-		
+
 		// Try to use Retry-After header if present
 		var retryAfter time.Duration
 		if retryAfterStr := resp.Header.Get("Retry-After"); retryAfterStr != "" {
@@ -220,21 +220,21 @@ func (c *Client) doRequestWithRetry(method, endpoint string, body interface{}, r
 				retryAfter = time.Duration(seconds) * time.Second
 			}
 		}
-		
+
 		// If no Retry-After header, use exponential backoff
 		if retryAfter == 0 {
 			// Exponential backoff: base * 2^retryCount (e.g., 2s, 4s, 8s, 16s, 32s)
 			retryAfter = c.retryBaseDelay * time.Duration(1<<uint(retryCount))
 		}
-		
+
 		// Cap the delay at 60 seconds
 		if retryAfter > 60*time.Second {
 			retryAfter = 60 * time.Second
 		}
-		
+
 		logger.Warn("Rate limit hit (429), waiting %v before retry %d/%d", retryAfter, retryCount+1, c.maxRetries)
 		time.Sleep(retryAfter)
-		
+
 		// Retry
 		return c.doRequestWithRetry(method, endpoint, body, retryCount+1)
 	}
@@ -1194,6 +1194,50 @@ func (c *Client) SetJoinRulesRestricted(roomID, spaceID string) error {
 	return nil
 }
 
+// SetRoomName sets m.room.name for a room as the current authenticated user (admin token).
+func (c *Client) SetRoomName(roomID, name string) error {
+	endpoint := fmt.Sprintf("/_matrix/client/v3/rooms/%s/state/m.room.name", url.PathEscape(roomID))
+	content := map[string]string{"name": name}
+	body, statusCode, err := c.doRequest("PUT", endpoint, content)
+	if err != nil {
+		return err
+	}
+	if statusCode != http.StatusOK {
+		var resp GenericResponse
+		json.Unmarshal(body, &resp)
+		return fmt.Errorf("API error (%d): %s - %s", statusCode, resp.Errcode, resp.Error)
+	}
+	return nil
+}
+
+// TryRecoverUnjoinableRoom performs best-effort recovery for rooms where admin cannot join for force-join.
+// Strategy:
+//  1) Have fallback owner invite admin and give admin power (requires fallback owner to be in room).
+//  2) Promote fallback owner to PL 100 (owner-equivalent).
+//  3) Rename room to "[Unjoinable] <oldName>" for visibility.
+func (c *Client) TryRecoverUnjoinableRoom(roomID, oldName, fallbackOwnerID string) error {
+	if fallbackOwnerID == "" {
+		return fmt.Errorf("fallback owner is empty")
+	}
+	if err := c.ensureAdminInRoomWithPower(roomID, fallbackOwnerID, 100); err != nil {
+		return err
+	}
+	if err := c.SetPowerLevels(roomID, fallbackOwnerID, 100); err != nil {
+		return fmt.Errorf("set fallback owner power level: %w", err)
+	}
+	newName := strings.TrimSpace(oldName)
+	if newName == "" {
+		newName = roomID
+	}
+	if !strings.HasPrefix(newName, "[Unjoinable] ") {
+		newName = "[Unjoinable] " + newName
+	}
+	if err := c.SetRoomName(roomID, newName); err != nil {
+		return fmt.Errorf("rename unjoinable room: %w", err)
+	}
+	return nil
+}
+
 // FormatUserID formats a username as a full Matrix user ID
 func (c *Client) FormatUserID(username string) string {
 	if c.masClient != nil {
@@ -1247,81 +1291,81 @@ func (c *Client) SendMessage(roomID, message string) (*SendMessageResponse, erro
 // If senderUserID is provided, the message will appear as sent by that user (requires AS)
 func (c *Client) SendMessageWithTimestamp(roomID, message string, timestamp int64, senderUserID string) (*SendMessageResponse, error) {
 	txnID := c.getNextTxnID()
-	
+
 	// Build endpoint
 	endpoint := fmt.Sprintf("/_matrix/client/v3/rooms/%s/send/m.room.message/%s",
 		url.PathEscape(roomID), url.PathEscape(txnID))
-	
+
 	// Add query parameters
 	params := url.Values{}
-	
+
 	// Add timestamp if AS token is available and timestamp is provided
 	if timestamp > 0 && c.asToken != "" {
 		params.Set("ts", strconv.FormatInt(timestamp, 10))
 	}
-	
+
 	// Add user_id parameter for AS to send on behalf of user
 	if senderUserID != "" && c.asToken != "" {
 		params.Set("user_id", senderUserID)
 	}
-	
+
 	if len(params) > 0 {
 		endpoint += "?" + params.Encode()
 	}
-	
+
 	// Create message content
 	req := &SendMessageRequest{
 		MsgType: "m.text",
 		Body:    message,
 	}
-	
+
 	// Use AS token if available, otherwise use admin token
 	token := c.adminToken
 	if c.asToken != "" {
 		token = c.asToken
 	}
-	
+
 	// Make request
 	body, statusCode, err := c.doRequestWithToken("PUT", endpoint, req, token)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	var resp SendMessageResponse
 	if err := json.Unmarshal(body, &resp); err != nil {
 		return nil, fmt.Errorf("failed to parse response: %w", err)
 	}
-	
+
 	if statusCode != http.StatusOK {
 		return nil, fmt.Errorf("API error (%d): %s - %s", statusCode, resp.Errcode, resp.Error)
 	}
-	
+
 	return &resp, nil
 }
 
 // SendReplyWithTimestamp sends a reply to a message with a specific timestamp
 func (c *Client) SendReplyWithTimestamp(roomID, message string, replyToEventID string, timestamp int64, senderUserID string) (*SendMessageResponse, error) {
 	txnID := c.getNextTxnID()
-	
+
 	// Build endpoint
 	endpoint := fmt.Sprintf("/_matrix/client/v3/rooms/%s/send/m.room.message/%s",
 		url.PathEscape(roomID), url.PathEscape(txnID))
-	
+
 	// Add query parameters
 	params := url.Values{}
-	
+
 	if timestamp > 0 && c.asToken != "" {
 		params.Set("ts", strconv.FormatInt(timestamp, 10))
 	}
-	
+
 	if senderUserID != "" && c.asToken != "" {
 		params.Set("user_id", senderUserID)
 	}
-	
+
 	if len(params) > 0 {
 		endpoint += "?" + params.Encode()
 	}
-	
+
 	// Create reply content with relation
 	content := map[string]interface{}{
 		"msgtype": "m.text",
@@ -1332,27 +1376,27 @@ func (c *Client) SendReplyWithTimestamp(roomID, message string, replyToEventID s
 			},
 		},
 	}
-	
+
 	// Use AS token if available
 	token := c.adminToken
 	if c.asToken != "" {
 		token = c.asToken
 	}
-	
+
 	body, statusCode, err := c.doRequestWithToken("PUT", endpoint, content, token)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	var resp SendMessageResponse
 	if err := json.Unmarshal(body, &resp); err != nil {
 		return nil, fmt.Errorf("failed to parse response: %w", err)
 	}
-	
+
 	if statusCode != http.StatusOK {
 		return nil, fmt.Errorf("API error (%d): %s - %s", statusCode, resp.Errcode, resp.Error)
 	}
-	
+
 	return &resp, nil
 }
 
@@ -1409,25 +1453,25 @@ func (c *Client) doRequestWithTokenAndRetry(method, endpoint string, body interf
 		if retryCount >= c.maxRetries {
 			return nil, resp.StatusCode, fmt.Errorf("rate limit exceeded after %d retries", c.maxRetries)
 		}
-		
+
 		var retryAfter time.Duration
 		if retryAfterStr := resp.Header.Get("Retry-After"); retryAfterStr != "" {
 			if seconds, err := strconv.Atoi(retryAfterStr); err == nil {
 				retryAfter = time.Duration(seconds) * time.Second
 			}
 		}
-		
+
 		if retryAfter == 0 {
 			retryAfter = c.retryBaseDelay * time.Duration(1<<uint(retryCount))
 		}
-		
+
 		if retryAfter > 60*time.Second {
 			retryAfter = 60 * time.Second
 		}
-		
+
 		logger.Warn("Rate limit hit (429), waiting %v before retry %d/%d", retryAfter, retryCount+1, c.maxRetries)
 		time.Sleep(retryAfter)
-		
+
 		return c.doRequestWithTokenAndRetry(method, endpoint, body, token, retryCount+1)
 	}
 
@@ -1445,7 +1489,7 @@ type UploadMediaResponse struct {
 // Returns the mxc:// URI for the uploaded file
 func (c *Client) UploadMedia(data []byte, filename, contentType string) (*UploadMediaResponse, error) {
 	endpoint := fmt.Sprintf("/_matrix/media/v3/upload?filename=%s", url.QueryEscape(filename))
-	
+
 	// Rate limiting
 	c.mu.Lock()
 	if c.rateLimit > 0 {
@@ -1456,61 +1500,61 @@ func (c *Client) UploadMedia(data []byte, filename, contentType string) (*Upload
 	}
 	c.lastRequest = time.Now()
 	c.mu.Unlock()
-	
+
 	reqURL := c.baseURL + endpoint
 	req, err := http.NewRequest("POST", reqURL, bytes.NewReader(data))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create upload request: %w", err)
 	}
-	
+
 	token := c.adminToken
 	if c.asToken != "" {
 		token = c.asToken
 	}
-	
+
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", contentType)
-	
+
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("upload request failed: %w", err)
 	}
 	defer resp.Body.Close()
-	
+
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read upload response: %w", err)
 	}
-	
+
 	var result UploadMediaResponse
 	if err := json.Unmarshal(body, &result); err != nil {
 		return nil, fmt.Errorf("failed to parse upload response: %w", err)
 	}
-	
+
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("upload failed (%d): %s - %s", resp.StatusCode, result.Errcode, result.Error)
 	}
-	
+
 	return &result, nil
 }
 
 // FileMessageContent represents a file message content
 type FileMessageContent struct {
-	MsgType  string         `json:"msgtype"`           // m.file, m.image, m.video, m.audio
-	Body     string         `json:"body"`              // Filename as fallback
-	URL      string         `json:"url,omitempty"`     // mxc:// URI (for uploaded files)
-	Filename string         `json:"filename,omitempty"`
-	Info     *FileInfo      `json:"info,omitempty"`
+	MsgType  string    `json:"msgtype"`       // m.file, m.image, m.video, m.audio
+	Body     string    `json:"body"`          // Filename as fallback
+	URL      string    `json:"url,omitempty"` // mxc:// URI (for uploaded files)
+	Filename string    `json:"filename,omitempty"`
+	Info     *FileInfo `json:"info,omitempty"`
 }
 
 // FileInfo contains metadata about the file
 type FileInfo struct {
-	MimeType      string `json:"mimetype,omitempty"`
-	Size          int64  `json:"size,omitempty"`
-	Width         int    `json:"w,omitempty"`          // For images/videos
-	Height        int    `json:"h,omitempty"`          // For images/videos
-	Duration      int    `json:"duration,omitempty"`   // For audio/video in ms
-	ThumbnailURL  string `json:"thumbnail_url,omitempty"`
+	MimeType      string         `json:"mimetype,omitempty"`
+	Size          int64          `json:"size,omitempty"`
+	Width         int            `json:"w,omitempty"`        // For images/videos
+	Height        int            `json:"h,omitempty"`        // For images/videos
+	Duration      int            `json:"duration,omitempty"` // For audio/video in ms
+	ThumbnailURL  string         `json:"thumbnail_url,omitempty"`
 	ThumbnailInfo *ThumbnailInfo `json:"thumbnail_info,omitempty"`
 }
 
@@ -1525,10 +1569,10 @@ type ThumbnailInfo struct {
 // SendFileMessage sends a file message to a room
 func (c *Client) SendFileMessage(roomID string, content *FileMessageContent, timestamp int64, senderUserID string) (*SendMessageResponse, error) {
 	txnID := c.getNextTxnID()
-	
+
 	endpoint := fmt.Sprintf("/_matrix/client/v3/rooms/%s/send/m.room.message/%s",
 		url.PathEscape(roomID), url.PathEscape(txnID))
-	
+
 	params := url.Values{}
 	if timestamp > 0 && c.asToken != "" {
 		params.Set("ts", strconv.FormatInt(timestamp, 10))
@@ -1539,26 +1583,26 @@ func (c *Client) SendFileMessage(roomID string, content *FileMessageContent, tim
 	if len(params) > 0 {
 		endpoint += "?" + params.Encode()
 	}
-	
+
 	token := c.adminToken
 	if c.asToken != "" {
 		token = c.asToken
 	}
-	
+
 	body, statusCode, err := c.doRequestWithToken("PUT", endpoint, content, token)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	var resp SendMessageResponse
 	if err := json.Unmarshal(body, &resp); err != nil {
 		return nil, fmt.Errorf("failed to parse response: %w", err)
 	}
-	
+
 	if statusCode != http.StatusOK {
 		return nil, fmt.Errorf("API error (%d): %s - %s", statusCode, resp.Errcode, resp.Error)
 	}
-	
+
 	return &resp, nil
 }
 
@@ -1575,9 +1619,9 @@ func (c *Client) SendFileLink(roomID, filename, fileURL, mimeType string, fileSi
 	} else if strings.HasPrefix(mimeType, "audio/") {
 		emoji = "🎵"
 	}
-	
+
 	message := fmt.Sprintf("%s [%s](%s)", emoji, filename, fileURL)
-	
+
 	return c.SendMessageWithTimestamp(roomID, message, timestamp, senderUserID)
 }
 
@@ -1591,7 +1635,7 @@ func (c *Client) SendUploadedFile(roomID, mxcURI, filename, mimeType string, fil
 	} else if strings.HasPrefix(mimeType, "audio/") {
 		msgType = "m.audio"
 	}
-	
+
 	content := &FileMessageContent{
 		MsgType:  msgType,
 		Body:     filename,
@@ -1602,11 +1646,11 @@ func (c *Client) SendUploadedFile(roomID, mxcURI, filename, mimeType string, fil
 			Size:     fileSize,
 		},
 	}
-	
+
 	if width > 0 && height > 0 {
 		content.Info.Width = width
 		content.Info.Height = height
 	}
-	
+
 	return c.SendFileMessage(roomID, content, timestamp, senderUserID)
 }

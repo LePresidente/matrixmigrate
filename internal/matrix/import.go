@@ -74,7 +74,7 @@ func (i *Importer) ImportUsers(users []mattermost.User, existingMapping map[stri
 
 	for idx, user := range users {
 		logger.Info("Processing user %d/%d: %s (ID: %s)", idx+1, total, user.Username, user.ID)
-		
+
 		if progress != nil {
 			progress("users", idx+1, total, user.Username)
 		}
@@ -383,10 +383,13 @@ func (i *Importer) ApplyTeamMemberships(
 	memberships []mattermost.TeamMember,
 	userMapping map[string]string,
 	spaceMapping map[string]string,
+	defaultSpaceOwnerID string,
 	progress ImportProgressCallback,
-) (*ImportStats, error) {
+) (*ImportStats, []string, error) {
 	stats := &ImportStats{}
 	total := len(memberships)
+	ensuredSpacesForForceJoin := make(map[string]struct{})
+	unjoinableSpaces := make(map[string]struct{})
 
 	logger.Info("Starting team membership import: %d memberships to process", total)
 
@@ -417,6 +420,31 @@ func (i *Importer) ApplyTeamMemberships(
 			continue
 		}
 
+		// Ensure AS admin is in each space with PL100 once before applying force-join memberships.
+		if i.client.ForceJoinEnabled() && i.client.HasASToken() {
+			if _, blocked := unjoinableSpaces[spaceID]; blocked {
+				logger.Warn("Team membership %d/%d skipped: space %s is marked unjoinable for admin", idx+1, total, spaceID)
+				stats.MembersSkipped++
+				continue
+			}
+			if _, already := ensuredSpacesForForceJoin[spaceID]; !already {
+				if defaultSpaceOwnerID == "" {
+					logger.Warn("Team membership %d/%d skipped: default space owner is empty, cannot ensure admin in space %s", idx+1, total, spaceID)
+					unjoinableSpaces[spaceID] = struct{}{}
+					stats.MembersSkipped++
+					continue
+				}
+				if err := i.client.ensureAdminInSpaceWithPower(spaceID, defaultSpaceOwnerID, 100); err != nil {
+					logger.Warn("Team membership %d/%d: could not ensure admin in space %s (owner %s): %v", idx+1, total, spaceID, defaultSpaceOwnerID, err)
+					unjoinableSpaces[spaceID] = struct{}{}
+					stats.MembersSkipped++
+					continue
+				}
+				ensuredSpacesForForceJoin[spaceID] = struct{}{}
+				logger.Info("ApplyTeamMemberships: admin joined space %s (PL 100) for force-join", spaceID)
+			}
+		}
+
 		if i.client.ForceJoinEnabled() {
 			logger.Info("Team membership %d/%d: force-joining %s to space %s", idx+1, total, userID, spaceID)
 		} else {
@@ -432,10 +460,14 @@ func (i *Importer) ApplyTeamMemberships(
 		stats.MembersAdded++
 	}
 
-	logger.Info("Team membership import completed: added=%d, skipped=%d, failed=%d", 
+	logger.Info("Team membership import completed: added=%d, skipped=%d, failed=%d",
 		stats.MembersAdded, stats.MembersSkipped, stats.MembersFailed)
 
-	return stats, nil
+	spacesToLeave := make([]string, 0, len(ensuredSpacesForForceJoin))
+	for spaceID := range ensuredSpacesForForceJoin {
+		spacesToLeave = append(spacesToLeave, spaceID)
+	}
+	return stats, spacesToLeave, nil
 }
 
 // ApplyChannelMemberships invites users to rooms based on channel memberships.
@@ -454,6 +486,15 @@ func (i *Importer) ApplyChannelMemberships(
 ) (*ImportStats, error) {
 	stats := &ImportStats{}
 	total := len(memberships)
+	failedByType := map[string]int{"O": 0, "P": 0, "G": 0, "D": 0, "?": 0}
+	skippedByType := map[string]int{"O": 0, "P": 0, "G": 0, "D": 0, "?": 0}
+	bump := func(m map[string]int, channelType string) {
+		if _, ok := m[channelType]; ok {
+			m[channelType]++
+			return
+		}
+		m["?"]++
+	}
 
 	channelByID := make(map[string]mattermost.Channel)
 	groupChannelIDs := make(map[string]bool)
@@ -474,6 +515,8 @@ func (i *Importer) ApplyChannelMemberships(
 	// When force_join + AS: rooms we joined (via owner invite) so we can leave after processing all memberships
 	roomsToLeaveAfter := make(map[string]struct{})
 	ensuredRoomsForForceJoin := make(map[string]struct{})
+	recoveryAttemptedRooms := make(map[string]struct{})
+	unjoinableRooms := make(map[string]struct{})
 
 	logger.Info("Starting channel membership import: %d memberships to process (%d DM channels will be skipped)", total, len(directChannelIDs))
 
@@ -482,7 +525,23 @@ func (i *Importer) ApplyChannelMemberships(
 			progress("channel_memberships", idx+1, total, "")
 		}
 
+		channel, channelKnown := channelByID[membership.ChannelID]
+		channelType := "?"
+		if channelKnown {
+			switch {
+			case channel.IsDirect():
+				channelType = "D"
+			case channel.IsGroup():
+				channelType = "G"
+			case channel.IsPrivate():
+				channelType = "P"
+			case channel.IsPublic():
+				channelType = "O"
+			}
+		}
+
 		if directChannelIDs[membership.ChannelID] {
+			bump(skippedByType, channelType)
 			stats.MembersSkipped++
 			continue
 		}
@@ -497,13 +556,19 @@ func (i *Importer) ApplyChannelMemberships(
 			if !roomExists {
 				logger.Warn("Channel membership %d/%d skipped: channel %s not in mapping", idx+1, total, membership.ChannelID)
 			}
+			bump(skippedByType, channelType)
 			stats.MembersSkipped++
 			continue
 		}
 
-		// For group (G) and private (P) rooms with force_join: ensure admin is in the room once (owner invites, admin joins with PL 100).
-		channel := channelByID[membership.ChannelID]
-		if i.client.ForceJoinEnabled() && i.client.HasASToken() && (channel.IsGroup() || channel.IsPrivate()) {
+		// For non-D rooms with force_join: ensure admin is in room with PL100 once before force-join.
+		if i.client.ForceJoinEnabled() && i.client.HasASToken() && !channel.IsDirect() {
+			if _, blocked := unjoinableRooms[roomID]; blocked {
+				logger.Warn("Channel membership %d/%d skipped: room %s is marked unjoinable", idx+1, total, roomID)
+				bump(skippedByType, channelType)
+				stats.MembersSkipped++
+				continue
+			}
 			if _, already := ensuredRoomsForForceJoin[roomID]; !already {
 				roomOwnerID := defaultRoomOwnerID
 				ownerFromCreator := false
@@ -526,6 +591,27 @@ func (i *Importer) ApplyChannelMemberships(
 					}
 					if roomEnsureErr != nil {
 						logger.Warn("ApplyChannelMemberships: could not ensure admin in room %s (owner %s): %v", roomID, roomOwnerID, roomEnsureErr)
+						// One-time best-effort recovery for unjoinable rooms:
+						// promote fallback owner and tag room name so it is easy to find.
+						if _, attempted := recoveryAttemptedRooms[roomID]; !attempted {
+							recoveryAttemptedRooms[roomID] = struct{}{}
+							recoverErr := i.client.TryRecoverUnjoinableRoom(roomID, channel.DisplayName, defaultRoomOwnerID)
+							if recoverErr != nil {
+								logger.Warn("ApplyChannelMemberships: recovery failed for room %s: %v", roomID, recoverErr)
+							} else {
+								logger.Warn("ApplyChannelMemberships: room %s recovered and renamed as unjoinable marker", roomID)
+								roomEnsureErr = nil
+								ensuredRoomsForForceJoin[roomID] = struct{}{}
+								roomsToLeaveAfter[roomID] = struct{}{}
+							}
+						}
+						if roomEnsureErr != nil {
+							unjoinableRooms[roomID] = struct{}{}
+							logger.Warn("ApplyChannelMemberships: room %s marked unjoinable; remaining memberships for this room will be skipped", roomID)
+							bump(skippedByType, channelType)
+							stats.MembersSkipped++
+							continue
+						}
 					} else {
 						ensuredRoomsForForceJoin[roomID] = struct{}{}
 						roomsToLeaveAfter[roomID] = struct{}{}
@@ -542,14 +628,18 @@ func (i *Importer) ApplyChannelMemberships(
 		}
 		logger.Debug("ApplyChannelMemberships: AddUserToRoom room=%s user=%s (membership %d/%d)", roomID, userID, idx+1, total)
 
-		if groupChannelIDs[membership.ChannelID] {
-			groupRoomMembers[roomID] = append(groupRoomMembers[roomID], userID)
-		}
-
 		if err := i.client.AddUserToRoom(roomID, userID); err != nil {
-			logger.Error("Channel membership %d/%d failed: %s -> %s: %v", idx+1, total, userID, roomID, err)
+			logger.Error("Channel membership %d/%d failed [type=%s]: %s -> %s: %v", idx+1, total, channelType, userID, roomID, err)
+			bump(failedByType, channelType)
 			stats.MembersFailed++
 			continue
+		}
+		// Ensure admin cleanup covers all channels where force-join succeeded in this run.
+		if i.client.ForceJoinEnabled() && i.client.HasASToken() && !channel.IsDirect() {
+			roomsToLeaveAfter[roomID] = struct{}{}
+		}
+		if groupChannelIDs[membership.ChannelID] {
+			groupRoomMembers[roomID] = append(groupRoomMembers[roomID], userID)
 		}
 
 		logger.Success("Channel membership %d/%d: %s added to room", idx+1, total, userID)
@@ -557,22 +647,30 @@ func (i *Importer) ApplyChannelMemberships(
 	}
 
 	// Leave rooms we joined for force-join so the admin is not left in group/private rooms
+	leftChannels := 0
+	failedLeaveChannels := 0
 	for roomID := range roomsToLeaveAfter {
 		logger.Debug("ApplyChannelMemberships: LeaveRoom %s (admin leaving after force-join)", roomID)
 		if err := i.client.LeaveRoom(roomID); err != nil {
 			logger.Warn("ApplyChannelMemberships: admin leave room %s after force-join: %v", roomID, err)
+			failedLeaveChannels++
 		} else {
 			logger.Info("ApplyChannelMemberships: admin left room %s", roomID)
+			leftChannels++
 		}
 	}
+	logger.Info("ApplyChannelMemberships: admin cleanup completed: left_channels=%d leave_failures=%d attempted=%d",
+		leftChannels, failedLeaveChannels, len(roomsToLeaveAfter))
 
 	// For group channels, set equal power levels (50) for all members to match Mattermost
 	for roomID, memberIDs := range groupRoomMembers {
 		if len(memberIDs) == 0 {
 			continue
 		}
+		uniqueMembers := make(map[string]struct{})
 		userLevels := make(map[string]int)
 		for _, u := range memberIDs {
+			uniqueMembers[u] = struct{}{}
 			userLevels[u] = 50
 		}
 		if err := i.client.SetPowerLevelsBulk(roomID, userLevels); err != nil {
@@ -580,10 +678,28 @@ func (i *Importer) ApplyChannelMemberships(
 		} else {
 			logger.Info("ApplyChannelMemberships: set equal power level 50 for %d members in group room %s", len(memberIDs), roomID)
 		}
+
+		// Group channels with only one participant are typically not collaborative.
+		// Add fallback owner for review with PL 100.
+		if len(uniqueMembers) == 1 && defaultRoomOwnerID != "" {
+			if _, already := uniqueMembers[defaultRoomOwnerID]; !already {
+				logger.Warn("ApplyChannelMemberships: group room %s has a single participant; adding fallback owner %s as admin", roomID, defaultRoomOwnerID)
+				if err := i.client.AddUserToRoom(roomID, defaultRoomOwnerID); err != nil {
+					logger.Warn("ApplyChannelMemberships: could not add fallback owner %s to single-participant group room %s: %v", defaultRoomOwnerID, roomID, err)
+				} else if err := i.client.SetPowerLevels(roomID, defaultRoomOwnerID, 100); err != nil {
+					logger.Warn("ApplyChannelMemberships: could not set fallback owner %s power level 100 in room %s: %v", defaultRoomOwnerID, roomID, err)
+				} else {
+					logger.Info("ApplyChannelMemberships: added fallback owner %s with power level 100 to single-participant group room %s", defaultRoomOwnerID, roomID)
+				}
+			}
+		}
 	}
 
 	logger.Info("Channel membership import completed: added=%d, skipped=%d, failed=%d",
 		stats.MembersAdded, stats.MembersSkipped, stats.MembersFailed)
+	logger.Info("Channel membership type summary: failed(O=%d,P=%d,G=%d,D=%d,?=%d) skipped(O=%d,P=%d,G=%d,D=%d,?=%d)",
+		failedByType["O"], failedByType["P"], failedByType["G"], failedByType["D"], failedByType["?"],
+		skippedByType["O"], skippedByType["P"], skippedByType["G"], skippedByType["D"], skippedByType["?"])
 
 	return stats, nil
 }
@@ -631,8 +747,8 @@ func (i *Importer) ImportDirectChannelsAsDMs(
 		// Resolve the two Matrix user IDs for this DM
 		senderID, receiverID, err := channel.DMParticipantIDs()
 		if err != nil {
-			logger.Error("ImportDirectChannelsAsDMs: channel %s: %v", channel.ID, err)
-			stats.RoomsFailed++
+			logger.Warn("ImportDirectChannelsAsDMs: channel %s has insufficient/invalid participants (%v), skipping", channel.ID, err)
+			stats.RoomsSkipped++
 			continue
 		}
 		creatorMX, ok1 := userMapping[senderID]
@@ -799,9 +915,9 @@ type ImportAssetsResult struct {
 
 // ExistingMappings holds existing mappings to skip already imported items
 type ExistingMappings struct {
-	Users    map[string]string
-	Spaces   map[string]string
-	Rooms    map[string]string
+	Users  map[string]string
+	Spaces map[string]string
+	Rooms  map[string]string
 }
 
 // ImportAssets imports all assets (users, teams as spaces, channels as rooms).
@@ -878,17 +994,17 @@ type MessageImportStats struct {
 	MessagesSkipped  int `json:"messages_skipped"` // Already imported
 	MessagesFailed   int `json:"messages_failed"`
 	RepliesImported  int `json:"replies_imported"`
-	RepliesFailed    int `json:"replies_failed"`  // Reply target not found
-	FilesLinked      int `json:"files_linked"`    // Files added as links
-	FilesUploaded    int `json:"files_uploaded"`  // Files uploaded to Matrix
-	FilesSkipped     int `json:"files_skipped"`   // Files skipped
+	RepliesFailed    int `json:"replies_failed"` // Reply target not found
+	FilesLinked      int `json:"files_linked"`   // Files added as links
+	FilesUploaded    int `json:"files_uploaded"` // Files uploaded to Matrix
+	FilesSkipped     int `json:"files_skipped"`  // Files skipped
 }
 
 // FileConfig holds file migration settings
 type FileConfig struct {
-	Mode         string // "link", "upload", or "skip"
-	S3PublicURL  string // Base URL for S3 files
-	MaxUploadSize int64 // Max file size for upload
+	Mode          string // "link", "upload", or "skip"
+	S3PublicURL   string // Base URL for S3 files
+	MaxUploadSize int64  // Max file size for upload
 }
 
 // MessageImportCallback is called for each message imported
@@ -896,18 +1012,18 @@ type MessageImportCallback func(current, total int, channelName string, status s
 
 // ImportMessagesResult contains the result of message import
 type ImportMessagesResult struct {
-	Stats    *MessageImportStats
-	Mapping  map[string]string // MattermostID -> MatrixEventID
-	Errors   []string
+	Stats   *MessageImportStats
+	Mapping map[string]string // MattermostID -> MatrixEventID
+	Errors  []string
 }
 
 // ImportMessages imports messages from Mattermost posts to Matrix rooms
 // This requires Application Service token for timestamp support
 func (i *Importer) ImportMessages(
 	posts []mattermost.Post,
-	channelToRoom map[string]string,      // Mattermost channel ID -> Matrix room ID
-	userMapping map[string]string,         // Mattermost user ID -> Matrix user ID
-	existingMapping map[string]string,     // Mattermost post ID -> Matrix event ID (for resume)
+	channelToRoom map[string]string, // Mattermost channel ID -> Matrix room ID
+	userMapping map[string]string, // Mattermost user ID -> Matrix user ID
+	existingMapping map[string]string, // Mattermost post ID -> Matrix event ID (for resume)
 	progress MessageImportCallback,
 ) (*ImportMessagesResult, error) {
 	result := &ImportMessagesResult{
@@ -915,22 +1031,22 @@ func (i *Importer) ImportMessages(
 		Mapping: make(map[string]string),
 		Errors:  []string{},
 	}
-	
+
 	if !i.client.HasASToken() {
 		logger.Warn("No Application Service token configured - messages will be imported without original timestamps")
 	}
-	
+
 	total := len(posts)
 	logger.Info("Starting message import: %d posts to process", total)
-	
+
 	// Collect all existing mappings
 	for k, v := range existingMapping {
 		result.Mapping[k] = v
 	}
-	
+
 	// Sort posts by timestamp (they should already be sorted, but just in case)
 	// This ensures parent messages are imported before replies
-	
+
 	// Process messages in order
 	for idx, post := range posts {
 		// Check if already imported
@@ -941,7 +1057,7 @@ func (i *Importer) ImportMessages(
 			}
 			continue
 		}
-		
+
 		// Get target room
 		roomID, roomExists := channelToRoom[post.ChannelID]
 		if !roomExists {
@@ -952,7 +1068,7 @@ func (i *Importer) ImportMessages(
 			}
 			continue
 		}
-		
+
 		// Get sender
 		senderID, userExists := userMapping[post.UserID]
 		if !userExists {
@@ -960,10 +1076,10 @@ func (i *Importer) ImportMessages(
 			senderID = ""
 			logger.Warn("No user mapping for user %s, message will be sent as AS bot", post.UserID)
 		}
-		
+
 		// Handle reply
 		var eventID string
-		
+
 		if post.IsReply() {
 			// This is a reply - find parent event ID
 			parentEventID, parentExists := result.Mapping[post.RootID]
@@ -971,7 +1087,7 @@ func (i *Importer) ImportMessages(
 				// Parent not yet imported or doesn't exist
 				result.Stats.RepliesFailed++
 				result.Errors = append(result.Errors, fmt.Sprintf("Parent post %s not found for reply %s", post.RootID, post.ID))
-				
+
 				// Import as regular message instead of failing
 				resp, sendErr := i.client.SendMessageWithTimestamp(roomID, post.Message, post.CreateAt, senderID)
 				if sendErr != nil {
@@ -1010,25 +1126,25 @@ func (i *Importer) ImportMessages(
 			}
 			eventID = resp.EventID
 		}
-		
+
 		// Store mapping
 		result.Mapping[post.ID] = eventID
 		result.Stats.MessagesImported++
-		
+
 		if progress != nil {
 			progress(idx+1, total, post.ChannelID, "imported")
 		}
-		
+
 		// Log progress every 100 messages
-		if (idx+1) % 100 == 0 {
+		if (idx+1)%100 == 0 {
 			logger.Info("Message import progress: %d/%d (%.1f%%)", idx+1, total, float64(idx+1)/float64(total)*100)
 		}
 	}
-	
+
 	logger.Info("Message import completed: imported=%d, skipped=%d, failed=%d, replies=%d",
-		result.Stats.MessagesImported, result.Stats.MessagesSkipped, 
+		result.Stats.MessagesImported, result.Stats.MessagesSkipped,
 		result.Stats.MessagesFailed, result.Stats.RepliesImported)
-	
+
 	return result, nil
 }
 
@@ -1048,24 +1164,24 @@ func (i *Importer) ImportMessagesWithFiles(
 		Mapping: make(map[string]string),
 		Errors:  []string{},
 	}
-	
+
 	if !i.client.HasASToken() {
 		logger.Warn("No Application Service token configured - messages will be imported without original timestamps")
 	}
-	
+
 	total := len(posts)
 	logger.Info("Starting message import with files: %d posts to process", total)
-	
+
 	// Default file config
 	if fileConfig == nil {
 		fileConfig = &FileConfig{Mode: "skip"}
 	}
-	
+
 	// Collect all existing mappings
 	for k, v := range existingMapping {
 		result.Mapping[k] = v
 	}
-	
+
 	// Process messages in order
 	for idx, post := range posts {
 		// Check if already imported
@@ -1076,7 +1192,7 @@ func (i *Importer) ImportMessagesWithFiles(
 			}
 			continue
 		}
-		
+
 		// Get target room
 		roomID, roomExists := channelToRoom[post.ChannelID]
 		if !roomExists {
@@ -1087,18 +1203,18 @@ func (i *Importer) ImportMessagesWithFiles(
 			}
 			continue
 		}
-		
+
 		// Get sender
 		senderID, userExists := userMapping[post.UserID]
 		if !userExists {
 			senderID = ""
 			logger.Warn("No user mapping for user %s, message will be sent as AS bot", post.UserID)
 		}
-		
+
 		// Build message content with files
 		messageContent := post.Message
 		files := filesByPost[post.ID]
-		
+
 		// Append file links if mode is "link"
 		if fileConfig.Mode == "link" && len(files) > 0 && fileConfig.S3PublicURL != "" {
 			for _, file := range files {
@@ -1107,16 +1223,16 @@ func (i *Importer) ImportMessagesWithFiles(
 				result.Stats.FilesLinked++
 			}
 		}
-		
+
 		// Handle reply
 		var eventID string
-		
+
 		if post.IsReply() {
 			parentEventID, parentExists := result.Mapping[post.RootID]
 			if !parentExists {
 				result.Stats.RepliesFailed++
 				result.Errors = append(result.Errors, fmt.Sprintf("Parent post %s not found for reply %s", post.RootID, post.ID))
-				
+
 				resp, sendErr := i.client.SendMessageWithTimestamp(roomID, messageContent, post.CreateAt, senderID)
 				if sendErr != nil {
 					result.Stats.MessagesFailed++
@@ -1152,26 +1268,25 @@ func (i *Importer) ImportMessagesWithFiles(
 			}
 			eventID = resp.EventID
 		}
-		
+
 		// Store mapping
 		result.Mapping[post.ID] = eventID
 		result.Stats.MessagesImported++
-		
+
 		if progress != nil {
 			progress(idx+1, total, post.ChannelID, "imported")
 		}
-		
+
 		// Log progress every 100 messages
-		if (idx+1) % 100 == 0 {
+		if (idx+1)%100 == 0 {
 			logger.Info("Message import progress: %d/%d (%.1f%%) - files linked: %d",
 				idx+1, total, float64(idx+1)/float64(total)*100, result.Stats.FilesLinked)
 		}
 	}
-	
+
 	logger.Info("Message import completed: imported=%d, skipped=%d, failed=%d, replies=%d, files_linked=%d",
-		result.Stats.MessagesImported, result.Stats.MessagesSkipped, 
+		result.Stats.MessagesImported, result.Stats.MessagesSkipped,
 		result.Stats.MessagesFailed, result.Stats.RepliesImported, result.Stats.FilesLinked)
-	
+
 	return result, nil
 }
-

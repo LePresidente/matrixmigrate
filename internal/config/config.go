@@ -24,6 +24,9 @@ type MattermostConfig struct {
 	ConfigPath string         `mapstructure:"config_path"` // Path to config.json on remote server
 	Database   DatabaseConfig `mapstructure:"database"`    // Optional: manual override
 	Files      FilesConfig    `mapstructure:"files"`       // File/attachment settings
+	// IgnoredUsers: Mattermost usernames to skip during import (e.g., bot/service accounts).
+	// Matching is case-insensitive.
+	IgnoredUsers []string `mapstructure:"ignored_users"`
 }
 
 // FilesConfig holds file attachment migration settings
@@ -31,14 +34,14 @@ type FilesConfig struct {
 	// S3 public URL prefix for direct linking (e.g., "https://s3.example.com/bucket")
 	// If set, files will be linked directly instead of uploaded to Matrix
 	S3PublicURL string `mapstructure:"s3_public_url"`
-	
+
 	// Local data path on Mattermost server (e.g., "/opt/mattermost/data")
 	// Used for local file storage mode
 	LocalDataPath string `mapstructure:"local_data_path"`
-	
+
 	// Migration mode: "link" (keep S3 URLs), "upload" (upload to Matrix), "skip" (no files)
 	Mode string `mapstructure:"mode"`
-	
+
 	// Maximum file size to upload in MB (default: 50)
 	// Files larger than this will be linked instead of uploaded
 	MaxUploadSizeMB int `mapstructure:"max_upload_size_mb"`
@@ -48,10 +51,10 @@ type FilesConfig struct {
 type MatrixConfig struct {
 	SSH        SSHConfig        `mapstructure:"ssh"`
 	API        APIConfig        `mapstructure:"api"`
-	Auth       AuthConfig       `mapstructure:"auth"`       // Username/password auth for Matrix API
+	Auth       AuthConfig       `mapstructure:"auth"` // Username/password auth for Matrix API
 	Homeserver string           `mapstructure:"homeserver"`
-	RateLimit  RateLimitConfig  `mapstructure:"rate_limit"`  // Rate limiting configuration
-	AppService AppServiceConfig `mapstructure:"appservice"`  // Application Service for message import
+	RateLimit  RateLimitConfig  `mapstructure:"rate_limit"` // Rate limiting configuration
+	AppService AppServiceConfig `mapstructure:"appservice"` // Application Service for message import
 	MAS        MASConfig        `mapstructure:"mas"`        // Matrix Authentication Service for user creation
 	Import     ImportConfig     `mapstructure:"import"`     // Room/space import options (owner and alias)
 }
@@ -79,17 +82,17 @@ type ImportConfig struct {
 // When enabled, users are created via MAS Admin API so they can log in via SSO/OAuth
 // without "Localpart not available" errors.
 type MASConfig struct {
-	Enabled        bool   `mapstructure:"enabled"`
-	Endpoint       string `mapstructure:"endpoint"`          // MAS API base URL (e.g. http://mas.example.com:8080)
-	ClientIDEnv    string `mapstructure:"client_id_env"`     // Env var for OAuth client ID (admin client)
+	Enabled         bool   `mapstructure:"enabled"`
+	Endpoint        string `mapstructure:"endpoint"`          // MAS API base URL (e.g. http://mas.example.com:8080)
+	ClientIDEnv     string `mapstructure:"client_id_env"`     // Env var for OAuth client ID (admin client)
 	ClientSecretEnv string `mapstructure:"client_secret_env"` // Env var for OAuth client secret
 }
 
 // AppServiceConfig holds Application Service configuration for message import
 type AppServiceConfig struct {
-	Enabled    bool   `mapstructure:"enabled"`       // Enable AS mode for message import
-	ASTokenEnv string `mapstructure:"as_token_env"`  // Env var for AS token
-	HSTokenEnv string `mapstructure:"hs_token_env"`  // Env var for HS token (optional)
+	Enabled    bool   `mapstructure:"enabled"`      // Enable AS mode for message import
+	ASTokenEnv string `mapstructure:"as_token_env"` // Env var for AS token
+	HSTokenEnv string `mapstructure:"hs_token_env"` // Env var for HS token (optional)
 }
 
 // RateLimitConfig holds rate limiting configuration for Matrix API
