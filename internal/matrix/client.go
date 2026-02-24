@@ -1016,7 +1016,11 @@ func (c *Client) ensureAdminInRoomWithPower(roomID, ownerUserID string, powerLev
 		logger.Debug("ensureAdminInRoomWithPower: owner is admin, skipping invite room=%s", roomID)
 	}
 	if err := c.JoinRoom(roomID); err != nil {
-		return fmt.Errorf("admin join room: %w", err)
+		// Private/invite-only room: direct join can fail if admin was previously cleaned up.
+		// Fall back to Synapse admin join so force-join membership import can proceed.
+		if joinErr := c.ForceJoinUser(roomID, me.UserID); joinErr != nil {
+			return fmt.Errorf("admin join room: %w", err)
+		}
 	}
 	c.joinedRoomsMu.Lock()
 	if c.joinedRooms == nil {
