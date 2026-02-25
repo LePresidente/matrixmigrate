@@ -57,12 +57,20 @@ mattermost:
     s3_public_url: "https://s3.example.com/mattermost-bucket"
     
     # Local data path (if using local file storage instead of S3)
+    # Can be either:
+    # - local path on the machine running matrixmigrate, or
+    # - remote path on Mattermost server (read over mattermost.ssh during upload mode).
     # local_data_path: "/opt/mattermost/data"
     
     # Maximum file size to upload to Matrix (in MB)
-    # Files larger than this will be linked instead of uploaded
+    # Files larger than this are treated as upload failures.
     # Only applies when mode is "upload"
     max_upload_size_mb: 50
+
+    # Optional fallback for upload mode:
+    # If true, failed uploads can be sent as links using s3_public_url.
+    # If false (default), failed uploads are skipped and logged.
+    fallback_to_link_on_upload_failure: false
 
 # Matrix Synapse server configuration
 matrix:

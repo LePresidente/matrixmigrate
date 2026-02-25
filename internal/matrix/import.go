@@ -2,6 +2,9 @@ package matrix
 
 import (
 	"fmt"
+	"os"
+	"path"
+	"path/filepath"
 	"strings"
 	"unicode"
 
@@ -1068,17 +1071,141 @@ type MessageImportStats struct {
 	MessagesSkipped  int `json:"messages_skipped"` // Already imported
 	MessagesFailed   int `json:"messages_failed"`
 	RepliesImported  int `json:"replies_imported"`
-	RepliesFailed    int `json:"replies_failed"` // Reply target not found
-	FilesLinked      int `json:"files_linked"`   // Files added as links
-	FilesUploaded    int `json:"files_uploaded"` // Files uploaded to Matrix
-	FilesSkipped     int `json:"files_skipped"`  // Files skipped
+	RepliesFailed    int `json:"replies_failed"`  // Reply target not found
+	FilesLinked      int `json:"files_linked"`    // Files added as links
+	FilesUploaded    int `json:"files_uploaded"`  // Files uploaded to Matrix
+	FilesSkipped     int `json:"files_skipped"`   // Files skipped
+	FilesTooLarge    int `json:"files_too_large"` // Files rejected for exceeding max_upload_size_mb
 }
 
 // FileConfig holds file migration settings
 type FileConfig struct {
-	Mode          string // "link", "upload", or "skip"
-	S3PublicURL   string // Base URL for S3 files
-	MaxUploadSize int64  // Max file size for upload
+	Mode                 string                            // "link", "upload", or "skip"
+	S3PublicURL          string                            // Base URL for S3 files
+	LocalDataPath        string                            // Mattermost data path base (local or remote)
+	RemoteReadFile       func(path string) ([]byte, error) // Optional remote file reader over SSH
+	UploadFallbackToLink bool                              // If true, upload failures may fall back to S3/public links
+	MaxUploadSize        int64                             // Max file size for upload
+}
+
+func buildPublicFileURL(baseURL, filePath string) string {
+	base := strings.TrimSuffix(baseURL, "/")
+	rel := strings.TrimPrefix(filePath, "/")
+	return base + "/" + rel
+}
+
+func resolveLocalMattermostPath(localDataPath, mattermostFilePath string) string {
+	relPath := filepath.FromSlash(strings.TrimPrefix(mattermostFilePath, "/"))
+	return filepath.Join(localDataPath, relPath)
+}
+
+func resolveRemoteMattermostPath(remoteDataPath, mattermostFilePath string) string {
+	relPath := strings.TrimPrefix(mattermostFilePath, "/")
+	return path.Join(remoteDataPath, relPath)
+}
+
+func (i *Importer) sendLinkOrSkip(
+	result *ImportMessagesResult,
+	roomID string,
+	file mattermost.FileInfo,
+	fileConfig *FileConfig,
+	timestamp int64,
+	senderID string,
+	reason string,
+) {
+	if fileConfig.S3PublicURL == "" {
+		result.Stats.FilesSkipped++
+		result.Errors = append(result.Errors, fmt.Sprintf("Skipped file %s for post %s: %s", file.Name, file.PostID, reason))
+		return
+	}
+	fileURL := buildPublicFileURL(fileConfig.S3PublicURL, file.Path)
+	if _, err := i.client.SendFileLink(roomID, file.Name, fileURL, file.MimeType, file.Size, timestamp, senderID); err != nil {
+		result.Stats.FilesSkipped++
+		result.Errors = append(result.Errors, fmt.Sprintf("Failed to send file link for %s (post %s): %v", file.Name, file.PostID, err))
+		return
+	}
+	result.Stats.FilesLinked++
+}
+
+func (i *Importer) importPostFiles(
+	result *ImportMessagesResult,
+	roomID string,
+	files []mattermost.FileInfo,
+	fileConfig *FileConfig,
+	timestamp int64,
+	senderID string,
+) (int, int64) {
+	tooLargeCount := 0
+	var maxTooLargeSize int64
+	for _, file := range files {
+		if file.IsDeleted() {
+			result.Stats.FilesSkipped++
+			continue
+		}
+		if file.Size > fileConfig.MaxUploadSize {
+			result.Stats.FilesTooLarge++
+			tooLargeCount++
+			if file.Size > maxTooLargeSize {
+				maxTooLargeSize = file.Size
+			}
+			if fileConfig.UploadFallbackToLink {
+				i.sendLinkOrSkip(result, roomID, file, fileConfig, timestamp, senderID, "file exceeds max_upload_size_mb")
+			} else {
+				result.Stats.FilesSkipped++
+				result.Errors = append(result.Errors, fmt.Sprintf("Skipped file %s for post %s: file size %d exceeds max_upload_size_mb (%d bytes)", file.Name, file.PostID, file.Size, fileConfig.MaxUploadSize))
+			}
+			continue
+		}
+		if fileConfig.LocalDataPath == "" {
+			if fileConfig.UploadFallbackToLink {
+				i.sendLinkOrSkip(result, roomID, file, fileConfig, timestamp, senderID, "mattermost.files.local_data_path is empty")
+			} else {
+				result.Stats.FilesSkipped++
+				result.Errors = append(result.Errors, fmt.Sprintf("Skipped file %s for post %s: mattermost.files.local_data_path is empty", file.Name, file.PostID))
+			}
+			continue
+		}
+		localPath := resolveLocalMattermostPath(fileConfig.LocalDataPath, file.Path)
+		data, err := os.ReadFile(localPath)
+		if err != nil && fileConfig.RemoteReadFile != nil {
+			remotePath := resolveRemoteMattermostPath(fileConfig.LocalDataPath, file.Path)
+			data, err = fileConfig.RemoteReadFile(remotePath)
+		}
+		if err != nil {
+			if fileConfig.UploadFallbackToLink {
+				i.sendLinkOrSkip(result, roomID, file, fileConfig, timestamp, senderID, fmt.Sprintf("cannot read attachment bytes from %s: %v", file.Path, err))
+			} else {
+				result.Stats.FilesSkipped++
+				result.Errors = append(result.Errors, fmt.Sprintf("Skipped file %s for post %s: cannot read attachment bytes from %s: %v", file.Name, file.PostID, file.Path, err))
+			}
+			continue
+		}
+		mimeType := strings.TrimSpace(file.MimeType)
+		if mimeType == "" {
+			mimeType = "application/octet-stream"
+		}
+		uploadResp, err := i.client.UploadMedia(data, file.Name, mimeType)
+		if err != nil {
+			if fileConfig.UploadFallbackToLink {
+				i.sendLinkOrSkip(result, roomID, file, fileConfig, timestamp, senderID, fmt.Sprintf("upload failed: %v", err))
+			} else {
+				result.Stats.FilesSkipped++
+				result.Errors = append(result.Errors, fmt.Sprintf("Skipped file %s for post %s: upload failed: %v", file.Name, file.PostID, err))
+			}
+			continue
+		}
+		if _, err := i.client.SendUploadedFile(roomID, uploadResp.ContentURI, file.Name, mimeType, file.Size, file.Width, file.Height, timestamp, senderID); err != nil {
+			if fileConfig.UploadFallbackToLink {
+				i.sendLinkOrSkip(result, roomID, file, fileConfig, timestamp, senderID, fmt.Sprintf("send uploaded file failed: %v", err))
+			} else {
+				result.Stats.FilesSkipped++
+				result.Errors = append(result.Errors, fmt.Sprintf("Skipped file %s for post %s: send uploaded file failed: %v", file.Name, file.PostID, err))
+			}
+			continue
+		}
+		result.Stats.FilesUploaded++
+	}
+	return tooLargeCount, maxTooLargeSize
 }
 
 // MessageImportCallback is called for each message imported
@@ -1250,6 +1377,9 @@ func (i *Importer) ImportMessagesWithFiles(
 	if fileConfig == nil {
 		fileConfig = &FileConfig{Mode: "skip"}
 	}
+	if fileConfig.MaxUploadSize <= 0 {
+		fileConfig.MaxUploadSize = 50 * 1024 * 1024
+	}
 
 	// Collect all existing mappings
 	for k, v := range existingMapping {
@@ -1257,6 +1387,8 @@ func (i *Importer) ImportMessagesWithFiles(
 	}
 
 	// Process messages in order
+	totalTooLarge := 0
+	var largestTooLargeSize int64
 	for idx, post := range posts {
 		// Check if already imported
 		if _, exists := existingMapping[post.ID]; exists {
@@ -1292,7 +1424,7 @@ func (i *Importer) ImportMessagesWithFiles(
 		// Append file links if mode is "link"
 		if fileConfig.Mode == "link" && len(files) > 0 && fileConfig.S3PublicURL != "" {
 			for _, file := range files {
-				fileURL := strings.TrimSuffix(fileConfig.S3PublicURL, "/") + "/" + file.Path
+				fileURL := buildPublicFileURL(fileConfig.S3PublicURL, file.Path)
 				messageContent += fmt.Sprintf("\n\n📎 [%s](%s)", file.Name, fileURL)
 				result.Stats.FilesLinked++
 			}
@@ -1351,6 +1483,16 @@ func (i *Importer) ImportMessagesWithFiles(
 			progress(idx+1, total, post.ChannelID, "imported")
 		}
 
+		// Upload or link files after the message event is imported.
+		// Matrix file attachments are sent as separate m.room.message events.
+		if fileConfig.Mode == "upload" && len(files) > 0 {
+			tooLargeCount, maxTooLargeSize := i.importPostFiles(result, roomID, files, fileConfig, post.CreateAt, senderID)
+			totalTooLarge += tooLargeCount
+			if maxTooLargeSize > largestTooLargeSize {
+				largestTooLargeSize = maxTooLargeSize
+			}
+		}
+
 		// Log progress every 100 messages
 		if (idx+1)%100 == 0 {
 			logger.Info("Message import progress: %d/%d (%.1f%%) - files linked: %d",
@@ -1361,6 +1503,10 @@ func (i *Importer) ImportMessagesWithFiles(
 	logger.Info("Message import completed: imported=%d, skipped=%d, failed=%d, replies=%d, files_linked=%d",
 		result.Stats.MessagesImported, result.Stats.MessagesSkipped,
 		result.Stats.MessagesFailed, result.Stats.RepliesImported, result.Stats.FilesLinked)
+	if fileConfig.Mode == "upload" && totalTooLarge > 0 {
+		logger.Warn("Upload mode: %d files exceeded max_upload_size_mb (%d bytes). Largest rejected file size: %d bytes",
+			totalTooLarge, fileConfig.MaxUploadSize, largestTooLargeSize)
+	}
 
 	return result, nil
 }

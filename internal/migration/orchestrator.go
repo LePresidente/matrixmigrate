@@ -969,6 +969,7 @@ type ImportMessagesResult struct {
 	FilesLinked      int
 	FilesUploaded    int
 	FilesSkipped     int
+	FilesTooLarge    int
 	MappingFile      string
 }
 
@@ -1062,9 +1063,27 @@ func (o *Orchestrator) ImportMessages(progress matrix.MessageImportCallback) (*I
 
 	// Build file config
 	fileConfig := &matrix.FileConfig{
-		Mode:          o.config.GetFileMode(),
-		S3PublicURL:   o.config.Mattermost.Files.S3PublicURL,
-		MaxUploadSize: o.config.GetMaxUploadSize(),
+		Mode:                 o.config.GetFileMode(),
+		S3PublicURL:          o.config.Mattermost.Files.S3PublicURL,
+		LocalDataPath:        o.config.Mattermost.Files.LocalDataPath,
+		UploadFallbackToLink: o.config.Mattermost.Files.FallbackToLinkOnUploadFailure,
+		MaxUploadSize:        o.config.GetMaxUploadSize(),
+	}
+	if fileConfig.Mode == "upload" && fileConfig.LocalDataPath != "" && o.config.Mattermost.SSH.Host != "" {
+		passphrase := o.config.GetSSHKeyPassphrase("mattermost")
+		sshPassword := o.config.GetSSHPassword("mattermost")
+		remoteExecutor, remoteErr := ssh.NewRemoteExecutorWithPassword(o.config.Mattermost.SSH, passphrase, sshPassword)
+		if remoteErr != nil {
+			logger.Warn("Upload mode: could not initialize Mattermost SSH file reader (will use local path only): %v", remoteErr)
+		} else {
+			defer func() {
+				if closeErr := remoteExecutor.Close(); closeErr != nil {
+					logger.Warn("Upload mode: failed to close Mattermost SSH file reader: %v", closeErr)
+				}
+			}()
+			fileConfig.RemoteReadFile = remoteExecutor.ReadFile
+			logger.Info("Upload mode: Mattermost SSH file reader enabled for remote local_data_path")
+		}
 	}
 	logger.Info("File mode: %s, S3 URL: %s", fileConfig.Mode, fileConfig.S3PublicURL)
 
@@ -1120,8 +1139,8 @@ func (o *Orchestrator) ImportMessages(progress matrix.MessageImportCallback) (*I
 		result.Stats.MessagesImported, result.Stats.MessagesSkipped, result.Stats.MessagesFailed)
 	logger.Info("Replies: imported=%d, failed=%d",
 		result.Stats.RepliesImported, result.Stats.RepliesFailed)
-	logger.Info("Files: linked=%d, uploaded=%d, skipped=%d",
-		result.Stats.FilesLinked, result.Stats.FilesUploaded, result.Stats.FilesSkipped)
+	logger.Info("Files: linked=%d, uploaded=%d, skipped=%d, too_large=%d",
+		result.Stats.FilesLinked, result.Stats.FilesUploaded, result.Stats.FilesSkipped, result.Stats.FilesTooLarge)
 	logger.Success("Message import completed successfully")
 
 	// Complete step
@@ -1139,6 +1158,7 @@ func (o *Orchestrator) ImportMessages(progress matrix.MessageImportCallback) (*I
 		FilesLinked:      result.Stats.FilesLinked,
 		FilesUploaded:    result.Stats.FilesUploaded,
 		FilesSkipped:     result.Stats.FilesSkipped,
+		FilesTooLarge:    result.Stats.FilesTooLarge,
 		MappingFile:      newMappingFile,
 	}, nil
 }

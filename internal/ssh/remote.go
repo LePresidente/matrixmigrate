@@ -1,8 +1,9 @@
-﻿package ssh
+package ssh
 
 import (
 	"bytes"
 	"fmt"
+	"strings"
 	"time"
 
 	"golang.org/x/crypto/ssh"
@@ -67,8 +68,9 @@ func (r *RemoteExecutor) ReadFile(path string) ([]byte, error) {
 	session.Stdout = &stdout
 	session.Stderr = &stderr
 
-	// Use cat to read the file, with sudo if needed
-	cmd := fmt.Sprintf("cat %s 2>/dev/null || sudo cat %s", path, path)
+	// Use cat to read the file, with sudo if needed.
+	quotedPath := shellQuote(path)
+	cmd := fmt.Sprintf("cat %s 2>/dev/null || sudo cat %s", quotedPath, quotedPath)
 	if err := session.Run(cmd); err != nil {
 		return nil, fmt.Errorf("failed to read file: %s", stderr.String())
 	}
@@ -84,7 +86,7 @@ func (r *RemoteExecutor) FileExists(path string) (bool, error) {
 	}
 	defer session.Close()
 
-	cmd := fmt.Sprintf("test -f %s && echo 'exists'", path)
+	cmd := fmt.Sprintf("test -f %s && echo 'exists'", shellQuote(path))
 	output, err := session.Output(cmd)
 	if err != nil {
 		return false, nil // File doesn't exist
@@ -112,4 +114,12 @@ func (r *RemoteExecutor) ExecuteCommand(cmd string) (string, error) {
 // GetClient returns the underlying SSH client (for creating tunnels)
 func (r *RemoteExecutor) GetClient() *ssh.Client {
 	return r.client
+}
+
+// shellQuote returns a POSIX shell-safe single-quoted string.
+func shellQuote(s string) string {
+	if s == "" {
+		return "''"
+	}
+	return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'"
 }

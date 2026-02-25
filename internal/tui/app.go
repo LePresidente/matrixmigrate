@@ -1,4 +1,4 @@
-﻿package tui
+package tui
 
 import (
 	"fmt"
@@ -41,11 +41,11 @@ type Model struct {
 	previousView View
 
 	// UI components
-	menuItems    []MenuItem
-	menuIndex    int
-	spinner      spinner.Model
-	width        int
-	height       int
+	menuItems []MenuItem
+	menuIndex int
+	spinner   spinner.Model
+	width     int
+	height    int
 
 	// Progress state
 	progressStage   string
@@ -762,7 +762,7 @@ func (m Model) formatTestStep(step *migration.TestStep) string {
 	}
 
 	if step.Error != "" {
-		line += "\n      " + ErrorStyle.Render("└─ " + step.Error)
+		line += "\n      " + ErrorStyle.Render("└─ "+step.Error)
 	}
 
 	return line
@@ -926,8 +926,9 @@ func (m *Model) runImportMessages() tea.Cmd {
 			return operationCompleteMsg{err: err}
 		}
 
-		msg := fmt.Sprintf("Messages imported: %d imported, %d skipped, %d failed, %d files linked",
-			result.MessagesImported, result.MessagesSkipped, result.MessagesFailed, result.FilesLinked)
+		msg := fmt.Sprintf("Messages imported: %d imported, %d skipped, %d failed, files linked=%d uploaded=%d skipped=%d too_large=%d",
+			result.MessagesImported, result.MessagesSkipped, result.MessagesFailed,
+			result.FilesLinked, result.FilesUploaded, result.FilesSkipped, result.FilesTooLarge)
 		return operationCompleteMsg{message: msg}
 	}
 }
@@ -970,4 +971,3 @@ func sendProgress(stage string, current, total int, item string) {
 		})
 	}
 }
-

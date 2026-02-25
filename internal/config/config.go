@@ -43,8 +43,12 @@ type FilesConfig struct {
 	Mode string `mapstructure:"mode"`
 
 	// Maximum file size to upload in MB (default: 50)
-	// Files larger than this will be linked instead of uploaded
+	// Files larger than this are treated as upload failures
 	MaxUploadSizeMB int `mapstructure:"max_upload_size_mb"`
+
+	// When true, upload failures may fall back to sending S3/public links (if s3_public_url is set).
+	// When false (default), upload failures are skipped and logged as errors.
+	FallbackToLinkOnUploadFailure bool `mapstructure:"fallback_to_link_on_upload_failure"`
 }
 
 // MatrixConfig holds Matrix server configuration
@@ -198,6 +202,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("mattermost.config_path", "/opt/mattermost/config/config.json")
 	v.SetDefault("mattermost.database.host", "localhost")
 	v.SetDefault("mattermost.database.port", 5432)
+	v.SetDefault("mattermost.files.fallback_to_link_on_upload_failure", false)
 	v.SetDefault("matrix.ssh.port", 22)
 	v.SetDefault("matrix.api.base_url", "http://localhost:8008")
 	v.SetDefault("matrix.api.port", 8008) // Synapse API port for SSH tunnel

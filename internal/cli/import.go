@@ -1,4 +1,4 @@
-﻿package cli
+package cli
 
 import (
 	"fmt"
@@ -44,7 +44,7 @@ original message timestamps. Without AS, messages will be imported with
 current timestamps.
 
 Requires: appservice.enabled=true and MATRIX_AS_TOKEN env var`,
-	RunE:  runImportMessages,
+	RunE: runImportMessages,
 }
 
 func init() {
@@ -98,11 +98,11 @@ func runImportAssets(cmd *cobra.Command, args []string) error {
 	}
 
 	printSuccess(i18n.T("messages.mapping_saved", result.OutputFile))
-	printInfo(fmt.Sprintf("  Users: created=%d, skipped=%d, failed=%d", 
+	printInfo(fmt.Sprintf("  Users: created=%d, skipped=%d, failed=%d",
 		result.UsersCreated, result.UsersSkipped, result.UsersFailed))
-	printInfo(fmt.Sprintf("  Spaces: created=%d, skipped=%d, failed=%d", 
+	printInfo(fmt.Sprintf("  Spaces: created=%d, skipped=%d, failed=%d",
 		result.SpacesCreated, result.SpacesSkipped, result.SpacesFailed))
-	printInfo(fmt.Sprintf("  Rooms: created=%d, skipped=%d, failed=%d, linked=%d", 
+	printInfo(fmt.Sprintf("  Rooms: created=%d, skipped=%d, failed=%d, linked=%d",
 		result.RoomsCreated, result.RoomsSkipped, result.RoomsFailed, result.RoomsLinked))
 	printSuccess(i18n.T("messages.step_completed", "import_assets"))
 
@@ -153,7 +153,7 @@ func runImportMemberships(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	printInfo(fmt.Sprintf("  Members: added=%d, skipped=%d, failed=%d", 
+	printInfo(fmt.Sprintf("  Members: added=%d, skipped=%d, failed=%d",
 		result.MembersAdded, result.MembersSkipped, result.MembersFailed))
 	printSuccess(i18n.T("messages.step_completed", "import_memberships"))
 	printSuccess(i18n.T("messages.migration_completed"))
@@ -208,20 +208,18 @@ func runImportMessages(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	printInfo(fmt.Sprintf("  Messages: imported=%d, skipped=%d, failed=%d", 
+	printInfo(fmt.Sprintf("  Messages: imported=%d, skipped=%d, failed=%d",
 		result.MessagesImported, result.MessagesSkipped, result.MessagesFailed))
-	printInfo(fmt.Sprintf("  Replies: imported=%d, failed=%d", 
+	printInfo(fmt.Sprintf("  Replies: imported=%d, failed=%d",
 		result.RepliesImported, result.RepliesFailed))
-	printInfo(fmt.Sprintf("  Files: linked=%d, uploaded=%d, skipped=%d",
-		result.FilesLinked, result.FilesUploaded, result.FilesSkipped))
-	
+	printInfo(fmt.Sprintf("  Files: linked=%d, uploaded=%d, skipped=%d, too_large=%d",
+		result.FilesLinked, result.FilesUploaded, result.FilesSkipped, result.FilesTooLarge))
+
 	if result.MappingFile != "" {
 		printSuccess(i18n.T("messages.mapping_saved", result.MappingFile))
 	}
-	
+
 	printSuccess(i18n.T("messages.step_completed", "import_messages"))
 
 	return nil
 }
-
-
