@@ -343,6 +343,10 @@ func (i *Importer) ImportChannelsAsRooms(channels []mattermost.Channel, existing
 	mapping := make(map[string]string)
 	stats := &ImportStats{}
 	total := len(channels)
+	lockedUserByID := make(map[string]bool, len(users))
+	for _, u := range users {
+		lockedUserByID[u.ID] = u.IsDeleted()
+	}
 
 	if opts != nil && opts.PreserveOwnerAndAlias && teamByID != nil {
 		logger.Info("ImportChannelsAsRooms: preserve_owner_and_alias enabled; rooms will get alias team+channel, owner from creator_id or first member (group) or fallback or admin")
@@ -383,6 +387,7 @@ func (i *Importer) ImportChannelsAsRooms(channels []mattermost.Channel, existing
 		}
 
 		var roomAlias, owner string
+		ownerFromLockedCreator := false
 		if opts != nil && opts.PreserveOwnerAndAlias && teamByID != nil {
 			if team, ok := teamByID[channel.TeamID]; ok {
 				roomAlias = sanitizeAliasLocalpart(team.Name + "-" + channel.Name)
@@ -401,6 +406,11 @@ func (i *Importer) ImportChannelsAsRooms(channels []mattermost.Channel, existing
 				}
 			} else {
 				owner = i.resolveRoomOwner(channel.CreatorID, userMapping, opts)
+				if channel.CreatorID != "" {
+					if mappedCreator, ok := userMapping[channel.CreatorID]; ok && mappedCreator != "" && mappedCreator == owner && lockedUserByID[channel.CreatorID] {
+						ownerFromLockedCreator = true
+					}
+				}
 				logger.Info("Room '%s' (channel %s): alias=%q owner=%s creator_id=%q", channel.DisplayName, channel.Name, roomAlias, owner, channel.CreatorID)
 			}
 		}
@@ -413,6 +423,22 @@ func (i *Importer) ImportChannelsAsRooms(channels []mattermost.Channel, existing
 		}
 
 		logger.Success("Created room '%s' -> %s", channel.DisplayName, resp.RoomID)
+		if ownerFromLockedCreator && opts != nil {
+			fallbackAdminID := opts.AdminUserID
+			if opts.FallbackCreator != "" {
+				fallbackAdminID = i.client.FormatUserID(opts.FallbackCreator)
+			}
+			if fallbackAdminID != "" && fallbackAdminID != owner {
+				logger.Info("Room '%s': creator %q is locked/deactivated; adding fallback admin %s with power level 100", channel.DisplayName, channel.CreatorID, fallbackAdminID)
+				if err := i.client.AddUserToRoom(resp.RoomID, fallbackAdminID); err != nil {
+					logger.Warn("Room '%s': could not add fallback admin %s to room %s: %v", channel.DisplayName, fallbackAdminID, resp.RoomID, err)
+				} else if err := i.client.SetPowerLevels(resp.RoomID, fallbackAdminID, 100); err != nil {
+					logger.Warn("Room '%s': could not set fallback admin %s power level 100 in room %s: %v", channel.DisplayName, fallbackAdminID, resp.RoomID, err)
+				} else {
+					logger.Info("Room '%s': added fallback admin %s with power level 100 (creator locked)", channel.DisplayName, fallbackAdminID)
+				}
+			}
+		}
 		mapping[channel.ID] = resp.RoomID
 		stats.RoomsCreated++
 	}
