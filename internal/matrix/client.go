@@ -998,8 +998,9 @@ func (c *Client) ensureAdminInSpaceWithPower(spaceID, ownerUserID string, powerL
 }
 
 // ensureAdminInRoomWithPower adds the admin to a room (created as owner via AS) with the given power level
-// so that the admin can link the room to a space. ownerUserID is the room creator; they invite the admin (via AS).
-func (c *Client) ensureAdminInRoomWithPower(roomID, ownerUserID string, powerLevel int) error {
+// so that the admin can link the room to a space. ownerUserID is the primary room owner used for PL updates.
+// inviteSenderCandidates are optional fallback inviters to try when ownerUserID cannot invite admin.
+func (c *Client) ensureAdminInRoomWithPower(roomID, ownerUserID string, powerLevel int, inviteSenderCandidates ...string) error {
 	logger.Debug("ensureAdminInRoomWithPower: room=%s owner=%s powerLevel=%d", roomID, ownerUserID, powerLevel)
 	me, err := c.WhoAmI()
 	if err != nil || me == nil {
@@ -1008,18 +1009,48 @@ func (c *Client) ensureAdminInRoomWithPower(roomID, ownerUserID string, powerLev
 	if c.asToken == "" || ownerUserID == "" {
 		return fmt.Errorf("AS token and ownerUserID required to add admin to room created as owner")
 	}
-	if ownerUserID != me.UserID {
-		if err := c.InviteUserAsUser(roomID, me.UserID, ownerUserID); err != nil {
-			return fmt.Errorf("invite admin to room: %w", err)
+	inviteSenders := make([]string, 0, 1+len(inviteSenderCandidates))
+	seenSenders := make(map[string]struct{}, 1+len(inviteSenderCandidates))
+	addSender := func(sender string) {
+		if sender == "" || sender == me.UserID {
+			return
 		}
-	} else {
-		logger.Debug("ensureAdminInRoomWithPower: owner is admin, skipping invite room=%s", roomID)
+		if _, exists := seenSenders[sender]; exists {
+			return
+		}
+		seenSenders[sender] = struct{}{}
+		inviteSenders = append(inviteSenders, sender)
+	}
+	addSender(ownerUserID)
+	for _, candidate := range inviteSenderCandidates {
+		addSender(candidate)
+	}
+	inviteAttempted := false
+	lastInviteSender := ""
+	var lastInviteErr error
+	for _, sender := range inviteSenders {
+		inviteAttempted = true
+		lastInviteSender = sender
+		logger.Debug("ensureAdminInRoomWithPower: invite admin room=%s inviter=%s", roomID, sender)
+		if err := c.InviteUserAsUser(roomID, me.UserID, sender); err == nil {
+			lastInviteErr = nil
+			break
+		} else {
+			lastInviteErr = err
+			logger.Debug("ensureAdminInRoomWithPower: invite failed room=%s inviter=%s err=%v", roomID, sender, err)
+		}
+	}
+	if !inviteAttempted {
+		logger.Debug("ensureAdminInRoomWithPower: no inviter candidates for room=%s owner=%s", roomID, ownerUserID)
 	}
 	if err := c.JoinRoom(roomID); err != nil {
 		// Private/invite-only room: direct join can fail if admin was previously cleaned up.
 		// Fall back to Synapse admin join so force-join membership import can proceed.
 		if joinErr := c.ForceJoinUser(roomID, me.UserID); joinErr != nil {
-			return fmt.Errorf("admin join room: %w", err)
+			return fmt.Errorf(
+				"admin join room failed room=%s owner=%s invite_attempted=%t inviter=%s invite_err=%v join_err=%w force_join_err=%v",
+				roomID, ownerUserID, inviteAttempted, lastInviteSender, lastInviteErr, err, joinErr,
+			)
 		}
 	}
 	c.joinedRoomsMu.Lock()

@@ -651,6 +651,7 @@ func (i *Importer) ApplyChannelMemberships(
 	ensuredRoomsForForceJoin := make(map[string]struct{})
 	recoveryAttemptedRooms := make(map[string]struct{})
 	unjoinableRooms := make(map[string]struct{})
+	unjoinableRoomSkipCounts := make(map[string]int)
 	adminUserID := ""
 	if i.client.ForceJoinEnabled() && i.client.HasASToken() {
 		if who, err := i.client.WhoAmI(); err == nil && who != nil && who.UserID != "" {
@@ -706,42 +707,42 @@ func (i *Importer) ApplyChannelMemberships(
 		// For non-D rooms with force_join: ensure admin is in room with PL100 once before force-join.
 		if i.client.ForceJoinEnabled() && i.client.HasASToken() && !channel.IsDirect() {
 			if _, blocked := unjoinableRooms[roomID]; blocked {
-				logger.Warn("Channel membership %d/%d skipped: room %s is marked unjoinable", idx+1, total, roomID)
+				unjoinableRoomSkipCounts[roomID]++
 				bump(skippedByType, channelType)
 				stats.MembersSkipped++
 				continue
 			}
 			if _, already := ensuredRoomsForForceJoin[roomID]; !already {
 				roomOwnerID := defaultRoomOwnerID
-				ownerFromCreator := false
+				creatorMappedUserID := ""
 				if channel.CreatorID != "" {
 					if mx, ok := userMapping[channel.CreatorID]; ok && mx != "" {
 						roomOwnerID = mx
-						ownerFromCreator = true
+						creatorMappedUserID = mx
 					}
 				}
 				if roomOwnerID == "" && adminUserID != "" {
 					roomOwnerID = adminUserID
 				}
 				if roomOwnerID != "" {
+					inviteCandidates := make([]string, 0, 3)
+					seenInviteCandidates := make(map[string]struct{}, 3)
+					addInviteCandidate := func(candidate string) {
+						if candidate == "" || candidate == roomOwnerID {
+							return
+						}
+						if _, exists := seenInviteCandidates[candidate]; exists {
+							return
+						}
+						seenInviteCandidates[candidate] = struct{}{}
+						inviteCandidates = append(inviteCandidates, candidate)
+					}
+					addInviteCandidate(creatorMappedUserID)
+					// If creator mapping is missing, current membership user is often already in room and can invite admin.
+					addInviteCandidate(userID)
+					addInviteCandidate(defaultRoomOwnerID)
 					logger.Debug("ApplyChannelMemberships: ensuring admin in room %s (owner %s) for membership %s -> room", roomID, roomOwnerID, userID)
-					roomEnsureErr := i.client.ensureAdminInRoomWithPower(roomID, roomOwnerID, 100)
-					if roomEnsureErr != nil && ownerFromCreator && adminUserID != "" && adminUserID != roomOwnerID {
-						logger.Debug("ApplyChannelMemberships: retry ensure admin in room %s with AS admin owner %s (primary owner %s failed)", roomID, adminUserID, roomOwnerID)
-						if retryErr := i.client.ensureAdminInRoomWithPower(roomID, adminUserID, 100); retryErr == nil {
-							roomEnsureErr = nil
-						} else {
-							roomEnsureErr = retryErr
-						}
-					}
-					if roomEnsureErr != nil && defaultRoomOwnerID != "" && defaultRoomOwnerID != roomOwnerID && defaultRoomOwnerID != adminUserID {
-						logger.Debug("ApplyChannelMemberships: retry ensure admin in room %s with fallback owner %s (primary owner %s failed)", roomID, defaultRoomOwnerID, roomOwnerID)
-						if retryErr := i.client.ensureAdminInRoomWithPower(roomID, defaultRoomOwnerID, 100); retryErr == nil {
-							roomEnsureErr = nil
-						} else {
-							roomEnsureErr = retryErr
-						}
-					}
+					roomEnsureErr := i.client.ensureAdminInRoomWithPower(roomID, roomOwnerID, 100, inviteCandidates...)
 					if roomEnsureErr != nil {
 						logger.Warn("ApplyChannelMemberships: could not ensure admin in room %s (owner %s): %v", roomID, roomOwnerID, roomEnsureErr)
 						// One-time best-effort recovery for unjoinable rooms:
@@ -764,6 +765,7 @@ func (i *Importer) ApplyChannelMemberships(
 						}
 						if roomEnsureErr != nil {
 							unjoinableRooms[roomID] = struct{}{}
+							unjoinableRoomSkipCounts[roomID] = 0
 							logger.Warn("ApplyChannelMemberships: room %s marked unjoinable; remaining memberships for this room will be skipped", roomID)
 							bump(skippedByType, channelType)
 							stats.MembersSkipped++
@@ -864,6 +866,18 @@ func (i *Importer) ApplyChannelMemberships(
 	logger.Info("Channel membership type summary: failed(O=%d,P=%d,G=%d,D=%d,?=%d) skipped(O=%d,P=%d,G=%d,D=%d,?=%d)",
 		failedByType["O"], failedByType["P"], failedByType["G"], failedByType["D"], failedByType["?"],
 		skippedByType["O"], skippedByType["P"], skippedByType["G"], skippedByType["D"], skippedByType["?"])
+	totalUnjoinableSkips := 0
+	for _, count := range unjoinableRoomSkipCounts {
+		totalUnjoinableSkips += count
+	}
+	if totalUnjoinableSkips > 0 {
+		logger.Info("Channel membership unjoinable summary: rooms=%d memberships_skipped=%d", len(unjoinableRoomSkipCounts), totalUnjoinableSkips)
+		for roomID, count := range unjoinableRoomSkipCounts {
+			if count > 0 {
+				logger.Info("Channel membership unjoinable room: room=%s skipped_memberships=%d", roomID, count)
+			}
+		}
+	}
 
 	return stats, nil
 }
