@@ -543,7 +543,7 @@ func (o *Orchestrator) ImportAssets(progress ProgressCallback) (*OperationResult
 		if existingMappings != nil {
 			existingRoomMapping = existingMappings.Rooms
 		}
-		dmMapping, dmStats, err := importer.ImportDirectChannelsAsDMs(assets.DirectChannels, importResult.UserMapping, existingRoomMapping, importProgress)
+		dmMapping, dmStats, err := importer.ImportDirectChannelsAsDMs(assets.DirectChannels, assets.Users, importResult.UserMapping, existingRoomMapping, importProgress)
 		if err != nil {
 			logger.Error("Import direct messages failed: %v", err)
 			o.state.FailStep(StepImportAssets, err)

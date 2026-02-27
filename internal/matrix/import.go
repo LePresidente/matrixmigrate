@@ -335,6 +335,60 @@ func resolveTokenToMatrixID(token string, users []mattermost.User, userMapping m
 	return ""
 }
 
+// resolveTokenToMattermostUser resolves a token (username/display/nickname) to a Mattermost user.
+func resolveTokenToMattermostUser(token string, users []mattermost.User) *mattermost.User {
+	tokenLower := strings.ToLower(token)
+	normalized := strings.ToLower(strings.ReplaceAll(token, " ", "_"))
+
+	for idx := range users {
+		u := &users[idx]
+		if u.Username == token || strings.ToLower(u.Username) == tokenLower || strings.ToLower(u.Username) == normalized {
+			return u
+		}
+		display := strings.TrimSpace(u.FirstName + " " + u.LastName)
+		if display != "" && (display == token || strings.EqualFold(display, token)) {
+			return u
+		}
+		if u.Nickname != "" && (u.Nickname == token || strings.EqualFold(u.Nickname, token)) {
+			return u
+		}
+	}
+	return nil
+}
+
+// groupParticipantsAllLocked returns true when all resolvable participants in display_name are deleted/locked.
+// If no participants can be resolved, it returns false to avoid accidental skips.
+func groupParticipantsAllLocked(displayName string, users []mattermost.User) bool {
+	parts := strings.Split(displayName, ",")
+	if len(parts) == 0 {
+		return false
+	}
+
+	seenUserIDs := make(map[string]struct{})
+	resolvedCount := 0
+
+	for _, part := range parts {
+		token := strings.TrimSpace(part)
+		if token == "" {
+			continue
+		}
+		u := resolveTokenToMattermostUser(token, users)
+		if u == nil {
+			continue
+		}
+		if _, seen := seenUserIDs[u.ID]; seen {
+			continue
+		}
+		seenUserIDs[u.ID] = struct{}{}
+		resolvedCount++
+		if !u.IsDeleted() {
+			return false
+		}
+	}
+
+	return resolvedCount > 0
+}
+
 // ImportChannelsAsRooms imports channels from Mattermost as Matrix rooms.
 // teamByID maps Mattermost team ID to Team (for alias and name); can be nil if opts.PreserveOwnerAndAlias is false.
 // users is used to build username->MatrixID map for group channel (type G) creator when creator_id is empty.
@@ -370,6 +424,13 @@ func (i *Importer) ImportChannelsAsRooms(channels []mattermost.Channel, existing
 
 		// Skip direct messages (2-person DMs)
 		if channel.IsDirect() {
+			stats.RoomsSkipped++
+			continue
+		}
+
+		// Skip group chats when all participants are deleted/locked in Mattermost.
+		if channel.IsGroup() && groupParticipantsAllLocked(channel.DisplayName, users) {
+			logger.Info("Room '%s' (group channel) skipped: all participants are locked/deleted", channel.DisplayName)
 			stats.RoomsSkipped++
 			continue
 		}
@@ -812,6 +873,7 @@ func (i *Importer) ApplyChannelMemberships(
 // When channel has no creator_id, name format is "senderID_receiverID" (first = sender, second = receiver); sender is used as room creator.
 func (i *Importer) ImportDirectChannelsAsDMs(
 	directChannels []mattermost.Channel,
+	users []mattermost.User,
 	userMapping map[string]string,
 	existingMapping map[string]string,
 	progress ImportProgressCallback,
@@ -826,6 +888,11 @@ func (i *Importer) ImportDirectChannelsAsDMs(
 
 	if !i.client.HasASToken() {
 		logger.Warn("ImportDirectChannelsAsDMs: Application Service token not set; DMs will be created but m.direct (People list) cannot be set for users")
+	}
+
+	lockedUserByID := make(map[string]bool, len(users))
+	for _, u := range users {
+		lockedUserByID[u.ID] = u.IsDeleted()
 	}
 
 	logger.Info("ImportDirectChannelsAsDMs: processing %d direct channels", total)
@@ -851,6 +918,11 @@ func (i *Importer) ImportDirectChannelsAsDMs(
 		senderID, receiverID, err := channel.DMParticipantIDs()
 		if err != nil {
 			logger.Warn("ImportDirectChannelsAsDMs: channel %s has insufficient/invalid participants (%v), skipping", channel.ID, err)
+			stats.RoomsSkipped++
+			continue
+		}
+		if lockedUserByID[senderID] && lockedUserByID[receiverID] {
+			logger.Info("ImportDirectChannelsAsDMs: channel %s skipped because both participants are locked/deleted (%s, %s)", channel.ID, senderID, receiverID)
 			stats.RoomsSkipped++
 			continue
 		}
