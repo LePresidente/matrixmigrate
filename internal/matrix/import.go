@@ -1460,10 +1460,6 @@ func (i *Importer) ImportMessages(
 			progress(idx+1, total, post.ChannelID, "imported")
 		}
 
-		// Log progress every 100 messages
-		if (idx+1)%100 == 0 {
-			logger.Info("Message import progress: %d/%d (%.1f%%)", idx+1, total, float64(idx+1)/float64(total)*100)
-		}
 	}
 
 	logger.Info("Message import completed: imported=%d, skipped=%d, failed=%d, replies=%d",
@@ -1626,14 +1622,6 @@ func (i *Importer) ImportMessagesWithFiles(
 			}
 		}
 
-		// Log progress every 100 messages
-		if (idx+1)%100 == 0 {
-			logger.Info(
-				"Message import progress: %d/%d (%.1f%%) - mode=%s files(uploaded=%d linked=%d skipped=%d too_large=%d)",
-				idx+1, total, float64(idx+1)/float64(total)*100, fileConfig.Mode,
-				result.Stats.FilesUploaded, result.Stats.FilesLinked, result.Stats.FilesSkipped, result.Stats.FilesTooLarge,
-			)
-		}
 	}
 
 	logger.Info("Message import completed: imported=%d, skipped=%d, failed=%d, replies=%d, files_linked=%d",

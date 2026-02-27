@@ -2,12 +2,24 @@ package cli
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/spf13/cobra"
 
 	"github.com/aligundogdu/matrixmigrate/internal/i18n"
 	"github.com/aligundogdu/matrixmigrate/internal/migration"
 )
+
+func formatETA(d time.Duration) string {
+	if d < 0 {
+		d = 0
+	}
+	totalSeconds := int(d.Seconds())
+	hours := totalSeconds / 3600
+	minutes := (totalSeconds % 3600) / 60
+	seconds := totalSeconds % 60
+	return fmt.Sprintf("%02d:%02d:%02d", hours, minutes, seconds)
+}
 
 var importCmd = &cobra.Command{
 	Use:   "import [assets|memberships|messages]",
@@ -198,9 +210,33 @@ func runImportMessages(cmd *cobra.Command, args []string) error {
 
 	// Import messages
 	printInfo("Importing messages...")
+	startedAt := time.Now()
+	lastProgressPrint := time.Time{}
+	const progressPrintInterval = 10 * time.Second
 	progress := func(current, total int, channelName, status string) {
+		if total <= 0 {
+			return
+		}
+		now := time.Now()
+		if current < total && !lastProgressPrint.IsZero() && now.Sub(lastProgressPrint) < progressPrintInterval {
+			return
+		}
+
 		percent := float64(current) / float64(total) * 100
-		printProgress("Messages: %d/%d (%.1f%%) - %s", current, total, percent, status)
+		elapsed := now.Sub(startedAt)
+		ratePerSec := float64(current) / elapsed.Seconds()
+		remaining := total - current
+		etaText := "calculating..."
+		if ratePerSec > 0 && remaining > 0 {
+			etaSeconds := float64(remaining) / ratePerSec
+			etaText = formatETA(time.Duration(etaSeconds * float64(time.Second)))
+		} else if remaining <= 0 {
+			etaText = "00:00:00"
+		}
+
+		printInfo("Messages: %d/%d (%.1f%%) | rate: %.1f msg/s | ETA: %s | %s",
+			current, total, percent, ratePerSec, etaText, status)
+		lastProgressPrint = now
 	}
 
 	result, err := orch.ImportMessages(progress)
