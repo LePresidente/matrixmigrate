@@ -917,13 +917,13 @@ func (i *Importer) ImportDirectChannelsAsDMs(
 		}
 
 		if channel.IsDeleted() {
-			logger.Info("DM channel %s deleted, skipping", channel.ID)
+			logger.Debug("DM channel %s deleted, skipping", channel.ID)
 			stats.RoomsSkipped++
 			continue
 		}
 
 		if _, exists := existingMapping[channel.ID]; exists {
-			logger.Info("DM channel %s already imported, skipping", channel.ID)
+			logger.Debug("DM channel %s already imported, skipping", channel.ID)
 			stats.RoomsSkipped++
 			continue
 		}
@@ -931,12 +931,12 @@ func (i *Importer) ImportDirectChannelsAsDMs(
 		// Resolve the two Matrix user IDs for this DM
 		senderID, receiverID, err := channel.DMParticipantIDs()
 		if err != nil {
-			logger.Warn("ImportDirectChannelsAsDMs: channel %s has insufficient/invalid participants (%v), skipping", channel.ID, err)
+			logger.Debug("ImportDirectChannelsAsDMs: channel %s has insufficient/invalid participants (%v), skipping", channel.ID, err)
 			stats.RoomsSkipped++
 			continue
 		}
 		if lockedUserByID[senderID] && lockedUserByID[receiverID] {
-			logger.Info("ImportDirectChannelsAsDMs: channel %s skipped because both participants are locked/deleted (%s, %s)", channel.ID, senderID, receiverID)
+			logger.Debug("ImportDirectChannelsAsDMs: channel %s skipped because both participants are locked/deleted (%s, %s)", channel.ID, senderID, receiverID)
 			stats.RoomsSkipped++
 			continue
 		}
@@ -944,10 +944,10 @@ func (i *Importer) ImportDirectChannelsAsDMs(
 		otherMX, ok2 := userMapping[receiverID]
 		if !ok1 || !ok2 {
 			if !ok1 {
-				logger.Warn("ImportDirectChannelsAsDMs: channel %s sender %s not in user mapping, skipping", channel.ID, senderID)
+				logger.Debug("ImportDirectChannelsAsDMs: channel %s sender %s not in user mapping, skipping", channel.ID, senderID)
 			}
 			if !ok2 {
-				logger.Warn("ImportDirectChannelsAsDMs: channel %s receiver %s not in user mapping, skipping", channel.ID, receiverID)
+				logger.Debug("ImportDirectChannelsAsDMs: channel %s receiver %s not in user mapping, skipping", channel.ID, receiverID)
 			}
 			stats.RoomsSkipped++
 			continue
@@ -965,12 +965,12 @@ func (i *Importer) ImportDirectChannelsAsDMs(
 		}
 
 		if creatorMX == "" || otherMX == "" {
-			logger.Warn("ImportDirectChannelsAsDMs: channel %s could not resolve both users (creator=%q other=%q), skipping", channel.ID, creatorMX, otherMX)
+			logger.Debug("ImportDirectChannelsAsDMs: channel %s could not resolve both users (creator=%q other=%q), skipping", channel.ID, creatorMX, otherMX)
 			stats.RoomsSkipped++
 			continue
 		}
 		if creatorMX == otherMX {
-			logger.Warn("ImportDirectChannelsAsDMs: channel %s same user for both sides, skipping", channel.ID)
+			logger.Debug("ImportDirectChannelsAsDMs: channel %s same user for both sides, skipping", channel.ID)
 			stats.RoomsSkipped++
 			continue
 		}
