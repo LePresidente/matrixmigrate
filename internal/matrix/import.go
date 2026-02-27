@@ -1235,12 +1235,15 @@ func (i *Importer) importPostFiles(
 ) (int, int64) {
 	tooLargeCount := 0
 	var maxTooLargeSize int64
+	logger.Debug("importPostFiles: room=%s sender=%s files=%d mode=%s", roomID, senderID, len(files), fileConfig.Mode)
 	for _, file := range files {
 		if file.IsDeleted() {
+			logger.Debug("importPostFiles: skipping deleted file id=%s name=%s post=%s", file.ID, file.Name, file.PostID)
 			result.Stats.FilesSkipped++
 			continue
 		}
 		if file.Size > fileConfig.MaxUploadSize {
+			logger.Debug("importPostFiles: file too large id=%s name=%s size=%d max=%d", file.ID, file.Name, file.Size, fileConfig.MaxUploadSize)
 			result.Stats.FilesTooLarge++
 			tooLargeCount++
 			if file.Size > maxTooLargeSize {
@@ -1255,6 +1258,7 @@ func (i *Importer) importPostFiles(
 			continue
 		}
 		if fileConfig.LocalDataPath == "" {
+			logger.Debug("importPostFiles: local_data_path empty for file id=%s name=%s", file.ID, file.Name)
 			if fileConfig.UploadFallbackToLink {
 				i.sendLinkOrSkip(result, roomID, file, fileConfig, timestamp, senderID, "mattermost.files.local_data_path is empty")
 			} else {
@@ -1264,12 +1268,15 @@ func (i *Importer) importPostFiles(
 			continue
 		}
 		localPath := resolveLocalMattermostPath(fileConfig.LocalDataPath, file.Path)
+		logger.Debug("importPostFiles: reading local file id=%s name=%s path=%s", file.ID, file.Name, localPath)
 		data, err := os.ReadFile(localPath)
 		if err != nil && fileConfig.RemoteReadFile != nil {
 			remotePath := resolveRemoteMattermostPath(fileConfig.LocalDataPath, file.Path)
+			logger.Debug("importPostFiles: local read failed, trying remote read id=%s name=%s path=%s err=%v", file.ID, file.Name, remotePath, err)
 			data, err = fileConfig.RemoteReadFile(remotePath)
 		}
 		if err != nil {
+			logger.Debug("importPostFiles: read failed id=%s name=%s err=%v", file.ID, file.Name, err)
 			if fileConfig.UploadFallbackToLink {
 				i.sendLinkOrSkip(result, roomID, file, fileConfig, timestamp, senderID, fmt.Sprintf("cannot read attachment bytes from %s: %v", file.Path, err))
 			} else {
@@ -1282,8 +1289,10 @@ func (i *Importer) importPostFiles(
 		if mimeType == "" {
 			mimeType = "application/octet-stream"
 		}
+		logger.Debug("importPostFiles: uploading file id=%s name=%s size=%d mime=%s", file.ID, file.Name, file.Size, mimeType)
 		uploadResp, err := i.client.UploadMedia(data, file.Name, mimeType)
 		if err != nil {
+			logger.Debug("importPostFiles: upload failed id=%s name=%s err=%v", file.ID, file.Name, err)
 			if fileConfig.UploadFallbackToLink {
 				i.sendLinkOrSkip(result, roomID, file, fileConfig, timestamp, senderID, fmt.Sprintf("upload failed: %v", err))
 			} else {
@@ -1292,7 +1301,9 @@ func (i *Importer) importPostFiles(
 			}
 			continue
 		}
+		logger.Debug("importPostFiles: upload success id=%s name=%s mxc=%s", file.ID, file.Name, uploadResp.ContentURI)
 		if _, err := i.client.SendUploadedFile(roomID, uploadResp.ContentURI, file.Name, mimeType, file.Size, file.Width, file.Height, timestamp, senderID); err != nil {
+			logger.Debug("importPostFiles: send uploaded file failed id=%s name=%s err=%v", file.ID, file.Name, err)
 			if fileConfig.UploadFallbackToLink {
 				i.sendLinkOrSkip(result, roomID, file, fileConfig, timestamp, senderID, fmt.Sprintf("send uploaded file failed: %v", err))
 			} else {
@@ -1301,6 +1312,7 @@ func (i *Importer) importPostFiles(
 			}
 			continue
 		}
+		logger.Debug("importPostFiles: sent uploaded file event id=%s name=%s room=%s", file.ID, file.Name, roomID)
 		result.Stats.FilesUploaded++
 	}
 	return tooLargeCount, maxTooLargeSize
@@ -1478,6 +1490,15 @@ func (i *Importer) ImportMessagesWithFiles(
 	if fileConfig.MaxUploadSize <= 0 {
 		fileConfig.MaxUploadSize = 50 * 1024 * 1024
 	}
+	logger.Info(
+		"Message file handling config: mode=%s fallback_to_link=%v local_data_path_set=%v remote_reader_set=%v s3_url_set=%v max_upload_size_bytes=%d",
+		fileConfig.Mode,
+		fileConfig.UploadFallbackToLink,
+		fileConfig.LocalDataPath != "",
+		fileConfig.RemoteReadFile != nil,
+		fileConfig.S3PublicURL != "",
+		fileConfig.MaxUploadSize,
+	)
 
 	// Collect all existing mappings
 	for k, v := range existingMapping {
@@ -1593,8 +1614,11 @@ func (i *Importer) ImportMessagesWithFiles(
 
 		// Log progress every 100 messages
 		if (idx+1)%100 == 0 {
-			logger.Info("Message import progress: %d/%d (%.1f%%) - files linked: %d",
-				idx+1, total, float64(idx+1)/float64(total)*100, result.Stats.FilesLinked)
+			logger.Info(
+				"Message import progress: %d/%d (%.1f%%) - mode=%s files(uploaded=%d linked=%d skipped=%d too_large=%d)",
+				idx+1, total, float64(idx+1)/float64(total)*100, fileConfig.Mode,
+				result.Stats.FilesUploaded, result.Stats.FilesLinked, result.Stats.FilesSkipped, result.Stats.FilesTooLarge,
+			)
 		}
 	}
 
