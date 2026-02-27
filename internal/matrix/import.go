@@ -491,7 +491,10 @@ func (i *Importer) ImportChannelsAsRooms(channels []mattermost.Channel, existing
 			}
 			if fallbackAdminID != "" && fallbackAdminID != owner {
 				logger.Info("Room '%s': creator %q is locked/deactivated; adding fallback admin %s with power level 100", channel.DisplayName, channel.CreatorID, fallbackAdminID)
-				if err := i.client.AddUserToRoom(resp.RoomID, fallbackAdminID); err != nil {
+				// Ensure migration admin has PL 100 first; otherwise SetPowerLevels can fail with user_level (0) < send_level (100).
+				if err := i.client.ensureAdminInRoomWithPower(resp.RoomID, owner, 100, fallbackAdminID); err != nil {
+					logger.Warn("Room '%s': could not ensure admin has power level 100 before promoting fallback admin %s in room %s: %v", channel.DisplayName, fallbackAdminID, resp.RoomID, err)
+				} else if err := i.client.AddUserToRoom(resp.RoomID, fallbackAdminID); err != nil {
 					logger.Warn("Room '%s': could not add fallback admin %s to room %s: %v", channel.DisplayName, fallbackAdminID, resp.RoomID, err)
 				} else if err := i.client.SetPowerLevels(resp.RoomID, fallbackAdminID, 100); err != nil {
 					logger.Warn("Room '%s': could not set fallback admin %s power level 100 in room %s: %v", channel.DisplayName, fallbackAdminID, resp.RoomID, err)

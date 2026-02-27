@@ -718,64 +718,59 @@ func (c *Client) ensureRoomOwner(roomID, ownerUserID string) error {
 }
 
 // SetPowerLevels sets a user's power level in a room (e.g. 100 for owner).
-// The current user and the target user are both set to the given level so the target becomes an owner.
+// Updates are merged with existing m.room.power_levels content to avoid dropping
+// other operators/users from the state event.
 func (c *Client) SetPowerLevels(roomID, userID string, level int) error {
 	me, err := c.WhoAmI()
 	if err != nil || me == nil {
 		return fmt.Errorf("whoami: %w", err)
 	}
-	content := &PowerLevelsContent{
-		Users:         map[string]int{me.UserID: 100, userID: level},
-		UsersDefault:  0,
-		EventsDefault: 0,
-		StateDefault:  50,
-		Ban:           50,
-		Kick:          50,
-		Redact:        50,
-	}
-	endpoint := fmt.Sprintf("/_matrix/client/v3/rooms/%s/state/m.room.power_levels/", url.PathEscape(roomID))
-	body, statusCode, err := c.doRequest("PUT", endpoint, content)
+
+	content, err := c.getPowerLevels(roomID)
 	if err != nil {
-		return err
+		return fmt.Errorf("get power levels: %w", err)
 	}
-	if statusCode != http.StatusOK {
-		var resp GenericResponse
-		json.Unmarshal(body, &resp)
-		return fmt.Errorf("API error (%d): %s - %s", statusCode, resp.Errcode, resp.Error)
+	if content.Users == nil {
+		content.Users = make(map[string]int)
+	}
+	// Keep admin at PL 100 for state updates where possible, while preserving all existing entries.
+	if current, ok := content.Users[me.UserID]; !ok || current < 100 {
+		content.Users[me.UserID] = 100
+	}
+	content.Users[userID] = level
+
+	if err := c.setPowerLevelsWithToken(roomID, content, c.adminToken); err != nil {
+		return err
 	}
 	logger.Info("SetPowerLevels: set %s to level %d in room %s", userID, level, roomID)
 	return nil
 }
 
 // SetPowerLevelsBulk sets power levels for multiple users in a room (e.g. all to the same level for equal membership).
-// The current user (admin) is kept at 100 so the state event can be sent. userLevels maps userID -> level.
+// Updates are merged with existing m.room.power_levels content so existing operators are preserved.
 func (c *Client) SetPowerLevelsBulk(roomID string, userLevels map[string]int) error {
 	me, err := c.WhoAmI()
 	if err != nil || me == nil {
 		return fmt.Errorf("whoami: %w", err)
 	}
-	content := &PowerLevelsContent{
-		Users:         make(map[string]int),
-		UsersDefault:  0,
-		EventsDefault: 0,
-		StateDefault:  50,
-		Ban:           50,
-		Kick:          50,
-		Redact:        50,
+
+	content, err := c.getPowerLevels(roomID)
+	if err != nil {
+		return fmt.Errorf("get power levels: %w", err)
 	}
-	content.Users[me.UserID] = 100
+	if content.Users == nil {
+		content.Users = make(map[string]int)
+	}
+
+	if current, ok := content.Users[me.UserID]; !ok || current < 100 {
+		content.Users[me.UserID] = 100
+	}
 	for u, level := range userLevels {
 		content.Users[u] = level
 	}
-	endpoint := fmt.Sprintf("/_matrix/client/v3/rooms/%s/state/m.room.power_levels/", url.PathEscape(roomID))
-	body, statusCode, err := c.doRequest("PUT", endpoint, content)
-	if err != nil {
+
+	if err := c.setPowerLevelsWithToken(roomID, content, c.adminToken); err != nil {
 		return err
-	}
-	if statusCode != http.StatusOK {
-		var resp GenericResponse
-		json.Unmarshal(body, &resp)
-		return fmt.Errorf("API error (%d): %s - %s", statusCode, resp.Errcode, resp.Error)
 	}
 	logger.Info("SetPowerLevelsBulk: set %d users in room %s", len(userLevels), roomID)
 	return nil
