@@ -1223,6 +1223,7 @@ func (i *Importer) sendLinkOrSkip(
 	fileConfig *FileConfig,
 	timestamp int64,
 	senderID string,
+	replyToEventID string,
 	reason string,
 ) {
 	if fileConfig.S3PublicURL == "" {
@@ -1231,7 +1232,13 @@ func (i *Importer) sendLinkOrSkip(
 		return
 	}
 	fileURL := buildPublicFileURL(fileConfig.S3PublicURL, file.Path)
-	if _, err := i.client.SendFileLink(roomID, file.Name, fileURL, file.MimeType, file.Size, timestamp, senderID); err != nil {
+	var err error
+	if replyToEventID != "" {
+		_, err = i.client.SendFileLinkAsReply(roomID, file.Name, fileURL, file.MimeType, file.Size, replyToEventID, timestamp, senderID)
+	} else {
+		_, err = i.client.SendFileLink(roomID, file.Name, fileURL, file.MimeType, file.Size, timestamp, senderID)
+	}
+	if err != nil {
 		result.Stats.FilesSkipped++
 		result.Errors = append(result.Errors, fmt.Sprintf("Failed to send file link for %s (post %s): %v", file.Name, file.PostID, err))
 		return
@@ -1246,6 +1253,7 @@ func (i *Importer) importPostFiles(
 	fileConfig *FileConfig,
 	timestamp int64,
 	senderID string,
+	replyToEventID string,
 ) (int, int64) {
 	tooLargeCount := 0
 	var maxTooLargeSize int64
@@ -1264,7 +1272,7 @@ func (i *Importer) importPostFiles(
 				maxTooLargeSize = file.Size
 			}
 			if fileConfig.UploadFallbackToLink {
-				i.sendLinkOrSkip(result, roomID, file, fileConfig, timestamp, senderID, "file exceeds max_upload_size_mb")
+				i.sendLinkOrSkip(result, roomID, file, fileConfig, timestamp, senderID, replyToEventID, "file exceeds max_upload_size_mb")
 			} else {
 				result.Stats.FilesSkipped++
 				result.Errors = append(result.Errors, fmt.Sprintf("Skipped file %s for post %s: file size %d exceeds max_upload_size_mb (%d bytes)", file.Name, file.PostID, file.Size, fileConfig.MaxUploadSize))
@@ -1274,7 +1282,7 @@ func (i *Importer) importPostFiles(
 		if fileConfig.LocalDataPath == "" {
 			logger.Debug("importPostFiles: local_data_path empty for file id=%s name=%s", file.ID, file.Name)
 			if fileConfig.UploadFallbackToLink {
-				i.sendLinkOrSkip(result, roomID, file, fileConfig, timestamp, senderID, "mattermost.files.local_data_path is empty")
+				i.sendLinkOrSkip(result, roomID, file, fileConfig, timestamp, senderID, replyToEventID, "mattermost.files.local_data_path is empty")
 			} else {
 				result.Stats.FilesSkipped++
 				result.Errors = append(result.Errors, fmt.Sprintf("Skipped file %s for post %s: mattermost.files.local_data_path is empty", file.Name, file.PostID))
@@ -1292,7 +1300,7 @@ func (i *Importer) importPostFiles(
 		if err != nil {
 			logger.Debug("importPostFiles: read failed id=%s name=%s err=%v", file.ID, file.Name, err)
 			if fileConfig.UploadFallbackToLink {
-				i.sendLinkOrSkip(result, roomID, file, fileConfig, timestamp, senderID, fmt.Sprintf("cannot read attachment bytes from %s: %v", file.Path, err))
+				i.sendLinkOrSkip(result, roomID, file, fileConfig, timestamp, senderID, replyToEventID, fmt.Sprintf("cannot read attachment bytes from %s: %v", file.Path, err))
 			} else {
 				result.Stats.FilesSkipped++
 				result.Errors = append(result.Errors, fmt.Sprintf("Skipped file %s for post %s: cannot read attachment bytes from %s: %v", file.Name, file.PostID, file.Path, err))
@@ -1308,7 +1316,7 @@ func (i *Importer) importPostFiles(
 		if err != nil {
 			logger.Debug("importPostFiles: upload failed id=%s name=%s err=%v", file.ID, file.Name, err)
 			if fileConfig.UploadFallbackToLink {
-				i.sendLinkOrSkip(result, roomID, file, fileConfig, timestamp, senderID, fmt.Sprintf("upload failed: %v", err))
+				i.sendLinkOrSkip(result, roomID, file, fileConfig, timestamp, senderID, replyToEventID, fmt.Sprintf("upload failed: %v", err))
 			} else {
 				result.Stats.FilesSkipped++
 				result.Errors = append(result.Errors, fmt.Sprintf("Skipped file %s for post %s: upload failed: %v", file.Name, file.PostID, err))
@@ -1316,10 +1324,15 @@ func (i *Importer) importPostFiles(
 			continue
 		}
 		logger.Debug("importPostFiles: upload success id=%s name=%s mxc=%s", file.ID, file.Name, uploadResp.ContentURI)
-		if _, err := i.client.SendUploadedFile(roomID, uploadResp.ContentURI, file.Name, mimeType, file.Size, file.Width, file.Height, timestamp, senderID); err != nil {
+		if replyToEventID != "" {
+			_, err = i.client.SendUploadedFileAsReply(roomID, uploadResp.ContentURI, file.Name, mimeType, file.Size, file.Width, file.Height, replyToEventID, timestamp, senderID)
+		} else {
+			_, err = i.client.SendUploadedFile(roomID, uploadResp.ContentURI, file.Name, mimeType, file.Size, file.Width, file.Height, timestamp, senderID)
+		}
+		if err != nil {
 			logger.Debug("importPostFiles: send uploaded file failed id=%s name=%s err=%v", file.ID, file.Name, err)
 			if fileConfig.UploadFallbackToLink {
-				i.sendLinkOrSkip(result, roomID, file, fileConfig, timestamp, senderID, fmt.Sprintf("send uploaded file failed: %v", err))
+				i.sendLinkOrSkip(result, roomID, file, fileConfig, timestamp, senderID, replyToEventID, fmt.Sprintf("send uploaded file failed: %v", err))
 			} else {
 				result.Stats.FilesSkipped++
 				result.Errors = append(result.Errors, fmt.Sprintf("Skipped file %s for post %s: send uploaded file failed: %v", file.Name, file.PostID, err))
@@ -1561,6 +1574,7 @@ func (i *Importer) ImportMessagesWithFiles(
 
 		// Handle reply
 		var eventID string
+		attachmentReplyToEventID := ""
 
 		if post.IsReply() {
 			parentEventID, parentExists := result.Mapping[post.RootID]
@@ -1590,6 +1604,7 @@ func (i *Importer) ImportMessagesWithFiles(
 				}
 				eventID = resp.EventID
 				result.Stats.RepliesImported++
+				attachmentReplyToEventID = parentEventID
 			}
 		} else {
 			resp, sendErr := i.client.SendMessageWithTimestamp(roomID, messageContent, post.CreateAt, senderID)
@@ -1615,7 +1630,7 @@ func (i *Importer) ImportMessagesWithFiles(
 		// Upload or link files after the message event is imported.
 		// Matrix file attachments are sent as separate m.room.message events.
 		if fileConfig.Mode == "upload" && len(files) > 0 {
-			tooLargeCount, maxTooLargeSize := i.importPostFiles(result, roomID, files, fileConfig, post.CreateAt, senderID)
+			tooLargeCount, maxTooLargeSize := i.importPostFiles(result, roomID, files, fileConfig, post.CreateAt, senderID, attachmentReplyToEventID)
 			totalTooLarge += tooLargeCount
 			if maxTooLargeSize > largestTooLargeSize {
 				largestTooLargeSize = maxTooLargeSize

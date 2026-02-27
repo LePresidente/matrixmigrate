@@ -1705,6 +1705,21 @@ func (c *Client) SendFileLink(roomID, filename, fileURL, mimeType string, fileSi
 	return c.SendMessageWithTimestamp(roomID, message, timestamp, senderUserID)
 }
 
+// SendFileLinkAsReply sends a file link as a reply message (external URL).
+func (c *Client) SendFileLinkAsReply(roomID, filename, fileURL, mimeType string, fileSize int64, replyToEventID string, timestamp int64, senderUserID string) (*SendMessageResponse, error) {
+	emoji := "📎"
+	if strings.HasPrefix(mimeType, "image/") {
+		emoji = "🖼️"
+	} else if strings.HasPrefix(mimeType, "video/") {
+		emoji = "🎬"
+	} else if strings.HasPrefix(mimeType, "audio/") {
+		emoji = "🎵"
+	}
+
+	message := fmt.Sprintf("%s [%s](%s)", emoji, filename, fileURL)
+	return c.SendReplyWithTimestamp(roomID, message, replyToEventID, timestamp, senderUserID)
+}
+
 // SendUploadedFile sends a file that was already uploaded to Matrix
 func (c *Client) SendUploadedFile(roomID, mxcURI, filename, mimeType string, fileSize int64, width, height int, timestamp int64, senderUserID string) (*SendMessageResponse, error) {
 	msgType := "m.file"
@@ -1733,4 +1748,70 @@ func (c *Client) SendUploadedFile(roomID, mxcURI, filename, mimeType string, fil
 	}
 
 	return c.SendFileMessage(roomID, content, timestamp, senderUserID)
+}
+
+// SendUploadedFileAsReply sends an already-uploaded file event as a reply.
+func (c *Client) SendUploadedFileAsReply(roomID, mxcURI, filename, mimeType string, fileSize int64, width, height int, replyToEventID string, timestamp int64, senderUserID string) (*SendMessageResponse, error) {
+	msgType := "m.file"
+	if strings.HasPrefix(mimeType, "image/") {
+		msgType = "m.image"
+	} else if strings.HasPrefix(mimeType, "video/") {
+		msgType = "m.video"
+	} else if strings.HasPrefix(mimeType, "audio/") {
+		msgType = "m.audio"
+	}
+
+	content := map[string]interface{}{
+		"msgtype":  msgType,
+		"body":     filename,
+		"url":      mxcURI,
+		"filename": filename,
+		"info": map[string]interface{}{
+			"mimetype": mimeType,
+			"size":     fileSize,
+		},
+		"m.relates_to": map[string]interface{}{
+			"m.in_reply_to": map[string]string{
+				"event_id": replyToEventID,
+			},
+		},
+	}
+	if width > 0 && height > 0 {
+		info := content["info"].(map[string]interface{})
+		info["w"] = width
+		info["h"] = height
+	}
+
+	txnID := c.getNextTxnID()
+	endpoint := fmt.Sprintf("/_matrix/client/v3/rooms/%s/send/m.room.message/%s",
+		url.PathEscape(roomID), url.PathEscape(txnID))
+	params := url.Values{}
+	if timestamp > 0 && c.asToken != "" {
+		params.Set("ts", strconv.FormatInt(timestamp, 10))
+	}
+	if senderUserID != "" && c.asToken != "" {
+		params.Set("user_id", senderUserID)
+	}
+	if len(params) > 0 {
+		endpoint += "?" + params.Encode()
+	}
+
+	token := c.adminToken
+	if c.asToken != "" {
+		token = c.asToken
+	}
+
+	body, statusCode, err := c.doRequestWithToken("PUT", endpoint, content, token)
+	if err != nil {
+		return nil, err
+	}
+
+	var resp SendMessageResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("failed to parse response: %w", err)
+	}
+	if statusCode != http.StatusOK {
+		return nil, fmt.Errorf("API error (%d): %s - %s", statusCode, resp.Errcode, resp.Error)
+	}
+	return &resp, nil
 }
