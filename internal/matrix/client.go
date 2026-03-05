@@ -1042,9 +1042,19 @@ func (c *Client) ensureAdminInRoomWithPower(roomID, ownerUserID string, powerLev
 		// Private/invite-only room: direct join can fail if admin was previously cleaned up.
 		// Fall back to Synapse admin join so force-join membership import can proceed.
 		if joinErr := c.ForceJoinUser(roomID, me.UserID); joinErr != nil {
+			inviterForLog := lastInviteSender
+			if inviterForLog == "" {
+				inviterForLog = "<none>"
+			}
+			inviteErrForLog := "<nil>"
+			if !inviteAttempted {
+				inviteErrForLog = "<not attempted>"
+			} else if lastInviteErr != nil {
+				inviteErrForLog = lastInviteErr.Error()
+			}
 			return fmt.Errorf(
-				"admin join room failed room=%s owner=%s invite_attempted=%t inviter=%s invite_err=%v join_err=%w force_join_err=%v",
-				roomID, ownerUserID, inviteAttempted, lastInviteSender, lastInviteErr, err, joinErr,
+				"admin join room failed room=%s owner=%s invite_attempted=%t inviter=%s invite_err=%s join_err=%w force_join_err=%v",
+				roomID, ownerUserID, inviteAttempted, inviterForLog, inviteErrForLog, err, joinErr,
 			)
 		}
 	}
@@ -1067,11 +1077,51 @@ func (c *Client) ensureAdminInRoomWithPower(roomID, ownerUserID string, powerLev
 		pl.Users = make(map[string]int)
 	}
 	pl.Users[me.UserID] = powerLevel
-	if err := c.setPowerLevelsAsUser(roomID, pl, ownerUserID); err != nil {
-		return fmt.Errorf("set admin power level in room: %w", err)
+	attemptedSetters := make([]string, 0, len(inviteSenders))
+	var lastSetErr error
+	for _, setter := range inviteSenders {
+		attemptedSetters = append(attemptedSetters, setter)
+		if err := c.setPowerLevelsAsUser(roomID, pl, setter); err != nil {
+			lastSetErr = err
+			logger.Debug("ensureAdminInRoomWithPower: set PL failed room=%s asUser=%s err=%v", roomID, setter, err)
+			continue
+		}
+		logger.Debug("ensureAdminInRoomWithPower: set PL success room=%s asUser=%s", roomID, setter)
+		logger.Debug("ensureAdminInRoomWithPower: success room=%s", roomID)
+		return nil
 	}
-	logger.Debug("ensureAdminInRoomWithPower: success room=%s", roomID)
-	return nil
+	if lastSetErr == nil {
+		lastSetErr = fmt.Errorf("no eligible sender available to set power levels")
+	}
+	return &adminPowerEscalationError{
+		roomID:           roomID,
+		requiredLevel:    powerLevel,
+		attemptedSetters: attemptedSetters,
+		cause:            lastSetErr,
+	}
+}
+
+type adminPowerEscalationError struct {
+	roomID           string
+	requiredLevel    int
+	attemptedSetters []string
+	cause            error
+}
+
+func (e *adminPowerEscalationError) Error() string {
+	return fmt.Sprintf(
+		"set admin power level in room: room=%s required_level=%d attempted_setters=%v err=%v",
+		e.roomID, e.requiredLevel, e.attemptedSetters, e.cause,
+	)
+}
+
+func (e *adminPowerEscalationError) Unwrap() error {
+	return e.cause
+}
+
+func isAdminPowerEscalationError(err error) bool {
+	var target *adminPowerEscalationError
+	return errors.As(err, &target)
 }
 
 // setPowerLevelsAsUser sets power levels in a room as ownerUserID (requires AS token).

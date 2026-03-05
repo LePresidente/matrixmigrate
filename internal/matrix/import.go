@@ -645,6 +645,28 @@ func (i *Importer) ApplyChannelMemberships(
 			directChannelIDs[ch.ID] = true
 		}
 	}
+	// Per channel, keep mapped Matrix users seen in membership data as extra inviter/recovery candidates.
+	// This helps when creator/fallback owner cannot invite admin but another known member can.
+	channelInviteFallbacks := make(map[string][]string)
+	if i.client.ForceJoinEnabled() && i.client.HasASToken() {
+		seenByChannel := make(map[string]map[string]struct{})
+		for _, membership := range memberships {
+			mappedUserID, ok := userMapping[membership.UserID]
+			if !ok || mappedUserID == "" {
+				continue
+			}
+			seen, ok := seenByChannel[membership.ChannelID]
+			if !ok {
+				seen = make(map[string]struct{})
+				seenByChannel[membership.ChannelID] = seen
+			}
+			if _, exists := seen[mappedUserID]; exists {
+				continue
+			}
+			seen[mappedUserID] = struct{}{}
+			channelInviteFallbacks[membership.ChannelID] = append(channelInviteFallbacks[membership.ChannelID], mappedUserID)
+		}
+	}
 
 	// Per group-channel room ID, collect Matrix user IDs that were added (for equal power levels later)
 	groupRoomMembers := make(map[string][]string)
@@ -718,6 +740,7 @@ func (i *Importer) ApplyChannelMemberships(
 			if _, already := ensuredRoomsForForceJoin[roomID]; !already {
 				roomOwnerID := defaultRoomOwnerID
 				creatorMappedUserID := ""
+				roomInviteFallbackCandidates := channelInviteFallbacks[membership.ChannelID]
 				if channel.CreatorID != "" {
 					if mx, ok := userMapping[channel.CreatorID]; ok && mx != "" {
 						roomOwnerID = mx
@@ -727,10 +750,23 @@ func (i *Importer) ApplyChannelMemberships(
 				if roomOwnerID == "" && adminUserID != "" {
 					roomOwnerID = adminUserID
 				}
+				// If owner resolves to admin, prefer a non-admin known member as owner for invite/PL operations.
+				if roomOwnerID == adminUserID {
+					for _, candidate := range roomInviteFallbackCandidates {
+						if candidate != "" && candidate != adminUserID {
+							roomOwnerID = candidate
+							break
+						}
+					}
+				}
 				if roomOwnerID != "" {
-					inviteCandidates := make([]string, 0, 3)
-					seenInviteCandidates := make(map[string]struct{}, 3)
+					const maxInviteCandidates = 12
+					inviteCandidates := make([]string, 0, maxInviteCandidates)
+					seenInviteCandidates := make(map[string]struct{}, maxInviteCandidates)
 					addInviteCandidate := func(candidate string) {
+						if len(inviteCandidates) >= maxInviteCandidates {
+							return
+						}
 						if candidate == "" || candidate == roomOwnerID {
 							return
 						}
@@ -744,17 +780,44 @@ func (i *Importer) ApplyChannelMemberships(
 					// If creator mapping is missing, current membership user is often already in room and can invite admin.
 					addInviteCandidate(userID)
 					addInviteCandidate(defaultRoomOwnerID)
+					for _, candidate := range roomInviteFallbackCandidates {
+						addInviteCandidate(candidate)
+					}
 					logger.Debug("ApplyChannelMemberships: ensuring admin in room %s (owner %s) for membership %s -> room", roomID, roomOwnerID, userID)
 					roomEnsureErr := i.client.ensureAdminInRoomWithPower(roomID, roomOwnerID, 100, inviteCandidates...)
 					if roomEnsureErr != nil {
 						logger.Warn("ApplyChannelMemberships: could not ensure admin in room %s (owner %s): %v", roomID, roomOwnerID, roomEnsureErr)
+						// For force-join membership import, admin presence in room is sufficient for Synapse admin join.
+						// If we only failed to escalate admin PL, continue and avoid blacklisting the room.
+						if isAdminPowerEscalationError(roomEnsureErr) {
+							logger.Warn("ApplyChannelMemberships: proceeding without PL escalation for room %s; force-join can continue", roomID)
+							roomEnsureErr = nil
+							ensuredRoomsForForceJoin[roomID] = struct{}{}
+							roomsToLeaveAfter[roomID] = struct{}{}
+						}
 						// One-time best-effort recovery for unjoinable rooms:
 						// promote fallback owner and tag room name so it is easy to find.
-						if _, attempted := recoveryAttemptedRooms[roomID]; !attempted {
+						if roomEnsureErr != nil {
+							if _, attempted := recoveryAttemptedRooms[roomID]; !attempted {
 							recoveryAttemptedRooms[roomID] = struct{}{}
-							recoveryOwnerID := adminUserID
+							// Prefer a non-admin recovery owner so invite-as-user has a chance to succeed.
+							recoveryOwnerID := defaultRoomOwnerID
+							if recoveryOwnerID == "" || recoveryOwnerID == adminUserID {
+								recoveryOwnerID = creatorMappedUserID
+							}
+							if recoveryOwnerID == "" || recoveryOwnerID == adminUserID {
+								recoveryOwnerID = userID
+							}
+							if recoveryOwnerID == "" || recoveryOwnerID == adminUserID {
+								for _, candidate := range roomInviteFallbackCandidates {
+									if candidate != "" && candidate != adminUserID {
+										recoveryOwnerID = candidate
+										break
+									}
+								}
+							}
 							if recoveryOwnerID == "" {
-								recoveryOwnerID = defaultRoomOwnerID
+								recoveryOwnerID = adminUserID
 							}
 							recoverErr := i.client.TryRecoverUnjoinableRoom(roomID, channel.DisplayName, recoveryOwnerID)
 							if recoverErr != nil {
@@ -765,6 +828,7 @@ func (i *Importer) ApplyChannelMemberships(
 								ensuredRoomsForForceJoin[roomID] = struct{}{}
 								roomsToLeaveAfter[roomID] = struct{}{}
 							}
+						}
 						}
 						if roomEnsureErr != nil {
 							unjoinableRooms[roomID] = struct{}{}
