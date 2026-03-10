@@ -56,6 +56,85 @@ func NewImporter(client *Client) *Importer {
 // ImportProgressCallback is called to report import progress
 type ImportProgressCallback func(stage string, current, total int, item string)
 
+var mattermostBroadcastMentions = map[string]struct{}{
+	"all":     {},
+	"channel": {},
+	"here":    {},
+}
+
+func isMentionChar(b byte) bool {
+	return (b >= 'a' && b <= 'z') ||
+		(b >= 'A' && b <= 'Z') ||
+		(b >= '0' && b <= '9') ||
+		b == '_' || b == '-' || b == '.'
+}
+
+// normalizeMatrixMentions rewrites plain @username mentions to @username:homeserver.
+// It skips already-formatted Matrix IDs and Mattermost broadcast mentions.
+func (i *Importer) normalizeMatrixMentions(message string) string {
+	if message == "" {
+		return message
+	}
+
+	var out strings.Builder
+	out.Grow(len(message) + 16)
+
+	for idx := 0; idx < len(message); {
+		if message[idx] != '@' {
+			out.WriteByte(message[idx])
+			idx++
+			continue
+		}
+
+		if idx > 0 {
+			prev := message[idx-1]
+			if isMentionChar(prev) || prev == '@' {
+				out.WriteByte('@')
+				idx++
+				continue
+			}
+		}
+
+		j := idx + 1
+		for j < len(message) && isMentionChar(message[j]) {
+			j++
+		}
+		if j == idx+1 {
+			out.WriteByte('@')
+			idx++
+			continue
+		}
+
+		username := message[idx+1 : j]
+		for len(username) > 0 && username[len(username)-1] == '.' {
+			username = username[:len(username)-1]
+			j--
+		}
+		if username == "" {
+			out.WriteByte('@')
+			idx++
+			continue
+		}
+
+		if _, isBroadcast := mattermostBroadcastMentions[strings.ToLower(username)]; isBroadcast {
+			out.WriteString(message[idx:j])
+			idx = j
+			continue
+		}
+
+		if j < len(message) && message[j] == ':' {
+			out.WriteString(message[idx:j])
+			idx = j
+			continue
+		}
+
+		out.WriteString(i.client.FormatUserID(username))
+		idx = j
+	}
+
+	return out.String()
+}
+
 // GenerateRandomPassword generates a random password for new users
 func GenerateRandomPassword() string {
 	// In production, use crypto/rand for secure random password
@@ -1482,6 +1561,8 @@ func (i *Importer) ImportMessages(
 			logger.Warn("No user mapping for user %s, message will be sent as AS bot", post.UserID)
 		}
 
+		messageContent := i.normalizeMatrixMentions(post.Message)
+
 		// Handle reply
 		var eventID string
 
@@ -1494,7 +1575,7 @@ func (i *Importer) ImportMessages(
 				result.Errors = append(result.Errors, fmt.Sprintf("Parent post %s not found for reply %s", post.RootID, post.ID))
 
 				// Import as regular message instead of failing
-				resp, sendErr := i.client.SendMessageWithTimestamp(roomID, post.Message, post.CreateAt, senderID)
+				resp, sendErr := i.client.SendMessageWithTimestamp(roomID, messageContent, post.CreateAt, senderID)
 				if sendErr != nil {
 					result.Stats.MessagesFailed++
 					result.Errors = append(result.Errors, fmt.Sprintf("Failed to send message %s: %v", post.ID, sendErr))
@@ -1506,7 +1587,7 @@ func (i *Importer) ImportMessages(
 				eventID = resp.EventID
 			} else {
 				// Send as reply
-				resp, sendErr := i.client.SendReplyWithTimestamp(roomID, post.Message, parentEventID, post.CreateAt, senderID)
+				resp, sendErr := i.client.SendReplyWithTimestamp(roomID, messageContent, parentEventID, post.CreateAt, senderID)
 				if sendErr != nil {
 					result.Stats.RepliesFailed++
 					result.Errors = append(result.Errors, fmt.Sprintf("Failed to send reply %s: %v", post.ID, sendErr))
@@ -1520,7 +1601,7 @@ func (i *Importer) ImportMessages(
 			}
 		} else {
 			// Regular message
-			resp, sendErr := i.client.SendMessageWithTimestamp(roomID, post.Message, post.CreateAt, senderID)
+			resp, sendErr := i.client.SendMessageWithTimestamp(roomID, messageContent, post.CreateAt, senderID)
 			if sendErr != nil {
 				result.Stats.MessagesFailed++
 				result.Errors = append(result.Errors, fmt.Sprintf("Failed to send message %s: %v", post.ID, sendErr))
@@ -1627,7 +1708,7 @@ func (i *Importer) ImportMessagesWithFiles(
 		}
 
 		// Build message content with files
-		messageContent := post.Message
+		messageContent := i.normalizeMatrixMentions(post.Message)
 		files := filesByPost[post.ID]
 
 		// Append file links if mode is "link"
