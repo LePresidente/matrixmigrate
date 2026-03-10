@@ -692,6 +692,12 @@ func (o *Orchestrator) ImportMemberships(progress ProgressCallback) (*OperationR
 		logger.Error("Cannot run step: %s", reason)
 		return nil, fmt.Errorf("cannot run step: %s", reason)
 	}
+	// If memberships were already imported successfully, skip expensive replays.
+	// This keeps reruns fast and avoids reissuing force-join operations.
+	if step := o.state.GetStep(StepImportMemberships); step.Status == StatusCompleted {
+		logger.Info("ImportMemberships: step already completed, skipping membership replay")
+		return result, nil
+	}
 
 	// Get the membership file and mapping file from previous steps
 	membershipFile := o.state.GetStepOutputFile(StepExportMemberships)

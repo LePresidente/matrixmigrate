@@ -142,6 +142,11 @@ func runImportMemberships(cmd *cobra.Command, args []string) error {
 	if !canRun {
 		return fmt.Errorf("cannot run step: %s", reason)
 	}
+	if step := state.GetStep(migration.StepImportMemberships); step.Status == migration.StatusCompleted {
+		printInfo("Membership import already completed in state; skipping replay.")
+		printSuccess(i18n.T("messages.migration_completed"))
+		return nil
+	}
 
 	// Connect to Matrix
 	printInfo(i18n.T("progress.connecting", "Matrix"))
