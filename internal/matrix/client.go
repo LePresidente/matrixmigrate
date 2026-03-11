@@ -1404,8 +1404,10 @@ func (c *Client) SendMessageWithTimestamp(roomID, message string, timestamp int6
 
 	// Create message content
 	req := &SendMessageRequest{
-		MsgType: "m.text",
-		Body:    message,
+		MsgType:       "m.text",
+		Body:          message,
+		Format:        "org.matrix.custom.html",
+		FormattedBody: markdownToMatrixHTML(message),
 	}
 
 	// Use AS token if available, otherwise use admin token
@@ -1457,8 +1459,10 @@ func (c *Client) SendReplyWithTimestamp(roomID, message string, replyToEventID s
 
 	// Create reply content with relation
 	content := map[string]interface{}{
-		"msgtype": "m.text",
-		"body":    message,
+		"msgtype":         "m.text",
+		"body":            message,
+		"format":          "org.matrix.custom.html",
+		"formatted_body":  markdownToMatrixHTML(message),
 		"m.relates_to": map[string]interface{}{
 			"m.in_reply_to": map[string]string{
 				"event_id": replyToEventID,
