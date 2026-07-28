@@ -22,6 +22,16 @@ type Orchestrator struct {
 	mmClient *mattermost.Client
 	mxClient *matrix.Client
 	mxToken  string // Matrix access token (from login or config)
+
+	// forceMembershipReplay re-applies channel/team memberships even when the step already
+	// completed, so members who joined after the first run get added on a later run.
+	forceMembershipReplay bool
+}
+
+// SetForceMembershipReplay controls whether a completed membership step is re-applied on
+// re-run (to pick up members added since the first run). Force-join is idempotent.
+func (o *Orchestrator) SetForceMembershipReplay(force bool) {
+	o.forceMembershipReplay = force
 }
 
 // NewOrchestrator creates a new migration orchestrator
@@ -692,9 +702,10 @@ func (o *Orchestrator) ImportMemberships(progress ProgressCallback) (*OperationR
 		logger.Error("Cannot run step: %s", reason)
 		return nil, fmt.Errorf("cannot run step: %s", reason)
 	}
-	// If memberships were already imported successfully, skip expensive replays.
-	// This keeps reruns fast and avoids reissuing force-join operations.
-	if step := o.state.GetStep(StepImportMemberships); step.Status == StatusCompleted {
+	// If memberships were already imported successfully, skip expensive replays by default.
+	// This keeps reruns fast and avoids reissuing force-join operations. When replay is
+	// forced, re-apply so members who joined after the first run get added (idempotent).
+	if step := o.state.GetStep(StepImportMemberships); step.Status == StatusCompleted && !o.forceMembershipReplay {
 		logger.Info("ImportMemberships: step already completed, skipping membership replay")
 		return result, nil
 	}

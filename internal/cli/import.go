@@ -59,10 +59,18 @@ Requires: appservice.enabled=true and MATRIX_AS_TOKEN env var`,
 	RunE: runImportMessages,
 }
 
+var membershipsSkipCompleted bool
+
 func init() {
 	importCmd.AddCommand(importAssetsCmd)
 	importCmd.AddCommand(importMembershipsCmd)
 	importCmd.AddCommand(importMessagesCmd)
+
+	// By default, re-running membership import re-applies against the latest snapshot so
+	// users who joined channels after the first run get added (force-join is idempotent for
+	// users already in a room). Pass --skip-completed to keep the old run-once behaviour.
+	importMembershipsCmd.Flags().BoolVar(&membershipsSkipCompleted, "skip-completed", false,
+		"skip membership import if it already completed once (default: re-apply to pick up new members)")
 }
 
 func runImportAssets(cmd *cobra.Command, args []string) error {
@@ -143,9 +151,13 @@ func runImportMemberships(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("cannot run step: %s", reason)
 	}
 	if step := state.GetStep(migration.StepImportMemberships); step.Status == migration.StatusCompleted {
-		printInfo("Membership import already completed in state; skipping replay.")
-		printSuccess(i18n.T("messages.migration_completed"))
-		return nil
+		if membershipsSkipCompleted {
+			printInfo("Membership import already completed in state; skipping replay (--skip-completed).")
+			printSuccess(i18n.T("messages.migration_completed"))
+			return nil
+		}
+		printInfo("Membership import already completed; re-applying to pick up new members (force-join is idempotent).")
+		orch.SetForceMembershipReplay(true)
 	}
 
 	// Connect to Matrix
