@@ -23,6 +23,16 @@ go.work
 
 # Config with secrets
 config.yaml
+config.yaml.*
+*.bak
+
+# Local environment scripts (export real tokens/passwords)
+startup.sh
+.env
+.env.*
+
+# Compiled binary (built by `make build`)
+/matrixmigrate
 
 # Data files (may contain sensitive info)
 data/assets/*.json.gz
@@ -39,3 +49,7 @@ Thumbs.db
 
 
 
+
+# Go build/test cache dirs
+.gotmp/
+.gocache/
