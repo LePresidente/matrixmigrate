@@ -370,7 +370,7 @@ func (p *Post) IsReply() bool {
 
 // IsSystemMessage returns true if the post is a system-generated message
 func (p *Post) IsSystemMessage() bool {
-	return p.Type != "" && len(p.Type) > 0
+	return p.Type != ""
 }
 
 // CreatedTime returns the creation time as time.Time

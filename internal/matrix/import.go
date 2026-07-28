@@ -1551,6 +1551,16 @@ func (i *Importer) ImportMessages(
 			continue
 		}
 
+		// Skip Mattermost system messages (joins/leaves, header/purpose changes, etc.);
+		// they carry no user content and only pollute the room.
+		if post.IsSystemMessage() {
+			result.Stats.MessagesSkipped++
+			if progress != nil {
+				progress(idx+1, total, post.ChannelID, "skipped:system")
+			}
+			continue
+		}
+
 		// Get target room
 		roomID, roomExists := channelToRoom[post.ChannelID]
 		if !roomExists {
@@ -1698,6 +1708,16 @@ func (i *Importer) ImportMessagesWithFiles(
 			continue
 		}
 
+		// Skip Mattermost system messages (joins/leaves, header/purpose changes, etc.);
+		// they carry no user content and only pollute the room.
+		if post.IsSystemMessage() {
+			result.Stats.MessagesSkipped++
+			if progress != nil {
+				progress(idx+1, total, post.ChannelID, "skipped:system")
+			}
+			continue
+		}
+
 		// Get target room
 		roomID, roomExists := channelToRoom[post.ChannelID]
 		if !roomExists {
@@ -1796,9 +1816,9 @@ func (i *Importer) ImportMessagesWithFiles(
 
 	}
 
-	logger.Info("Message import completed: imported=%d, skipped=%d, failed=%d, replies=%d, files_linked=%d",
+	logger.Info("Message import completed: imported=%d, skipped=%d, failed=%d, replies=%d, files_uploaded=%d, files_linked=%d",
 		result.Stats.MessagesImported, result.Stats.MessagesSkipped,
-		result.Stats.MessagesFailed, result.Stats.RepliesImported, result.Stats.FilesLinked)
+		result.Stats.MessagesFailed, result.Stats.RepliesImported, result.Stats.FilesUploaded, result.Stats.FilesLinked)
 	if fileConfig.Mode == "upload" && totalTooLarge > 0 {
 		logger.Warn("Upload mode: %d files exceeded max_upload_size_mb (%d bytes). Largest rejected file size: %d bytes",
 			totalTooLarge, fileConfig.MaxUploadSize, largestTooLargeSize)
