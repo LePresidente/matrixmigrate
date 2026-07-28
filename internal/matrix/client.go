@@ -1356,10 +1356,26 @@ func (c *Client) getNextTxnID() string {
 
 // SendMessageRequest represents a message to send
 type SendMessageRequest struct {
-	MsgType       string `json:"msgtype"`
-	Body          string `json:"body"`
-	FormattedBody string `json:"formatted_body,omitempty"`
-	Format        string `json:"format,omitempty"`
+	MsgType       string    `json:"msgtype"`
+	Body          string    `json:"body"`
+	FormattedBody string    `json:"formatted_body,omitempty"`
+	Format        string    `json:"format,omitempty"`
+	Mentions      *Mentions `json:"m.mentions,omitempty"`
+}
+
+// Mentions carries the intentional-mentions metadata (MSC3952) so mentioned users are
+// notified and clients render the mention as a pill.
+type Mentions struct {
+	UserIDs []string `json:"user_ids,omitempty"`
+}
+
+// mentionsOrNil returns a *Mentions for the given user IDs, or nil when there are none
+// (so the field is omitted from the event content).
+func mentionsOrNil(userIDs []string) *Mentions {
+	if len(userIDs) == 0 {
+		return nil
+	}
+	return &Mentions{UserIDs: userIDs}
 }
 
 // SendMessageResponse represents the response from sending a message
@@ -1402,12 +1418,15 @@ func (c *Client) SendMessageWithTimestamp(roomID, message string, timestamp int6
 		endpoint += "?" + params.Encode()
 	}
 
-	// Create message content
+	// Create message content. Render mentions as pills (protecting their underscores from
+	// markdown emphasis) and advertise them via m.mentions.
+	formattedBody, mentionIDs := renderMatrixMessageHTML(message)
 	req := &SendMessageRequest{
 		MsgType:       "m.text",
 		Body:          message,
 		Format:        "org.matrix.custom.html",
-		FormattedBody: markdownToMatrixHTML(message),
+		FormattedBody: formattedBody,
+		Mentions:      mentionsOrNil(mentionIDs),
 	}
 
 	// Use AS token if available, otherwise use admin token
@@ -1458,16 +1477,20 @@ func (c *Client) SendReplyWithTimestamp(roomID, message string, replyToEventID s
 	}
 
 	// Create reply content with relation
+	formattedBody, mentionIDs := renderMatrixMessageHTML(message)
 	content := map[string]interface{}{
-		"msgtype":         "m.text",
-		"body":            message,
-		"format":          "org.matrix.custom.html",
-		"formatted_body":  markdownToMatrixHTML(message),
+		"msgtype":        "m.text",
+		"body":           message,
+		"format":         "org.matrix.custom.html",
+		"formatted_body": formattedBody,
 		"m.relates_to": map[string]interface{}{
 			"m.in_reply_to": map[string]string{
 				"event_id": replyToEventID,
 			},
 		},
+	}
+	if len(mentionIDs) > 0 {
+		content["m.mentions"] = map[string]interface{}{"user_ids": mentionIDs}
 	}
 
 	// Use AS token if available

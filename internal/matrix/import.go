@@ -135,6 +135,15 @@ func (i *Importer) normalizeMatrixMentions(message string) string {
 	return out.String()
 }
 
+// renderMentions normalizes plain @username mentions to full Matrix IDs and renders the
+// message to HTML with mention pills. Returns the plain body, the formatted HTML body, and
+// the deduped list of mentioned user IDs (for m.mentions).
+func (i *Importer) renderMentions(message string) (body string, formattedHTML string, userIDs []string) {
+	body = i.normalizeMatrixMentions(message)
+	formattedHTML, userIDs = renderMatrixMessageHTML(body)
+	return body, formattedHTML, userIDs
+}
+
 // GenerateRandomPassword generates a random password for new users
 func GenerateRandomPassword() string {
 	// In production, use crypto/rand for secure random password

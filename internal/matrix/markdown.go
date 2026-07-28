@@ -1,6 +1,7 @@
 package matrix
 
 import (
+	"fmt"
 	"html"
 	"regexp"
 	"strings"
@@ -14,7 +15,44 @@ var (
 	reItalicStar = regexp.MustCompile(`\*([^*\n]+)\*`)
 	reItalicUnd  = regexp.MustCompile(`_([^_\n]+)_`)
 	reLink       = regexp.MustCompile(`\[(.*?)\]\((https?://[^\s)]+)\)`)
+	// reMatrixMention matches a full Matrix user ID (@localpart:domain) inside an
+	// already-normalized message. Localpart grammar follows the Matrix spec.
+	reMatrixMention = regexp.MustCompile(`@[a-zA-Z0-9._=+/-]+:[a-zA-Z0-9.-]+`)
 )
+
+// renderMatrixMessageHTML converts a normalized message (mentions already written as
+// @localpart:domain) into Matrix HTML. Mentions are masked out before the markdown pass so
+// their underscores are never interpreted as emphasis, then spliced back in as matrix.to
+// pills. It also returns the deduped list of mentioned user IDs for the m.mentions field.
+func renderMatrixMessageHTML(message string) (string, []string) {
+	if message == "" {
+		return "", nil
+	}
+
+	var ids []string
+	seen := make(map[string]struct{})
+	pills := make(map[string]string)
+	idx := 0
+
+	masked := reMatrixMention.ReplaceAllStringFunc(message, func(m string) string {
+		if _, ok := seen[m]; !ok {
+			seen[m] = struct{}{}
+			ids = append(ids, m)
+		}
+		// NUL-delimited placeholder: contains no markdown-significant characters and is
+		// left untouched by html.EscapeString, so it survives the markdown pass intact.
+		key := fmt.Sprintf("\x00MENTION%d\x00", idx)
+		idx++
+		pills[key] = fmt.Sprintf(`<a href="https://matrix.to/#/%s">%s</a>`, m, html.EscapeString(m))
+		return key
+	})
+
+	out := markdownToMatrixHTML(masked)
+	for key, pill := range pills {
+		out = strings.ReplaceAll(out, key, pill)
+	}
+	return out, ids
+}
 
 // markdownToMatrixHTML converts a subset of Mattermost/Markdown syntax to Matrix HTML.
 // It favors safe rendering with escaped fallback text instead of full Markdown compatibility.
