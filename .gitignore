@@ -30,6 +30,7 @@ config.yaml.*
 startup.sh
 .env
 .env.*
+!.env.example
 
 # Compiled binary (built by `make build`)
 /matrixmigrate

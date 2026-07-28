@@ -116,6 +116,17 @@ Under `mattermost` in `config.yaml` you can set:
 |--------|---------|-------------|
 | `ignored_users` | `[]` | List of Mattermost usernames to skip during import (case-insensitive). Useful for bot/service accounts. Ignored users are not created in Matrix, and their team/channel memberships are skipped. |
 
+### File attachment options
+
+Under `mattermost.files` in `config.yaml`:
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `mode` | `link` | How message attachments are migrated. **`link`**: the message body gets a link back to the file on the Mattermost server (no file data is transferred). **`upload`**: the file is read from `local_data_path` and uploaded to the Matrix media repository, so attachments survive Mattermost being decommissioned. |
+| `local_data_path` | — | Path to the Mattermost file storage directory, as reachable from the machine running the tool (typically an NFS/SSHFS mount of Mattermost's `data/` directory). Required when `mode: "upload"`. |
+| `max_upload_size_mb` | `50` | Files larger than this are not uploaded. Must not exceed the Synapse `max_upload_size` setting, or uploads will be rejected by the homeserver. Rejected files are counted and reported at the end of the import. |
+| `fallback_to_link_on_upload_failure` | `false` | When `mode: "upload"` and an individual upload fails, fall back to linking that file instead of recording an error. Useful for a first pass over a large archive where a handful of files are unreadable. |
+
 ### Matrix import options
 
 Under `matrix.import` in `config.yaml` you can set:
@@ -126,6 +137,8 @@ Under `matrix.import` in `config.yaml` you can set:
 | `force_join` | `false` | Add users to rooms/spaces via Synapse admin API (joined directly, no invite to accept). Use when users are already expected to be members. |
 | **`public_room_join_rules`** | **`space_members`** | Who can join public (Mattermost) channels in Matrix. **`space_members`**: only members of the parent space/team can join (restricted join rule). **`public`**: anyone can join (default Matrix join rule). |
 | `import_direct_messages` | `false` | Export and import Mattermost **direct message** channels (D type) as Matrix DMs. Rooms appear under **People** for both users. See [Direct messages import](#direct-messages-import) below. |
+| `space_visibility` | `invite_only` | Visibility of Matrix spaces created from Mattermost teams. **`invite_only`**: spaces are private (recommended; matches Mattermost team behaviour). **`public`**: spaces are publicly joinable. **`from_mattermost`**: derive per team from its type (`O` → public, `I` → invite-only). |
+| `fallback_room_creator` | — | Matrix username (**localpart only**, e.g. `admin` for `@admin:domain`) used as room creator when the Mattermost channel has an empty `creator_id`, or when the real creator is a locked/deactivated account. If the user does not exist, the admin account from `auth.username` is used instead. Only meaningful with `preserve_owner_and_alias: true`. |
 
 #### Direct messages import
 
@@ -166,6 +179,21 @@ When `import_direct_messages` is `true`:
 
 # Run with specific config
 ./matrixmigrate --config ./config.yaml export assets
+```
+
+#### Re-running membership import
+
+Re-running `import memberships` re-applies the latest membership snapshot by default, so users
+who joined a channel *after* the first import are added to the corresponding Matrix room.
+Force-join treats an already-present user as success, so replaying is safe.
+
+```bash
+# Re-export from Mattermost first, so the snapshot includes recent joins
+./matrixmigrate export memberships
+./matrixmigrate import memberships
+
+# Keep the old run-once behaviour: skip entirely if the step already completed
+./matrixmigrate import memberships --skip-completed
 ```
 
 ### Test Connections
@@ -261,11 +289,22 @@ The connection test provides detailed step-by-step diagnostics:
 
 ## Environment Variables
 
+`config.yaml` never holds a secret directly — it stores the *name* of the environment variable
+to read (`admin_token_env`, `password_env`, `as_token_env`, `client_secret_env`). Copy
+[`.env.example`](.env.example) to `.env`, fill it in, and source it before running:
+
+```bash
+cp .env.example .env
+set -a && . ./.env && set +a
+./matrixmigrate export assets
+```
+
 | Variable | Description | Required |
 |----------|-------------|----------|
 | `MATRIX_ADMIN_PASSWORD` | Matrix admin password for login | Yes (if using auth) |
 | `MATRIX_ADMIN_TOKEN` | Alternative: existing admin token | No |
 | `MATRIX_AS_TOKEN` | Application Service token for message import | Yes (for messages) |
+| `MATRIX_HS_TOKEN` | Homeserver token from the same Application Service registration | No |
 | `MAS_CLIENT_ID` | MAS OAuth client ID (admin client) when `matrix.mas.enabled` is true | Yes (if using MAS) |
 | `MAS_CLIENT_SECRET` | MAS OAuth client secret when `matrix.mas.enabled` is true | Yes (if using MAS) |
 | `MM_SSH_PASSWORD` | Mattermost SSH password | No (if using key) |

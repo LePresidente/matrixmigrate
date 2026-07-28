@@ -1,5 +1,9 @@
 # MatrixMigrate Configuration Example
 # Copy this file to config.yaml and update with your settings
+#
+# This file holds no secrets. Every credential is referenced by the *name* of an
+# environment variable (the `*_env` keys below); the value itself lives in your
+# environment. See .env.example for the matching variables.
 
 # Language setting (default: en)
 # Supported: en, tr
