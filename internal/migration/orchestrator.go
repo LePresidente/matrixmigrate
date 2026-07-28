@@ -1109,27 +1109,44 @@ func (o *Orchestrator) ImportMessages(progress matrix.MessageImportCallback) (*I
 		return nil, fmt.Errorf("failed to import messages: %w", err)
 	}
 
-	// Update message mapping with new imports
-	for mmID, mxEventID := range result.Mapping {
-		if _, exists := msgMapping.Messages[mmID]; !exists {
-			// Find the post to get additional info
-			for _, post := range messages.Posts {
-				if post.ID == mmID {
-					msgMapping.AddMessage(&MessageMapEntry{
-						MattermostID:  mmID,
-						MatrixEventID: mxEventID,
-						ChannelID:     post.ChannelID,
-						RoomID:        assetMapping.Channels[post.ChannelID],
-						UserID:        post.UserID,
-						MatrixUserID:  assetMapping.Users[post.UserID],
-						Timestamp:     post.CreateAt,
-						IsReply:       post.IsReply(),
-						RootID:        post.RootID,
-					})
-					break
-				}
-			}
+	// Persist per-message failure reasons so they're diagnosable (the aggregate counts alone
+	// hide why ~10% of posts fail — usually no_room for skipped DMs / archived channels).
+	if len(result.Errors) > 0 {
+		if path, werr := WriteMessageErrors(o.config.Data.AssetsDir, result.Errors); werr != nil {
+			logger.Warn("Failed to write message error log: %v", werr)
+		} else {
+			c := CategorizeMessageErrors(result.Errors)
+			logger.Warn("Message import had %d errors; details written to %s", len(result.Errors), path)
+			logger.Warn("Message error categories: no_room=%d send_error=%d reply_error=%d parent_missing=%d other=%d",
+				c["no_room"], c["send_error"], c["reply_error"], c["parent_missing"], c["other"])
 		}
+	}
+
+	// Update message mapping with new imports.
+	// Index posts by ID once to avoid an O(N*M) scan over all posts per mapping entry.
+	postByID := make(map[string]*mattermost.Post, len(messages.Posts))
+	for idx := range messages.Posts {
+		postByID[messages.Posts[idx].ID] = &messages.Posts[idx]
+	}
+	for mmID, mxEventID := range result.Mapping {
+		if _, exists := msgMapping.Messages[mmID]; exists {
+			continue
+		}
+		post, ok := postByID[mmID]
+		if !ok {
+			continue
+		}
+		msgMapping.AddMessage(&MessageMapEntry{
+			MattermostID:  mmID,
+			MatrixEventID: mxEventID,
+			ChannelID:     post.ChannelID,
+			RoomID:        assetMapping.Channels[post.ChannelID],
+			UserID:        post.UserID,
+			MatrixUserID:  assetMapping.Users[post.UserID],
+			Timestamp:     post.CreateAt,
+			IsReply:       post.IsReply(),
+			RootID:        post.RootID,
+		})
 	}
 
 	// Save message mapping

@@ -5,9 +5,50 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
+
+// GenerateMessageErrorsFilename returns a timestamped path for the message-error log.
+func GenerateMessageErrorsFilename(dir string) string {
+	timestamp := time.Now().Format("20060102-150405")
+	return filepath.Join(dir, fmt.Sprintf("message-errors-%s.log", timestamp))
+}
+
+// WriteMessageErrors writes one error per line to a timestamped file and returns its path.
+func WriteMessageErrors(dir string, errs []string) (string, error) {
+	path := GenerateMessageErrorsFilename(dir)
+	var b strings.Builder
+	for _, e := range errs {
+		b.WriteString(e)
+		b.WriteByte('\n')
+	}
+	if err := os.WriteFile(path, []byte(b.String()), 0o640); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+// CategorizeMessageErrors buckets raw import errors by failure mode for a summary line.
+func CategorizeMessageErrors(errs []string) map[string]int {
+	counts := make(map[string]int)
+	for _, e := range errs {
+		switch {
+		case strings.Contains(e, "No room mapping"):
+			counts["no_room"]++
+		case strings.Contains(e, "Failed to send reply"):
+			counts["reply_error"]++
+		case strings.Contains(e, "Failed to send message"):
+			counts["send_error"]++
+		case strings.Contains(e, "Parent post"):
+			counts["parent_missing"]++
+		default:
+			counts["other"]++
+		}
+	}
+	return counts
+}
 
 // MessageMapping represents the mapping between Mattermost posts and Matrix events
 type MessageMapping struct {
