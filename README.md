@@ -139,6 +139,29 @@ Under `matrix.import` in `config.yaml` you can set:
 | `import_direct_messages` | `false` | Export and import Mattermost **direct message** channels (D type) as Matrix DMs. Rooms appear under **People** for both users. See [Direct messages import](#direct-messages-import) below. |
 | `space_visibility` | `invite_only` | Visibility of Matrix spaces created from Mattermost teams. **`invite_only`**: spaces are private (recommended; matches Mattermost team behaviour). **`public`**: spaces are publicly joinable. **`from_mattermost`**: derive per team from its type (`O` → public, `I` → invite-only). |
 | `fallback_room_creator` | — | Matrix username (**localpart only**, e.g. `admin` for `@admin:domain`) used as room creator when the Mattermost channel has an empty `creator_id`, or when the real creator is a locked/deactivated account. If the user does not exist, the admin account from `auth.username` is used instead. Only meaningful with `preserve_owner_and_alias: true`. |
+| `user_password.mode` | `auto` | How imported users get a password. **`auto`**: no password when `matrix.mas.enabled` is true (accounts are SSO-only), a random password otherwise. **`random`**: always generate a distinct random password per user. **`none`**: never set a password. |
+| `user_password.length` | `24` | Length of generated passwords. Valid range 12–128. |
+| `user_password.write_file` | `true` | Write generated passwords to `<assets_dir>/user-passwords-<timestamp>.csv` (mode `0600`) so they can be distributed. Set `false` to discard them. |
+
+#### User passwords
+
+Each imported user gets a distinct password generated with `crypto/rand`. There is no shared
+or default password.
+
+With `mode: "auto"` and MAS enabled — the common setup — **no password is set at all**. Those
+accounts authenticate through SSO, so a local password would only widen the attack surface.
+
+When passwords *are* generated and `write_file` is true, they are written to
+`data/assets/user-passwords-<timestamp>.csv`:
+
+```csv
+mattermost_username,matrix_user_id,password
+alice_dev,@alice_dev:example.com,7Kq!mV2xRt9pLc4wZhY6sNbA
+```
+
+This file is plaintext credentials. It is created `0600`, is gitignored, and should be
+deleted once the passwords have been distributed. If it is lost, affected users can only get
+in via SSO or an admin-initiated password reset — the passwords are not stored anywhere else.
 
 #### Direct messages import
 

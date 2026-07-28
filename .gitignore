@@ -39,6 +39,8 @@ startup.sh
 data/assets/*.json.gz
 data/mappings/*.json
 data/state.json
+# Generated user passwords (plaintext credentials)
+data/assets/user-passwords-*.csv
 
 # OS files
 .DS_Store

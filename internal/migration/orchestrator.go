@@ -529,6 +529,21 @@ func (o *Orchestrator) ImportAssets(progress ProgressCallback) (*OperationResult
 	// Create importer
 	importer := matrix.NewImporter(o.mxClient)
 
+	// Resolve how new users get a password ("auto" -> none when MAS handles authentication).
+	passwordMode := matrix.PasswordModeRandom
+	if o.config.GetUserPasswordMode() == config.UserPasswordModeNone {
+		passwordMode = matrix.PasswordModeNone
+	}
+	importer.SetPasswordPolicy(matrix.PasswordPolicy{
+		Mode:   passwordMode,
+		Length: o.config.GetUserPasswordLength(),
+	})
+	if passwordMode == matrix.PasswordModeNone {
+		logger.Info("User import: creating users without a password (SSO/MAS or admin reset required)")
+	} else {
+		logger.Info("User import: generating a random %d-character password per user", o.config.GetUserPasswordLength())
+	}
+
 	// Import callback
 	var importProgress matrix.ImportProgressCallback
 	if progress != nil {
@@ -544,6 +559,18 @@ func (o *Orchestrator) ImportAssets(progress ProgressCallback) (*OperationResult
 		o.state.FailStep(StepImportAssets, err)
 		o.SaveState()
 		return nil, fmt.Errorf("import failed: %w", err)
+	}
+
+	// Persist generated passwords before anything else can fail, otherwise they are lost and
+	// the accounts become unreachable without an admin reset.
+	if creds := importer.GeneratedCredentials(); len(creds) > 0 {
+		if !o.config.Matrix.Import.UserPassword.WriteFile {
+			logger.Warn("Generated %d user passwords but user_password.write_file is false; they are discarded (SSO or admin reset required)", len(creds))
+		} else if path, werr := WriteUserPasswords(o.config.Data.AssetsDir, creds); werr != nil {
+			logger.Error("Failed to write generated user passwords to %s: %v", o.config.Data.AssetsDir, werr)
+		} else {
+			logger.Warn("Wrote %d generated user passwords to %s (mode 0600) - distribute and delete this file", len(creds), path)
+		}
 	}
 
 	// Import direct message channels as Matrix DMs when enabled

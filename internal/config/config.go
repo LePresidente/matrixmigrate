@@ -85,6 +85,32 @@ type ImportConfig struct {
 	// ImportDirectMessages: when true, export and import Mattermost direct message channels (D type) as Matrix DMs.
 	// Rooms appear under "People" for both users with is_direct set. Requires Application Service for m.direct account_data.
 	ImportDirectMessages bool `mapstructure:"import_direct_messages"`
+	// UserPassword: how passwords are assigned to newly created Matrix users.
+	UserPassword UserPasswordConfig `mapstructure:"user_password"`
+}
+
+// User password modes for ImportConfig.UserPassword.Mode
+const (
+	// UserPasswordModeAuto sets no password when MAS is enabled (accounts are SSO-only),
+	// and generates a random one otherwise.
+	UserPasswordModeAuto = "auto"
+	// UserPasswordModeRandom always generates a distinct random password per user.
+	UserPasswordModeRandom = "random"
+	// UserPasswordModeNone never sets a password. Users can only authenticate via SSO/MAS
+	// or an admin-initiated password reset.
+	UserPasswordModeNone = "none"
+)
+
+// UserPasswordConfig controls password assignment for imported users.
+type UserPasswordConfig struct {
+	// Mode: "auto" (default), "random", or "none".
+	Mode string `mapstructure:"mode"`
+	// Length of generated passwords. Default 24; valid range 12-128.
+	Length int `mapstructure:"length"`
+	// WriteFile: when true (default), generated passwords are written to
+	// <assets_dir>/user-passwords-<timestamp>.csv with mode 0600 so they can be distributed.
+	// Set false to discard them, leaving SSO or an admin reset as the only way in.
+	WriteFile bool `mapstructure:"write_file"`
 }
 
 // MASConfig holds Matrix Authentication Service configuration
@@ -213,6 +239,9 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("matrix.import.force_join", false)
 	v.SetDefault("matrix.import.public_room_join_rules", "space_members")
 	v.SetDefault("matrix.import.space_visibility", "invite_only")
+	v.SetDefault("matrix.import.user_password.mode", UserPasswordModeAuto)
+	v.SetDefault("matrix.import.user_password.length", 24)
+	v.SetDefault("matrix.import.user_password.write_file", true)
 	v.SetDefault("data.assets_dir", "./data/assets")
 	v.SetDefault("data.mappings_dir", "./data/mappings")
 	v.SetDefault("data.state_file", "./data/state.json")
@@ -308,6 +337,17 @@ func (c *Config) Validate() error {
 	default:
 		return fmt.Errorf("matrix.import.space_visibility must be \"invite_only\", \"public\", or \"from_mattermost\", got %q", c.Matrix.Import.SpaceVisibility)
 	}
+	// Validate user_password
+	switch c.Matrix.Import.UserPassword.Mode {
+	case "", UserPasswordModeAuto, UserPasswordModeRandom, UserPasswordModeNone:
+		// valid
+	default:
+		return fmt.Errorf("matrix.import.user_password.mode must be %q, %q, or %q, got %q",
+			UserPasswordModeAuto, UserPasswordModeRandom, UserPasswordModeNone, c.Matrix.Import.UserPassword.Mode)
+	}
+	if l := c.Matrix.Import.UserPassword.Length; l != 0 && (l < 12 || l > 128) {
+		return fmt.Errorf("matrix.import.user_password.length must be between 12 and 128, got %d", l)
+	}
 
 	// Validate MAS config when enabled
 	if c.Matrix.MAS.Enabled {
@@ -376,6 +416,34 @@ func (c *Config) GetSpaceVisibility() string {
 		return "invite_only"
 	}
 	return s
+}
+
+// GetUserPasswordMode resolves matrix.import.user_password.mode to a concrete mode,
+// returning either UserPasswordModeRandom or UserPasswordModeNone.
+//
+// "auto" (the default) resolves to "none" when MAS is enabled, because those accounts
+// authenticate through SSO and a local password would be dead weight; otherwise it resolves
+// to "random".
+func (c *Config) GetUserPasswordMode() string {
+	switch c.Matrix.Import.UserPassword.Mode {
+	case UserPasswordModeRandom:
+		return UserPasswordModeRandom
+	case UserPasswordModeNone:
+		return UserPasswordModeNone
+	default: // "" or "auto"
+		if c.Matrix.MAS.Enabled {
+			return UserPasswordModeNone
+		}
+		return UserPasswordModeRandom
+	}
+}
+
+// GetUserPasswordLength returns the configured generated-password length, or 24 when unset.
+func (c *Config) GetUserPasswordLength() int {
+	if l := c.Matrix.Import.UserPassword.Length; l != 0 {
+		return l
+	}
+	return 24
 }
 
 // GetSSHKeyPassphrase returns the SSH key passphrase from environment

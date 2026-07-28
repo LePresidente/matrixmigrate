@@ -46,11 +46,30 @@ func sanitizeAliasLocalpart(s string) string {
 // Importer handles importing data to Matrix
 type Importer struct {
 	client *Client
+
+	// passwordPolicy decides what password newly created users get. Defaults to a distinct
+	// random password per user; override with SetPasswordPolicy.
+	passwordPolicy PasswordPolicy
+	// generatedCredentials accumulates passwords created during this run so the caller can
+	// persist them. Empty when the policy generates no passwords.
+	generatedCredentials []UserCredential
 }
 
 // NewImporter creates a new importer
 func NewImporter(client *Client) *Importer {
-	return &Importer{client: client}
+	return &Importer{client: client, passwordPolicy: DefaultPasswordPolicy()}
+}
+
+// SetPasswordPolicy controls how passwords are assigned to newly created users.
+func (i *Importer) SetPasswordPolicy(policy PasswordPolicy) {
+	i.passwordPolicy = policy
+}
+
+// GeneratedCredentials returns the passwords generated during this import, in creation
+// order. Empty when the policy is PasswordModeNone. The caller is responsible for storing
+// these securely; they are not written anywhere by the importer.
+func (i *Importer) GeneratedCredentials() []UserCredential {
+	return i.generatedCredentials
 }
 
 // ImportProgressCallback is called to report import progress
@@ -144,11 +163,7 @@ func (i *Importer) renderMentions(message string) (body string, formattedHTML st
 	return body, formattedHTML, userIDs
 }
 
-// GenerateRandomPassword generates a random password for new users
-func GenerateRandomPassword() string {
-	// In production, use crypto/rand for secure random password
-	return "ChangeMe123!" // Placeholder - users should change this
-}
+// (password generation lives in password.go)
 
 func isNumericOnlyUsername(username string) bool {
 	name := strings.TrimSpace(username)
@@ -248,8 +263,17 @@ func (i *Importer) ImportUsers(users []mattermost.User, existingMapping map[stri
 			displayName = user.Username
 		}
 
+		// An empty password means "do not set one" (PasswordModeNone); the account is then
+		// reachable only via SSO/MAS or an admin reset.
+		password, err := i.passwordPolicy.Generate()
+		if err != nil {
+			logger.Error("Failed to generate password for user '%s': %v", user.Username, err)
+			stats.UsersFailed++
+			continue
+		}
+
 		req := &CreateUserRequest{
-			Password:    GenerateRandomPassword(),
+			Password:    password,
 			DisplayName: displayName,
 			Email:       strings.TrimSpace(user.Email),
 			Admin:       false,
@@ -274,6 +298,14 @@ func (i *Importer) ImportUsers(users []mattermost.User, existingMapping map[stri
 			continue
 		}
 		logger.Success("Created user '%s' -> %s", user.Username, resp.UserID)
+
+		if password != "" {
+			i.generatedCredentials = append(i.generatedCredentials, UserCredential{
+				Username:     user.Username,
+				MatrixUserID: resp.UserID,
+				Password:     password,
+			})
+		}
 
 		mapping[user.ID] = resp.UserID
 		stats.UsersCreated++
