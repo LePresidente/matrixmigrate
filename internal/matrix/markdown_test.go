@@ -244,9 +244,95 @@ func TestMarkdownToMatrixHTML(t *testing.T) {
 			want: "<div data-mx-maths=\"\\frac{1}{2}\"><code>\\frac{1}{2}</code></div>",
 		},
 		{
-			name: "channel links and emoji shortcodes are left alone",
-			in:   "~channel-name and :smile:",
-			want: "~channel-name and :smile:",
+			name: "channel links are left alone",
+			in:   "~channel-name stays",
+			want: "~channel-name stays",
+		},
+
+		// Reference links
+		{
+			name: "full reference link",
+			in:   "see [site][ref] now\n\n[ref]: https://example.com",
+			want: "see <a href=\"https://example.com\">site</a> now",
+		},
+		{
+			name: "collapsed reference link",
+			in:   "see [site][] now\n\n[site]: https://example.com",
+			want: "see <a href=\"https://example.com\">site</a> now",
+		},
+		{
+			name: "shortcut reference link",
+			in:   "see [ref] now\n\n[ref]: https://example.com",
+			want: "see <a href=\"https://example.com\">ref</a> now",
+		},
+		{
+			name: "reference image",
+			in:   "![alt][img]\n\n[img]: https://example.com/x.png",
+			want: "<a href=\"https://example.com/x.png\">alt</a>",
+		},
+		{
+			name: "unknown reference label stays literal",
+			in:   "[unknown][nope] stays",
+			want: "[unknown][nope] stays",
+		},
+		{
+			name: "bracketed prose is not a reference link",
+			in:   "prose [in brackets] stays",
+			want: "prose [in brackets] stays",
+		},
+		{
+			name: "inline link next to a defined label is untouched",
+			in:   "[a](https://example.com/1) and [a][ref]\n\n[ref]: https://example.com/2",
+			want: "<a href=\"https://example.com/1\">a</a> and <a href=\"https://example.com/2\">a</a>",
+		},
+
+		// Indented code
+		{
+			name: "indented code block",
+			in:   "text\n\n    code line 1\n    code line 2\n\nafter",
+			want: "text<br><pre><code>code line 1\ncode line 2</code></pre><br>after",
+		},
+		{
+			name: "tab indented code block",
+			in:   "\tcode",
+			want: "<pre><code>code</code></pre>",
+		},
+		{
+			name: "indented line without a blank line above is not code",
+			in:   "para\n    not code",
+			want: "para<br>    not code",
+		},
+		{
+			name: "indented continuation under a list is not code",
+			in:   "- a\n    continued",
+			want: "<ul><li>a</li></ul><br>    continued",
+		},
+
+		// Emoji shortcodes
+		{
+			name: "known shortcodes expand and unknown ones stay",
+			in:   "nice :smile: and :+1: and :custom_thing:",
+			want: "nice 😄 and 👍 and :custom_thing:",
+		},
+		{
+			name: "adjacent shortcodes",
+			in:   ":smile::+1:",
+			want: "😄👍",
+		},
+		{
+			name: "shortcode inside code is left alone",
+			in:   "`:smile:` stays",
+			want: "<code>:smile:</code> stays",
+		},
+		{
+			name: "colons in a url are not a shortcode",
+			in:   "https://example.com/a:b:c",
+			want: "<a href=\"https://example.com/a:b:c\">https://example.com/a:b:c</a>",
+		},
+		{
+			name: "shortcode inside emphasis",
+			in:   "**:tada: done**",
+			want: "<strong>🎉 done</strong>",
 		},
 	}
 

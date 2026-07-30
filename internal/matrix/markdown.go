@@ -35,6 +35,15 @@ var (
 	reAutolink    = regexp.MustCompile(`(?:https?|ftp)://[^\s]+|www\.[^\s]+|[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}`)
 	reInlineMath  = regexp.MustCompile(`\$([^$\n]+)\$`)
 	reEscape      = regexp.MustCompile("\\\\([\\\\`*_{}\\[\\]()#+\\-.!|~$])")
+	reEmoji       = regexp.MustCompile(`:([a-zA-Z0-9_+\-]+):`)
+
+	// Reference links. Definitions are collected and removed segment-wide before block
+	// parsing, then the three reference forms are rewritten into inline links.
+	reRefDefinition = regexp.MustCompile(`(?m)^[ \t]*\[([^\]]+)\]:[ \t]*(\S+)` + reTitleSuffix + `[ \t]*$\n?`)
+	reRefFull       = regexp.MustCompile(`\[([^\]]*)\]\[([^\]]+)\]`)
+	reRefCollapsed  = regexp.MustCompile(`\[([^\]]+)\]\[\]`)
+	reRefShortcut   = regexp.MustCompile(`\[([^\]]+)\]`)
+	reBlankRun      = regexp.MustCompile(`\n{3,}`)
 
 	// Block-level constructs. html.EscapeString leaves #, -, *, _, +, =, |, : and [ untouched,
 	// so matching these against escaped lines is safe.
@@ -46,6 +55,7 @@ var (
 	reSetextH2       = regexp.MustCompile(`^\s*-+\s*$`)
 	reTaskItem       = regexp.MustCompile(`^\[([ xX])\]\s+(.*)$`)
 	reTableDelimCell = regexp.MustCompile(`^:?-+:?$`)
+	reIndentedCode   = regexp.MustCompile(`^(?: {4}|\t)(.*)$`)
 )
 
 // reTitleSuffix matches the optional title or =WxH size suffix Mattermost allows after a link
@@ -143,7 +153,79 @@ func renderMarkdownSegment(segment string) string {
 		return ""
 	}
 
-	return renderBlocks(strings.Split(html.EscapeString(segment), "\n"))
+	escaped := resolveReferenceLinks(html.EscapeString(segment))
+	return renderBlocks(strings.Split(escaped, "\n"))
+}
+
+// resolveReferenceLinks collects [label]: target definitions, removes their lines, and rewrites
+// the full, collapsed and shortcut reference forms into inline links. Doing this segment-wide
+// before block parsing means a definition may sit anywhere in the message, and every later pass
+// only ever sees inline links.
+func resolveReferenceLinks(segment string) string {
+	defs := make(map[string]string)
+	body := reRefDefinition.ReplaceAllStringFunc(segment, func(s string) string {
+		g := reRefDefinition.FindStringSubmatch(s)
+		defs[strings.ToLower(strings.TrimSpace(g[1]))] = g[2]
+		return ""
+	})
+	if len(defs) == 0 {
+		return segment
+	}
+
+	// [text][] reuses its own text as the label.
+	body = reRefCollapsed.ReplaceAllStringFunc(body, func(s string) string {
+		label := reRefCollapsed.FindStringSubmatch(s)[1]
+		if target, ok := defs[strings.ToLower(strings.TrimSpace(label))]; ok {
+			return fmt.Sprintf("[%s](%s)", label, target)
+		}
+		return s
+	})
+
+	// [text][label], which also covers the image form ![alt][label].
+	body = reRefFull.ReplaceAllStringFunc(body, func(s string) string {
+		g := reRefFull.FindStringSubmatch(s)
+		if target, ok := defs[strings.ToLower(strings.TrimSpace(g[2]))]; ok {
+			return fmt.Sprintf("[%s](%s)", g[1], target)
+		}
+		return s
+	})
+
+	// Removing a definition line leaves the blank line that separated it behind, which would
+	// render as a stray <br>. Collapse the gap it left.
+	body = reBlankRun.ReplaceAllString(body, "\n\n")
+	body = strings.TrimRight(body, "\n")
+
+	return resolveShortcutRefs(body, defs)
+}
+
+// resolveShortcutRefs rewrites the bare [label] form. It is index-driven because Go's regexp
+// has no lookahead and a bracket run that is already part of an inline link or image must be
+// left alone. An unknown label is left alone too, so ordinary bracketed prose survives.
+func resolveShortcutRefs(s string, defs map[string]string) string {
+	var b strings.Builder
+	last := 0
+	for _, loc := range reRefShortcut.FindAllStringSubmatchIndex(s, -1) {
+		start, end := loc[0], loc[1]
+		if start < last {
+			continue
+		}
+		label := s[loc[2]:loc[3]]
+		target, ok := defs[strings.ToLower(strings.TrimSpace(label))]
+		if !ok {
+			continue
+		}
+		if end < len(s) && (s[end] == '(' || s[end] == '[') {
+			continue
+		}
+		if start > 0 && s[start-1] == '!' {
+			continue
+		}
+		b.WriteString(s[last:start])
+		fmt.Fprintf(&b, "[%s](%s)", label, target)
+		last = end
+	}
+	b.WriteString(s[last:])
+	return b.String()
 }
 
 // chunk is one rendered piece of a segment. isBlock marks the block-level elements whose
@@ -178,6 +260,16 @@ func renderBlocks(lines []string) string {
 
 		if reBullet.MatchString(line) || reOrdered.MatchString(line) {
 			rendered, next := renderList(lines, i)
+			chunks = append(chunks, chunk{html: rendered, isBlock: true})
+			i = next
+			continue
+		}
+
+		// Indented code, which requires a blank line above it. Without that guard an
+		// indented continuation line under a list item or paragraph would become code.
+		if reIndentedCode.MatchString(line) && strings.TrimSpace(line) != "" &&
+			(i == 0 || strings.TrimSpace(lines[i-1]) == "") {
+			rendered, next := renderIndentedCode(lines, i)
 			chunks = append(chunks, chunk{html: rendered, isBlock: true})
 			i = next
 			continue
@@ -233,6 +325,29 @@ func joinChunks(chunks []chunk) string {
 		kept = append(kept, c.html)
 	}
 	return strings.Join(kept, "<br>")
+}
+
+// renderIndentedCode consumes a run of four-space or tab indented lines as a code block,
+// keeping interior blank lines and dropping trailing ones. The content is already escaped and
+// no inline pass runs over it.
+func renderIndentedCode(lines []string, start int) (string, int) {
+	var content []string
+	last := start
+	i := start
+	for ; i < len(lines); i++ {
+		if m := reIndentedCode.FindStringSubmatch(lines[i]); m != nil && strings.TrimSpace(lines[i]) != "" {
+			content = append(content, m[1])
+			last = i + 1
+			continue
+		}
+		if strings.TrimSpace(lines[i]) == "" {
+			content = append(content, "")
+			continue
+		}
+		break
+	}
+	content = content[:last-start]
+	return "<pre><code>" + strings.Join(content, "\n") + "</code></pre>", last
 }
 
 func renderHeading(level int, text string) string {
@@ -518,6 +633,7 @@ func renderInlineDepth(text string, depth int) string {
 	out = maskLinks(m, out, depth)
 	out = maskAutolinks(m, out)
 	out = maskEscapes(m, out)
+	out = replaceEmoji(out)
 
 	out = reBoldStar.ReplaceAllString(out, "<strong>$1</strong>")
 	out = reBoldUnder.ReplaceAllString(out, "<strong>$1</strong>")
@@ -601,6 +717,22 @@ func maskAutolinks(m *masker, text string) string {
 			return s
 		}
 		return m.mask(fmt.Sprintf(`<a href="%s">%s</a>`, href, target)) + trailing
+	})
+}
+
+// replaceEmoji expands :shortcode: to the Unicode character. It runs after code spans, links
+// and URLs are masked, so a shortcode inside code or a colon inside a URL is left alone, and
+// before the emphasis passes, so shortcode underscores are never read as emphasis. An unknown
+// shortcode stays literal, which is the right outcome for custom Mattermost emoji.
+func replaceEmoji(text string) string {
+	if !strings.Contains(text, ":") {
+		return text
+	}
+	return reEmoji.ReplaceAllStringFunc(text, func(s string) string {
+		if emoji, ok := emojiShortcodes[strings.ToLower(s[1:len(s)-1])]; ok {
+			return emoji
+		}
+		return s
 	})
 }
 
