@@ -24,6 +24,18 @@ func TestMarkdownToMatrixHTML(t *testing.T) {
 			want: "<blockquote>quoted</blockquote><br>next",
 		},
 		{
+			name: "bold italic combined",
+			in:   "***both***",
+			want: "<em><strong>both</strong></em>",
+		},
+		{
+			name: "strikethrough",
+			in:   "~~gone~~",
+			want: "<del>gone</del>",
+		},
+
+		// Tables
+		{
 			name: "table between prose lines",
 			in:   "GW 7 Summary\n\n| Name | Rank |\n| --- | --- |\n| alice | 1 |\n| bob_dev | 2 |\n\nGW 8 Summary",
 			want: "GW 7 Summary<br>" +
@@ -71,6 +83,30 @@ func TestMarkdownToMatrixHTML(t *testing.T) {
 			in:   "alice | bob_dev\ncarol | dave",
 			want: "alice | bob_dev<br>carol | dave",
 		},
+
+		// Headings and rules
+		{
+			name: "atx heading",
+			in:   "## Heading\ntext",
+			want: "<h2>Heading</h2><br>text",
+		},
+		{
+			name: "setext heading level one",
+			in:   "Title\n===\ntext",
+			want: "<h1>Title</h1><br>text",
+		},
+		{
+			name: "setext heading level two",
+			in:   "Title\n---\ntext",
+			want: "<h2>Title</h2><br>text",
+		},
+		{
+			name: "horizontal rule",
+			in:   "above\n\n---\n\nbelow",
+			want: "above<br><hr><br>below",
+		},
+
+		// Lists
 		{
 			name: "unordered list",
 			in:   "- one\n- two",
@@ -87,19 +123,130 @@ func TestMarkdownToMatrixHTML(t *testing.T) {
 			want: "<ol start=\"3\"><li>one</li><li>two</li></ol>",
 		},
 		{
-			name: "heading",
-			in:   "## Heading\ntext",
-			want: "<h2>Heading</h2><br>text",
+			name: "nested unordered list",
+			in:   "- a\n  - b\n  - c\n- d",
+			want: "<ul><li>a<ul><li>b</li><li>c</li></ul></li><li>d</li></ul>",
 		},
 		{
-			name: "horizontal rule",
-			in:   "above\n\n---\n\nbelow",
-			want: "above<br><hr><br>below",
+			name: "nested ordered list",
+			in:   "1. a\n  1. b\n2. c",
+			want: "<ol><li>a<ol><li>b</li></ol></li><li>c</li></ol>",
 		},
+		{
+			name: "task list becomes checkbox symbols",
+			in:   "- [ ] todo\n- [x] done",
+			want: "<ul><li>☐ todo</li><li>☑ done</li></ul>",
+		},
+
+		// Quotes
 		{
 			name: "consecutive quote lines merge",
 			in:   "> one\n> two",
 			want: "<blockquote>one<br>two</blockquote>",
+		},
+		{
+			name: "nested quote",
+			in:   "> outer\n> > inner\n> back",
+			want: "<blockquote>outer<br><blockquote>inner</blockquote><br>back</blockquote>",
+		},
+		{
+			name: "list inside quote",
+			in:   "> - a\n> - b",
+			want: "<blockquote><ul><li>a</li><li>b</li></ul></blockquote>",
+		},
+
+		// Links and images
+		{
+			name: "image becomes a link because img src must be mxc",
+			in:   "![alt](https://example.com/x.png)",
+			want: "<a href=\"https://example.com/x.png\">alt</a>",
+		},
+		{
+			name: "image title suffix is dropped",
+			in:   "![alt](https://example.com/x.png \"hover\")",
+			want: "<a href=\"https://example.com/x.png\">alt</a>",
+		},
+		{
+			name: "image size suffix is dropped",
+			in:   "![alt](https://example.com/x.png =50x40)",
+			want: "<a href=\"https://example.com/x.png\">alt</a>",
+		},
+		{
+			name: "mxc image stays an image",
+			in:   "![logo](mxc://example.com/abc)",
+			want: "<img src=\"mxc://example.com/abc\" alt=\"logo\">",
+		},
+		{
+			name: "linked image collapses to the outer link",
+			in:   "[![alt](https://example.com/x.png)](https://example.com/page)",
+			want: "<a href=\"https://example.com/page\">alt</a>",
+		},
+		{
+			name: "bare url is autolinked",
+			in:   "see https://example.com/a?x=1&y=2 now",
+			want: "see <a href=\"https://example.com/a?x=1&amp;y=2\">https://example.com/a?x=1&amp;y=2</a> now",
+		},
+		{
+			name: "www url is autolinked over https",
+			in:   "visit www.example.com.",
+			want: "visit <a href=\"https://www.example.com\">www.example.com</a>.",
+		},
+		{
+			name: "trailing paren is not part of the url",
+			in:   "(see https://example.com/a)",
+			want: "(see <a href=\"https://example.com/a\">https://example.com/a</a>)",
+		},
+		{
+			name: "email is autolinked as mailto",
+			in:   "mail alice@example.com please",
+			want: "mail <a href=\"mailto:alice@example.com\">alice@example.com</a> please",
+		},
+		{
+			name: "disallowed scheme is left as text",
+			in:   "[bad](javascript:alert(1))",
+			want: "[bad](javascript:alert(1))",
+		},
+		{
+			name: "relative target is left as text",
+			in:   "[rel](/local/path)",
+			want: "[rel](/local/path)",
+		},
+		{
+			name: "emphasis inside link label",
+			in:   "**bold [link](https://example.com) in bold**",
+			want: "<strong>bold <a href=\"https://example.com\">link</a> in bold</strong>",
+		},
+
+		// Escapes, maths, and things deliberately left alone
+		{
+			name: "backslash escapes suppress emphasis",
+			in:   "\\*not bold\\* \\_keep\\_",
+			want: "*not bold* _keep_",
+		},
+		{
+			name: "emphasis does not reach inside code",
+			in:   "`a_b_c` and _real_",
+			want: "<code>a_b_c</code> and <em>real</em>",
+		},
+		{
+			name: "money is not treated as maths",
+			in:   "cost $5 and $10",
+			want: "cost $5 and $10",
+		},
+		{
+			name: "inline latex becomes data-mx-maths",
+			in:   "math $\\frac{1}{2}$ here",
+			want: "math <span data-mx-maths=\"\\frac{1}{2}\"><code>\\frac{1}{2}</code></span> here",
+		},
+		{
+			name: "latex fence becomes block maths",
+			in:   "```latex\n\\frac{1}{2}\n```",
+			want: "<div data-mx-maths=\"\\frac{1}{2}\"><code>\\frac{1}{2}</code></div>",
+		},
+		{
+			name: "channel links and emoji shortcodes are left alone",
+			in:   "~channel-name and :smile:",
+			want: "~channel-name and :smile:",
 		},
 	}
 
