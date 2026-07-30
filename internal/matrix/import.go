@@ -53,6 +53,13 @@ type Importer struct {
 	// generatedCredentials accumulates passwords created during this run so the caller can
 	// persist them. Empty when the policy generates no passwords.
 	generatedCredentials []UserCredential
+
+	// knownMentionUsers holds the localparts of users this run knows exist, derived from the
+	// migration's user mapping. A nil map disables mention gating.
+	knownMentionUsers map[string]struct{}
+	// mentionExistsCache caches homeserver lookups for mention candidates outside the mapping,
+	// negative results included, so each distinct name costs at most one request per run.
+	mentionExistsCache map[string]bool
 }
 
 // NewImporter creates a new importer
@@ -147,11 +154,70 @@ func (i *Importer) normalizeMatrixMentions(message string) string {
 			continue
 		}
 
+		// Only rewrite names that resolve to a real user. Prose like "email without
+		// @example.com" is a valid mention shape but nobody's user ID.
+		if !i.mentionTargetExists(username) {
+			out.WriteString(message[idx:j])
+			idx = j
+			continue
+		}
+
 		out.WriteString(i.client.FormatUserID(username))
 		idx = j
 	}
 
 	return out.String()
+}
+
+// SetKnownMentionUsers records the users this run knows exist, taking them from a Mattermost
+// user ID -> Matrix user ID mapping, and switches mention gating on. Until it is called,
+// mentions are rewritten unconditionally.
+func (i *Importer) SetKnownMentionUsers(userMapping map[string]string) {
+	known := make(map[string]struct{}, len(userMapping))
+	for _, matrixUserID := range userMapping {
+		if localpart := mentionLocalpart(matrixUserID); localpart != "" {
+			known[localpart] = struct{}{}
+		}
+	}
+	i.knownMentionUsers = known
+	i.mentionExistsCache = make(map[string]bool)
+}
+
+// mentionTargetExists reports whether @username should become a Matrix mention. Users in the
+// migration's own mapping are known to exist. Anything else is checked against the homeserver
+// once and cached; a name that cannot be verified stays plain text, since a wrong pill corrupts
+// the message text while an unlinked @name still reads correctly.
+func (i *Importer) mentionTargetExists(username string) bool {
+	if i.knownMentionUsers == nil {
+		return true
+	}
+
+	localpart := strings.ToLower(username)
+	if _, ok := i.knownMentionUsers[localpart]; ok {
+		return true
+	}
+	if cached, ok := i.mentionExistsCache[localpart]; ok {
+		return cached
+	}
+
+	exists, err := i.client.UserExists(localpart)
+	if err != nil {
+		logger.Warn("Could not verify mention target '%s' (%v); leaving it as plain text", username, err)
+		exists = false
+	} else if !exists {
+		logger.Info("Mention target '%s' does not exist; leaving it as plain text", username)
+	}
+	i.mentionExistsCache[localpart] = exists
+	return exists
+}
+
+// mentionLocalpart extracts "alice" from "@alice:example.com".
+func mentionLocalpart(matrixUserID string) string {
+	localpart := strings.TrimPrefix(matrixUserID, "@")
+	if idx := strings.IndexByte(localpart, ':'); idx >= 0 {
+		localpart = localpart[:idx]
+	}
+	return strings.ToLower(localpart)
 }
 
 // renderMentions normalizes plain @username mentions to full Matrix IDs and renders the
@@ -1564,6 +1630,9 @@ func (i *Importer) ImportMessages(
 	total := len(posts)
 	logger.Info("Starting message import: %d posts to process", total)
 
+	// Gate @name rewriting on users that actually exist.
+	i.SetKnownMentionUsers(userMapping)
+
 	// Collect all existing mappings
 	for k, v := range existingMapping {
 		result.Mapping[k] = v
@@ -1704,6 +1773,9 @@ func (i *Importer) ImportMessagesWithFiles(
 
 	total := len(posts)
 	logger.Info("Starting message import with files: %d posts to process", total)
+
+	// Gate @name rewriting on users that actually exist.
+	i.SetKnownMentionUsers(userMapping)
 
 	// Default file config
 	if fileConfig == nil {
