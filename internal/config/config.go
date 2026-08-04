@@ -103,11 +103,16 @@ const (
 	// UserPasswordModeNone never sets a password. Users can only authenticate via SSO/MAS
 	// or an admin-initiated password reset.
 	UserPasswordModeNone = "none"
+	// UserPasswordModeLocalOnly generates a password only for users whose Mattermost account
+	// had no SSO provider (auth_service empty). Use it for a mixed workspace where most
+	// people sign in through the upstream IdP but a few local accounts have no identity
+	// there. Requires password login to be enabled on the homeserver or in MAS.
+	UserPasswordModeLocalOnly = "local_only"
 )
 
 // UserPasswordConfig controls password assignment for imported users.
 type UserPasswordConfig struct {
-	// Mode: "auto" (default), "random", or "none".
+	// Mode: "auto" (default), "random", "local_only", or "none".
 	Mode string `mapstructure:"mode"`
 	// Length of generated passwords. Default 24; valid range 12-128.
 	Length int `mapstructure:"length"`
@@ -388,11 +393,12 @@ func (c *Config) Validate() error {
 	}
 	// Validate user_password
 	switch c.Matrix.Import.UserPassword.Mode {
-	case "", UserPasswordModeAuto, UserPasswordModeRandom, UserPasswordModeNone:
+	case "", UserPasswordModeAuto, UserPasswordModeRandom, UserPasswordModeLocalOnly, UserPasswordModeNone:
 		// valid
 	default:
-		return fmt.Errorf("matrix.import.user_password.mode must be %q, %q, or %q, got %q",
-			UserPasswordModeAuto, UserPasswordModeRandom, UserPasswordModeNone, c.Matrix.Import.UserPassword.Mode)
+		return fmt.Errorf("matrix.import.user_password.mode must be %q, %q, %q, or %q, got %q",
+			UserPasswordModeAuto, UserPasswordModeRandom, UserPasswordModeLocalOnly,
+			UserPasswordModeNone, c.Matrix.Import.UserPassword.Mode)
 	}
 	if l := c.Matrix.Import.UserPassword.Length; l != 0 && (l < 12 || l > 128) {
 		return fmt.Errorf("matrix.import.user_password.length must be between 12 and 128, got %d", l)
@@ -467,16 +473,19 @@ func (c *Config) GetSpaceVisibility() string {
 	return s
 }
 
-// GetUserPasswordMode resolves matrix.import.user_password.mode to a concrete mode,
-// returning either UserPasswordModeRandom or UserPasswordModeNone.
+// GetUserPasswordMode resolves matrix.import.user_password.mode to a concrete mode:
+// UserPasswordModeRandom, UserPasswordModeLocalOnly, or UserPasswordModeNone.
 //
 // "auto" (the default) resolves to "none" when MAS is enabled, because those accounts
 // authenticate through SSO and a local password would be dead weight; otherwise it resolves
-// to "random".
+// to "random". "local_only" is passed through — it is the middle ground for a workspace
+// where only some users have an upstream identity.
 func (c *Config) GetUserPasswordMode() string {
 	switch c.Matrix.Import.UserPassword.Mode {
 	case UserPasswordModeRandom:
 		return UserPasswordModeRandom
+	case UserPasswordModeLocalOnly:
+		return UserPasswordModeLocalOnly
 	case UserPasswordModeNone:
 		return UserPasswordModeNone
 	default: // "" or "auto"

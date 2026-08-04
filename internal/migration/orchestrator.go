@@ -620,16 +620,27 @@ func (o *Orchestrator) ImportAssets(progress ProgressCallback) (*OperationResult
 
 	// Resolve how new users get a password ("auto" -> none when MAS handles authentication).
 	passwordMode := matrix.PasswordModeRandom
-	if o.config.GetUserPasswordMode() == config.UserPasswordModeNone {
+	switch o.config.GetUserPasswordMode() {
+	case config.UserPasswordModeNone:
 		passwordMode = matrix.PasswordModeNone
+	case config.UserPasswordModeLocalOnly:
+		passwordMode = matrix.PasswordModeLocalOnly
 	}
 	importer.SetPasswordPolicy(matrix.PasswordPolicy{
 		Mode:   passwordMode,
 		Length: o.config.GetUserPasswordLength(),
 	})
-	if passwordMode == matrix.PasswordModeNone {
+	switch passwordMode {
+	case matrix.PasswordModeNone:
 		logger.Info("User import: creating users without a password (SSO/MAS or admin reset required)")
-	} else {
+	case matrix.PasswordModeLocalOnly:
+		logger.Info("User import: generating a random %d-character password only for users without SSO in Mattermost; everyone else signs in through the upstream provider",
+			o.config.GetUserPasswordLength())
+		if o.config.Matrix.MAS.Enabled {
+			logger.Warn("User import: user_password.mode is %q with MAS enabled - password login must be enabled in MAS (passwords.enabled: true), otherwise set-password returns 403 and those accounts end up unreachable",
+				config.UserPasswordModeLocalOnly)
+		}
+	default:
 		logger.Info("User import: generating a random %d-character password per user", o.config.GetUserPasswordLength())
 	}
 

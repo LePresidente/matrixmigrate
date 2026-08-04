@@ -79,3 +79,51 @@ func TestDefaultPasswordPolicyGeneratesRandom(t *testing.T) {
 		t.Fatal("default policy produced an empty password")
 	}
 }
+
+func TestPasswordPolicyGenerateFor(t *testing.T) {
+	tests := []struct {
+		name        string
+		mode        PasswordMode
+		authService string
+		wantPass    bool
+	}{
+		{"random ignores auth_service for local account", PasswordModeRandom, "", true},
+		{"random ignores auth_service for SSO account", PasswordModeRandom, "gitlab", true},
+		{"none never generates", PasswordModeNone, "", false},
+		{"local_only generates for local account", PasswordModeLocalOnly, "", true},
+		{"local_only skips gitlab SSO", PasswordModeLocalOnly, "gitlab", false},
+		{"local_only skips ldap SSO", PasswordModeLocalOnly, "ldap", false},
+		// Mattermost stores an unset auth_service as NULL, which the query coalesces to "";
+		// stray whitespace must not be mistaken for a provider name.
+		{"local_only treats whitespace as local", PasswordModeLocalOnly, "   ", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := PasswordPolicy{Mode: tt.mode, Length: DefaultPasswordLength}
+			pw, err := p.GenerateFor(tt.authService)
+			if err != nil {
+				t.Fatalf("GenerateFor(%q) returned error: %v", tt.authService, err)
+			}
+			if tt.wantPass && pw == "" {
+				t.Fatalf("mode %q, auth_service %q: expected a password, got none", tt.mode, tt.authService)
+			}
+			if !tt.wantPass && pw != "" {
+				t.Fatalf("mode %q, auth_service %q: expected no password, got %q", tt.mode, tt.authService, pw)
+			}
+		})
+	}
+}
+
+func TestPasswordPolicyGenerateLocalOnlyWithoutUser(t *testing.T) {
+	// Generate() has no user context, so local_only must not hand out a password by
+	// default — callers that care use GenerateFor.
+	p := PasswordPolicy{Mode: PasswordModeLocalOnly, Length: DefaultPasswordLength}
+	pw, err := p.Generate()
+	if err != nil {
+		t.Fatalf("Generate() returned error: %v", err)
+	}
+	if pw == "" {
+		t.Fatal("Generate() with local_only should behave as an unknown (local) user and generate")
+	}
+}

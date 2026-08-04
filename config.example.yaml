@@ -179,6 +179,12 @@ matrix:
       # "auto" (default) - no password when matrix.mas.enabled is true (accounts are
       #                    SSO-only), otherwise a random password per user.
       # "random"         - always generate a distinct random password per user.
+      # "local_only"     - generate one only for users whose Mattermost account had no SSO
+      #                    provider (auth_service empty), e.g. accounts created with mmctl.
+      #                    Everyone else signs in through the upstream IdP. Requires
+      #                    password login to be enabled on the homeserver, or in MAS
+      #                    (passwords.enabled: true) - MAS otherwise answers set-password
+      #                    with 403 and those accounts end up unreachable.
       # "none"           - never set a password; SSO or an admin-initiated reset only.
       mode: "auto"
       # Length of generated passwords. Default 24, valid range 12-128.

@@ -15,6 +15,8 @@ func TestGetUserPasswordModeAuto(t *testing.T) {
 		{"unset without MAS resolves to random", "", false, UserPasswordModeRandom},
 		{"explicit random wins over MAS", UserPasswordModeRandom, true, UserPasswordModeRandom},
 		{"explicit none without MAS", UserPasswordModeNone, false, UserPasswordModeNone},
+		{"local_only passes through with MAS", UserPasswordModeLocalOnly, true, UserPasswordModeLocalOnly},
+		{"local_only passes through without MAS", UserPasswordModeLocalOnly, false, UserPasswordModeLocalOnly},
 	}
 
 	for _, tt := range tests {
@@ -51,6 +53,7 @@ func TestValidateUserPassword(t *testing.T) {
 	}{
 		{"defaults are valid", "", 0, false},
 		{"random with valid length", UserPasswordModeRandom, 24, false},
+		{"local_only accepted", UserPasswordModeLocalOnly, 24, false},
 		{"bad mode rejected", "shared", 24, true},
 		{"length below minimum rejected", UserPasswordModeRandom, 11, true},
 		{"length above maximum rejected", UserPasswordModeRandom, 129, true},

@@ -176,7 +176,7 @@ Under `matrix.import` in `config.yaml` you can set:
 | `import_direct_messages` | `false` | Export and import Mattermost **direct message** channels (D type) as Matrix DMs. Rooms appear under **People** for both users. See [Direct messages import](#direct-messages-import) below. |
 | `space_visibility` | `invite_only` | Visibility of Matrix spaces created from Mattermost teams. **`invite_only`**: spaces are private (recommended; matches Mattermost team behaviour). **`public`**: spaces are publicly joinable. **`from_mattermost`**: derive per team from its type (`O` → public, `I` → invite-only). |
 | `fallback_room_creator` | — | Matrix username (**localpart only**, e.g. `admin` for `@admin:domain`) used as room creator when the Mattermost channel has an empty `creator_id`, or when the real creator is a locked/deactivated account. If the user does not exist, the admin account from `auth.username` is used instead. Only meaningful with `preserve_owner_and_alias: true`. |
-| `user_password.mode` | `auto` | How imported users get a password. **`auto`**: no password when `matrix.mas.enabled` is true (accounts are SSO-only), a random password otherwise. **`random`**: always generate a distinct random password per user. **`none`**: never set a password. |
+| `user_password.mode` | `auto` | How imported users get a password. **`auto`**: no password when `matrix.mas.enabled` is true (accounts are SSO-only), a random password otherwise. **`random`**: always generate a distinct random password per user. **`local_only`**: generate one only for users whose Mattermost account had no SSO provider (`auth_service` empty) — see [Mixed workspaces](#mixed-workspaces-mode-local_only). **`none`**: never set a password. |
 | `user_password.length` | `24` | Length of generated passwords. Valid range 12–128. |
 | `user_password.write_file` | `true` | Write generated passwords to `<assets_dir>/user-passwords-<timestamp>.csv` (mode `0600`) so they can be distributed. Set `false` to discard them. |
 
@@ -187,6 +187,33 @@ or default password.
 
 With `mode: "auto"` and MAS enabled — the common setup — **no password is set at all**. Those
 accounts authenticate through SSO, so a local password would only widen the attack surface.
+
+##### Mixed workspaces: `mode: "local_only"`
+
+`auto` and `random` are all-or-nothing, which does not fit a workspace where most people sign
+in through an upstream provider but a handful of accounts were created locally (for example
+with `mmctl`). `auto` leaves those local accounts with no way in at all; `random` hands every
+SSO user an unused second login and puts the whole workforce's credentials in one file.
+
+`mode: "local_only"` generates a password only for users whose Mattermost account had no SSO
+provider — that is, where `users.auth_service` is empty:
+
+```yaml
+matrix:
+  import:
+    user_password:
+      mode: "local_only"
+```
+
+Two things to check before relying on it:
+
+- **Password login must actually be enabled** on the homeserver, or in MAS
+  (`passwords.enabled: true`). MAS answers `set-password` with `403 Password auth is
+  disabled` otherwise, and that is logged at info level only — the run reports success while
+  the affected accounts stay unreachable.
+- **Re-run `export assets`.** `auth_service` is a field added to the exported asset JSON; an
+  export taken with an older build does not carry it, and every user would then look local
+  and be given a password.
 
 When passwords *are* generated and `write_file` is true, they are written to
 `data/assets/user-passwords-<timestamp>.csv`:
@@ -574,6 +601,73 @@ export MAS_CLIENT_SECRET="your-mas-admin-client-secret"
 ```
 
 When MAS is enabled, **user import** (e.g. `import assets`) creates users via the MAS Admin API and sets a temporary password; all other steps (spaces, rooms, memberships, messages) still use the Synapse API as before.
+
+### Two MAS settings that fail silently
+
+Both of these let a migration finish and report success while leaving accounts nobody can log
+into. Verify them on a single throwaway account **before** the real run, not after.
+
+#### `claims_imports.localpart.on_conflict` must not be `fail`
+
+Creating users ahead of time is the entire point of MAS support, but by default MAS refuses to
+attach an upstream identity to a localpart that already exists — and `fail` is the default. The
+migration would create every account correctly, and every SSO login afterwards would be
+rejected. On the upstream provider:
+
+```yaml
+upstream_oauth2:
+  providers:
+    - # ...
+      claims_imports:
+        localpart:
+          action: force
+          on_conflict: add     # default is "fail"
+```
+
+`add` links the upstream account to the existing user; `set` does the same but only when no
+other link exists for that provider. See
+[Configure an upstream SSO provider](https://element-hq.github.io/matrix-authentication-service/setup/sso.html).
+
+**Test it**: pre-create the localpart of one account you control that has never signed in,
+then sign in with it via SSO.
+
+```bash
+TOKEN=$(curl -s -u "$MAS_CLIENT_ID:$MAS_CLIENT_SECRET" \
+  -d grant_type=client_credentials -d scope=urn:mas:admin \
+  "$MAS_URL/oauth2/token" | jq -r .access_token)
+
+curl -s -X POST "$MAS_URL/api/admin/v1/users" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/vnd.api+json" \
+  -d '{"username":"ssotest"}' | jq
+```
+
+#### `passwords.enabled` must be true if any password is generated
+
+Only relevant when `user_password.mode` generates passwords at all (`random` or
+`local_only`). If MAS is OIDC-only, `set-password` returns `403 Password auth is disabled`,
+which the client logs at info level and carries on — so the generated-passwords CSV would
+list credentials that were never set.
+
+Password login and SSO are independent switches in MAS and can both be on; users then see a
+password form alongside the provider button, instead of being redirected straight to the
+provider.
+
+**Test it**: set a password on a throwaway account and check the status code.
+
+```bash
+ULID=$(curl -s -X POST "$MAS_URL/api/admin/v1/users" \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/vnd.api+json" \
+  -d '{"username":"pwtest"}' | jq -r .data.id)
+
+curl -s -o /dev/null -w 'HTTP %{http_code}\n' \
+  -X POST "$MAS_URL/api/admin/v1/users/$ULID/set-password" \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/vnd.api+json" \
+  -d '{"password":"a-24-character-test-pass"}'
+```
+
+`200` is fine; `403` means the setting is missing. Then actually sign in with it, and remove
+both test accounts afterwards (see the Swagger UI at `$MAS_URL/api/doc/`).
 
 ---
 

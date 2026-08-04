@@ -21,6 +21,16 @@ type User struct {
 	UpdateAt  int64     `json:"update_at" db:"updateat"`
 	DeleteAt  int64     `json:"delete_at" db:"deleteat"`
 	Roles     string    `json:"roles" db:"roles"`
+	// AuthService names the SSO provider Mattermost authenticates this user against
+	// ("gitlab", "ldap", "saml", ...). Empty means a local account with a Mattermost
+	// password, which is the only kind that needs a password on the Matrix side.
+	AuthService string `json:"auth_service" db:"authservice"`
+}
+
+// HasSSO reports whether the user signs in through an external provider rather than a
+// local Mattermost password.
+func (u *User) HasSSO() bool {
+	return strings.TrimSpace(u.AuthService) != ""
 }
 
 // IsDeleted returns true if the user is deleted

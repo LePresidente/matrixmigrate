@@ -336,9 +336,10 @@ func (i *Importer) ImportUsers(users []mattermost.User, existingMapping map[stri
 			displayName = user.Username
 		}
 
-		// An empty password means "do not set one" (PasswordModeNone); the account is then
-		// reachable only via SSO/MAS or an admin reset.
-		password, err := i.passwordPolicy.Generate()
+		// An empty password means "do not set one" (PasswordModeNone, or PasswordModeLocalOnly
+		// for a user who had SSO in Mattermost); the account is then reachable only via
+		// SSO/MAS or an admin reset.
+		password, err := i.passwordPolicy.GenerateFor(user.AuthService)
 		if err != nil {
 			logger.Error("Failed to generate password for user '%s': %v", user.Username, err)
 			stats.UsersFailed++

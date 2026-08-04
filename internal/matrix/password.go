@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"fmt"
 	"math/big"
+	"strings"
 )
 
 // PasswordMode controls whether imported users get a generated password.
@@ -15,6 +16,10 @@ const (
 	// PasswordModeNone creates users without a password, so they can only authenticate
 	// through SSO/MAS or an admin-initiated reset.
 	PasswordModeNone PasswordMode = "none"
+	// PasswordModeLocalOnly generates a password only for users who had no SSO provider in
+	// Mattermost. Everyone else signs in through the upstream provider, where a local
+	// password would go unused and only widen the attack surface.
+	PasswordModeLocalOnly PasswordMode = "local_only"
 )
 
 // Password length bounds. The minimum is well above what a shared-secret migration needs;
@@ -44,9 +49,27 @@ func DefaultPasswordPolicy() PasswordPolicy {
 // Generate returns the password for one user. It returns an empty string (and no error)
 // when the policy is PasswordModeNone, so callers can pass the result straight through to
 // CreateUserRequest.Password, where empty means "do not set a password".
+//
+// PasswordModeLocalOnly needs to know which user it is deciding for, which Generate cannot
+// know; it therefore assumes a local account and generates. That errs toward a usable
+// account rather than an unreachable one. Callers with a user in hand should use GenerateFor.
 func (p PasswordPolicy) Generate() (string, error) {
-	if p.Mode == PasswordModeNone {
+	return p.GenerateFor("")
+}
+
+// GenerateFor returns the password for one user, given the Mattermost auth_service they
+// were authenticated against ("" for a local account, "gitlab"/"ldap"/... for SSO).
+//
+// Only PasswordModeLocalOnly looks at authService; the other modes ignore it, so callers
+// can use this unconditionally.
+func (p PasswordPolicy) GenerateFor(authService string) (string, error) {
+	switch p.Mode {
+	case PasswordModeNone:
 		return "", nil
+	case PasswordModeLocalOnly:
+		if strings.TrimSpace(authService) != "" {
+			return "", nil
+		}
 	}
 	length := p.Length
 	if length == 0 {

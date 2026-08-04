@@ -50,7 +50,8 @@ func (c *Client) GetUsers() ([]User, error) {
 			COALESCE(locale, 'en') as locale,
 			COALESCE(timezone::text, '{}') as timezone,
 			createat, updateat, deleteat,
-			COALESCE(roles, '') as roles
+			COALESCE(roles, '') as roles,
+			COALESCE(authservice, '') as authservice
 		FROM users
 		ORDER BY createat ASC
 	`
@@ -69,7 +70,7 @@ func (c *Client) GetUsers() ([]User, error) {
 			&u.FirstName, &u.LastName, &u.Nickname,
 			&u.Position, &u.Locale, &u.Timezone,
 			&u.CreateAt, &u.UpdateAt, &u.DeleteAt,
-			&u.Roles,
+			&u.Roles, &u.AuthService,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan user: %w", err)
