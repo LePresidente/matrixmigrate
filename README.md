@@ -8,6 +8,7 @@ A CLI tool for migrating from Mattermost to Matrix Synapse with multi-step, resu
 
 - **Multi-step Migration**: Migrate users, teams, channels, and memberships in organized steps
 - **SSH Tunnel Support**: Securely connect to remote servers via SSH port forwarding
+- **Direct Mode**: Skip SSH entirely when the database and Matrix API are already reachable
 - **Flexible SSH Authentication**: Support for both SSH key and password-based authentication
 - **Auto-discovery**: Automatically reads Mattermost database credentials from `config.json`
 - **Flexible Matrix Auth**: Login with username/password or use existing admin token
@@ -49,6 +50,42 @@ make build
    ```
 
 2. Edit `config.yaml` with your server details:
+
+### Direct mode (no SSH)
+
+Each side decides independently whether to use SSH, based on whether `ssh.host` is set.
+Leave the `ssh` block empty and the tool connects directly instead of forwarding a port:
+
+```yaml
+mattermost:
+  ssh: {}          # connect straight to the database
+  database:        # required: with no SSH there is no remote config.json to read
+    host: "127.0.0.1"
+    port: 5432
+    name: "mattermost"
+    user: "mmuser"
+    password_env: "MM_DB_PASSWORD"
+
+matrix:
+  ssh: {}          # talk to api.base_url instead of a tunnel
+  api:
+    base_url: "https://matrix.example.com"
+    admin_token_env: "MATRIX_ADMIN_TOKEN"
+  homeserver: "example.com"
+```
+
+Use it when:
+
+- the homeserver sits behind an **HTTPS ingress** (Kubernetes/Helm, reverse proxy). There is
+  no host where Synapse listens on `127.0.0.1:8008`, so there is nothing to tunnel to.
+- matrixmigrate runs **on the server itself**, or against a **database dump restored
+  locally** — which also keeps trial runs off the production database.
+
+The two sides are independent: SSH into the Mattermost server while reaching Matrix over its
+public URL is a valid combination.
+
+Note that `mattermost.database` is not optional in direct mode. Credential auto-discovery
+reads `config.json` over SSH, so with no SSH host it cannot run.
 
 ### SSH Key Authentication (Recommended)
 

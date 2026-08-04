@@ -301,7 +301,7 @@ func (c *Config) Validate() error {
 		}
 	}
 
-	// Validate Matrix config if SSH host is provided
+	// Validate Matrix SSH config if SSH host is provided
 	if c.Matrix.SSH.Host != "" {
 		if c.Matrix.SSH.User == "" {
 			return fmt.Errorf("matrix.ssh.user is required")
@@ -312,15 +312,19 @@ func (c *Config) Validate() error {
 		if !hasKey && !hasPassword {
 			return fmt.Errorf("matrix.ssh: either key_path or password_env is required")
 		}
-		if c.Matrix.Homeserver == "" {
-			return fmt.Errorf("matrix.homeserver is required")
-		}
+	}
+
+	// Validate Matrix API access whenever a homeserver is configured. This has to hold in
+	// direct mode too, where matrix.ssh is empty and the API is reached over its base_url.
+	if c.Matrix.Homeserver != "" {
 		// Check that either auth or admin token is provided
 		hasAuth := c.Matrix.Auth.Username != "" && c.Matrix.Auth.PasswordEnv != ""
 		hasToken := c.Matrix.API.AdminTokenEnv != ""
 		if !hasAuth && !hasToken {
 			return fmt.Errorf("matrix: either auth (username/password_env) or api.admin_token_env is required")
 		}
+	} else if c.Matrix.SSH.Host != "" {
+		return fmt.Errorf("matrix.homeserver is required")
 	}
 
 	// Validate public_room_join_rules

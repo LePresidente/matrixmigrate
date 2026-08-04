@@ -15,6 +15,11 @@ debug: false
 
 # Mattermost server configuration
 mattermost:
+  # Leave `ssh` empty to use direct mode: the database is reached from this machine
+  # without a tunnel. Use it when matrixmigrate runs on the Mattermost server itself, or
+  # against a dump restored locally. Combine with a manual `database` block below, since
+  # there is then no remote config.json to read credentials from.
+  #   ssh: {}
   ssh:
     host: "mattermost.example.com"
     port: 22
@@ -78,6 +83,10 @@ mattermost:
 
 # Matrix Synapse server configuration
 matrix:
+  # Leave `ssh` empty to use direct mode: the Matrix API is reached over `api.base_url`
+  # without a tunnel. This is the normal setup for a homeserver behind an HTTPS ingress
+  # (Kubernetes/Helm), where nothing listens on 127.0.0.1:8008 to forward to.
+  #   ssh: {}
   ssh:
     host: "matrix.example.com"
     port: 22
@@ -316,3 +325,57 @@ data:
 #     username: "admin"
 #     password_env: "MATRIX_ADMIN_PASSWORD"
 #   homeserver: "company.com"
+
+
+# Example 4: GitLab-bundled Mattermost -> Element Server Suite (no SSH on either side)
+# ------------------------------------------------------------------------------------
+# GitLab Omnibus keeps Mattermost's PostgreSQL on a unix socket and writes a DataSource
+# that the config.json parser cannot read, so dump the database and point the tool at the
+# restored copy with a manual `database` block. ESS on Kubernetes has no host to tunnel
+# through, so the Matrix side talks to the ingress directly.
+#
+#   # on the GitLab host, at the same time as the file copy:
+#   sudo -u gitlab-psql /opt/gitlab/embedded/bin/pg_dump \
+#     -h /var/opt/gitlab/postgresql mattermost_production > mm.sql
+#   sudo tar czf mm-data.tgz -C /var/opt/gitlab/mattermost data
+#
+# mattermost:
+#   ssh: {}                                  # direct mode
+#   database:
+#     host: "127.0.0.1"
+#     port: 5433                             # throwaway PostgreSQL holding the dump
+#     name: "mattermost_production"
+#     user: "postgres"
+#     password_env: "MM_DB_PASSWORD"
+#   files:
+#     mode: "upload"
+#     local_data_path: "/srv/migration/data" # local copy of /var/opt/gitlab/mattermost/data
+#     max_upload_size_mb: 50                 # must not exceed Synapse max_upload_size
+#
+# matrix:
+#   ssh: {}                                  # direct mode
+#   api:
+#     base_url: "https://matrix.company.com"
+#     admin_token_env: "MATRIX_ADMIN_TOKEN"
+#   homeserver: "company.com"
+#   appservice:
+#     enabled: true                          # needed for timestamps and DMs
+#     as_token_env: "MATRIX_AS_TOKEN"
+#   mas:
+#     enabled: true
+#     endpoint: "https://account.company.com"
+#     client_id_env: "MAS_CLIENT_ID"
+#     client_secret_env: "MAS_CLIENT_SECRET"
+#   import:
+#     force_join: true
+#     import_direct_messages: true
+#     preserve_owner_and_alias: true
+#     user_password:
+#       mode: "local_only"                   # only accounts without SSO get a password
+#
+# Server side, none of which this tool can do for you:
+#   - a MAS admin OAuth client with scope urn:mas:admin
+#   - claims_imports.localpart.on_conflict: add on the upstream provider, otherwise a
+#     pre-created account can never complete an SSO login (the default is "fail")
+#   - passwords.enabled: true in MAS, if user_password.mode generates any password
+#   - the Application Service registered in Synapse, with an exclusive alias namespace
