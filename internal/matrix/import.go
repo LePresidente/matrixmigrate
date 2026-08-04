@@ -1229,20 +1229,26 @@ func (i *Importer) ImportDirectChannelsAsDMs(
 			stats.RoomsSkipped++
 			continue
 		}
-		if creatorMX == otherMX {
-			logger.Debug("ImportDirectChannelsAsDMs: channel %s same user for both sides, skipping", channel.ID)
-			stats.RoomsSkipped++
-			continue
-		}
+		// Both sides equal is a self-DM (Mattermost notes to self), not an error: it gets
+		// its own room with the user as sole member.
+		selfDM := creatorMX == otherMX
 
 		resp, err := i.client.CreateDirectRoom(creatorMX, otherMX)
 		if err != nil {
-			logger.Error("ImportDirectChannelsAsDMs: failed to create DM for channel %s (%s <-> %s): %v", channel.ID, creatorMX, otherMX, err)
+			if selfDM {
+				logger.Error("ImportDirectChannelsAsDMs: failed to create self-DM for channel %s (%s): %v", channel.ID, creatorMX, err)
+			} else {
+				logger.Error("ImportDirectChannelsAsDMs: failed to create DM for channel %s (%s <-> %s): %v", channel.ID, creatorMX, otherMX, err)
+			}
 			stats.RoomsFailed++
 			continue
 		}
 
-		logger.Success("ImportDirectChannelsAsDMs: created DM %s for channel %s (%s <-> %s)", resp.RoomID, channel.ID, creatorMX, otherMX)
+		if selfDM {
+			logger.Success("ImportDirectChannelsAsDMs: created self-DM %s for channel %s (%s)", resp.RoomID, channel.ID, creatorMX)
+		} else {
+			logger.Success("ImportDirectChannelsAsDMs: created DM %s for channel %s (%s <-> %s)", resp.RoomID, channel.ID, creatorMX, otherMX)
+		}
 		mapping[channel.ID] = resp.RoomID
 		stats.RoomsCreated++
 	}

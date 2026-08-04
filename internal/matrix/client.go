@@ -778,14 +778,25 @@ func (c *Client) CreateRegularRoom(name, topic string, public bool, roomAliasLoc
 // Room is created as creatorUserID (using AS when available) so it shows under "People" for both.
 // Sets m.direct account_data for both users so clients show the room as a DM.
 // When force_join is true, the admin is temporarily invited (as creator), joins to force-join the other user, then leaves so only the two users remain.
+//
+// A self-DM (Mattermost notes to self) has both sides equal. createRoom rejects an invite
+// listing the creator's own ID, so the invite is left empty and there is nobody to join:
+// the creator is already a member, and m.direct is keyed by their own ID.
 func (c *Client) CreateDirectRoom(creatorUserID, otherUserID string) (*CreateRoomResponse, error) {
+	selfDM := creatorUserID == otherUserID
+
 	req := &CreateRoomRequest{
 		Preset:     string(PresetTrustedPrivateChat),
 		Visibility: string(VisibilityPrivate),
 		IsDirect:   true,
 		Invite:     []string{otherUserID},
 	}
-	logger.Info("CreateDirectRoom: creator=%s other=%s (is_direct=true)", creatorUserID, otherUserID)
+	if selfDM {
+		req.Invite = nil
+		logger.Info("CreateDirectRoom: self-DM for %s (is_direct=true)", creatorUserID)
+	} else {
+		logger.Info("CreateDirectRoom: creator=%s other=%s (is_direct=true)", creatorUserID, otherUserID)
+	}
 	resp, err := c.CreateRoomAsUser(req, creatorUserID)
 	if errors.Is(err, ErrCreateRoomTimeout) {
 		// A DM has no alias to resolve, so look for the room by its membership before trying
@@ -801,6 +812,14 @@ func (c *Client) CreateDirectRoom(creatorUserID, otherUserID string) (*CreateRoo
 	}
 	if err != nil {
 		return nil, fmt.Errorf("create DM room: %w", err)
+	}
+
+	if selfDM {
+		// No second participant to force-join or invite.
+		if err := c.setDirectRoomForUser(creatorUserID, creatorUserID, resp.RoomID); err != nil {
+			logger.Warn("CreateDirectRoom: failed to set m.direct for self-DM of %s: %v", creatorUserID, err)
+		}
+		return resp, nil
 	}
 	// Ensure other user is in the room. When force_join: room is invite-only so admin cannot join directly.
 	// Have creator invite admin, admin joins, force-join other, then admin leaves.
