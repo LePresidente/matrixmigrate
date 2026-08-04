@@ -18,6 +18,26 @@ import (
 	"github.com/aligundogdu/matrixmigrate/internal/logger"
 )
 
+// mediaUploadHTTPTimeout caps how long to wait for a Matrix media upload (request body plus
+// response headers). The shared client's 30s default is far too low for large attachments.
+const mediaUploadHTTPTimeout = 45 * time.Minute
+
+// uploadResponseSnippet abbreviates a non-JSON or error upload body for logs, since proxies
+// in front of the homeserver commonly answer with an HTML or plain-text page.
+func uploadResponseSnippet(b []byte, max int) string {
+	b = bytes.TrimSpace(b)
+	if len(b) == 0 {
+		return "(empty body)"
+	}
+	s := string(b)
+	s = strings.ReplaceAll(s, "\r\n", " ")
+	s = strings.ReplaceAll(s, "\n", " ")
+	if len(s) > max {
+		return s[:max] + "..."
+	}
+	return s
+}
+
 // RateLimitConfig holds rate limiting settings
 type RateLimitConfig struct {
 	RequestsPerSecond float64       // Max requests per second (0 = no limit)
@@ -1939,7 +1959,11 @@ func (c *Client) UploadMedia(data []byte, filename, contentType string) (*Upload
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", contentType)
 
-	resp, err := c.httpClient.Do(req)
+	// The shared client's 30s timeout covers Admin API calls, not media bodies: a large
+	// attachment over a slow link needs far longer, and the deadline covers the whole
+	// request including the upload itself.
+	uploadClient := &http.Client{Timeout: mediaUploadHTTPTimeout}
+	resp, err := uploadClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("upload request failed: %w", err)
 	}
@@ -1950,13 +1974,24 @@ func (c *Client) UploadMedia(data []byte, filename, contentType string) (*Upload
 		return nil, fmt.Errorf("failed to read upload response: %w", err)
 	}
 
-	var result UploadMediaResponse
-	if err := json.Unmarshal(body, &result); err != nil {
-		return nil, fmt.Errorf("failed to parse upload response: %w", err)
+	// Check the status before unmarshalling. A reverse proxy in front of the homeserver
+	// answers 413 or 502 with an HTML page, and parsing that first would report a JSON
+	// error instead of the status that actually explains the failure.
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		var errResp UploadMediaResponse
+		if json.Unmarshal(body, &errResp) == nil && (errResp.Errcode != "" || errResp.Error != "") {
+			return nil, fmt.Errorf("upload failed (%d): %s - %s", resp.StatusCode, errResp.Errcode, errResp.Error)
+		}
+		return nil, fmt.Errorf("upload failed (HTTP %d), non-JSON body: %s", resp.StatusCode, uploadResponseSnippet(body, 400))
 	}
 
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("upload failed (%d): %s - %s", resp.StatusCode, result.Errcode, result.Error)
+	body = bytes.TrimSpace(body)
+	var result UploadMediaResponse
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, fmt.Errorf("upload HTTP %d but invalid JSON: %w; body: %s", resp.StatusCode, err, uploadResponseSnippet(body, 400))
+	}
+	if strings.TrimSpace(result.ContentURI) == "" {
+		return nil, fmt.Errorf("upload missing content_uri in JSON: %s", uploadResponseSnippet(body, 400))
 	}
 
 	return &result, nil
