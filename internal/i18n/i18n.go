@@ -40,6 +40,7 @@ type MenuStrings struct {
 	ImportMemberships string `yaml:"import_memberships"`
 	ExportMessages    string `yaml:"export_messages"`
 	ImportMessages    string `yaml:"import_messages"`
+	LeaveRooms        string `yaml:"leave_rooms"`
 	TestConnection    string `yaml:"test_connection"`
 	TestMattermost    string `yaml:"test_mattermost"`
 	TestMatrix        string `yaml:"test_matrix"`
@@ -68,6 +69,7 @@ type ProgressStrings struct {
 	CreatingRooms        string `yaml:"creating_rooms"`
 	ApplyingMemberships  string `yaml:"applying_memberships"`
 	LinkingRooms         string `yaml:"linking_rooms"`
+	LeavingRooms         string `yaml:"leaving_rooms"`
 	SavingFile           string `yaml:"saving_file"`
 	LoadingFile          string `yaml:"loading_file"`
 	Completed            string `yaml:"completed"`
@@ -358,6 +360,8 @@ func getProgressString(l *Locale, key string) string {
 		return l.Progress.ApplyingMemberships
 	case "linking_rooms":
 		return l.Progress.LinkingRooms
+	case "leaving_rooms":
+		return l.Progress.LeavingRooms
 	case "saving_file":
 		return l.Progress.SavingFile
 	case "loading_file":

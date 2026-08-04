@@ -132,6 +132,11 @@ type OperationResult struct {
 	MembersSkipped             int
 	MembersFailed              int
 
+	// Leave-rooms stats
+	RoomsLeft        int
+	RoomsLeaveSkip   int
+	RoomsLeaveFailed int
+
 	// Output file
 	OutputFile string
 }
@@ -987,6 +992,94 @@ func (o *Orchestrator) ImportMemberships(progress ProgressCallback) (*OperationR
 
 	// Complete step
 	o.state.CompleteStep(StepImportMemberships, "")
+	return result, o.SaveState()
+}
+
+// LeaveRooms makes the migration admin leave every room and space from the asset mapping.
+//
+// This is a cleanup sweep, not part of the import chain: the import steps already leave
+// rooms inline after force-joining members, but they only log a warning when that fails,
+// which leaves the admin account inside private rooms and other people's DMs. Running this
+// at the end of a migration clears those leftovers, and it is safe to repeat.
+func (o *Orchestrator) LeaveRooms(progress ProgressCallback) (*OperationResult, error) {
+	result := &OperationResult{}
+
+	logger.Info("=== LeaveRooms Started ===")
+
+	if o.mxClient == nil {
+		logger.Error("Not connected to Matrix")
+		return nil, fmt.Errorf("not connected to Matrix")
+	}
+
+	canRun, reason := o.state.CanRunStep(StepLeaveRooms)
+	if !canRun {
+		logger.Error("Cannot run step: %s", reason)
+		return nil, fmt.Errorf("cannot run step: %s", reason)
+	}
+
+	mappingFile := o.state.GetStepOutputFile(StepImportAssets)
+	if mappingFile == "" {
+		logger.Error("No mapping file found from import assets step")
+		return nil, fmt.Errorf("no mapping file found from import assets step")
+	}
+	logger.Info("Using mapping file: %s", mappingFile)
+
+	o.state.StartStep(StepLeaveRooms)
+	if err := o.SaveState(); err != nil {
+		return nil, err
+	}
+
+	mapping, err := LoadMapping(mappingFile)
+	if err != nil {
+		logger.Error("Failed to load mapping: %v", err)
+		o.state.FailStep(StepLeaveRooms, err)
+		o.SaveState()
+		return nil, fmt.Errorf("failed to load mapping: %w", err)
+	}
+
+	// Rooms first, then spaces: a space is only left once its rooms are done, so a run
+	// interrupted midway does not leave the admin outside a space it still needs.
+	roomIDs := make([]string, 0, len(mapping.Channels)+len(mapping.Teams))
+	for _, roomID := range mapping.Channels {
+		roomIDs = append(roomIDs, roomID)
+	}
+	for _, spaceID := range mapping.Teams {
+		roomIDs = append(roomIDs, spaceID)
+	}
+	logger.Info("Leaving %d rooms and %d spaces", len(mapping.Channels), len(mapping.Teams))
+
+	importer := matrix.NewImporter(o.mxClient)
+
+	var importProgress matrix.ImportProgressCallback
+	if progress != nil {
+		importProgress = func(stage string, current, total int, item string) {
+			progress(stage, current, total, item)
+			o.state.UpdateStepProgress(StepLeaveRooms, current, total)
+		}
+	}
+
+	stats, err := importer.LeaveMigratedRooms(roomIDs, importProgress)
+	if err != nil {
+		logger.Error("Failed to leave rooms: %v", err)
+		o.state.FailStep(StepLeaveRooms, err)
+		o.SaveState()
+		return nil, fmt.Errorf("failed to leave rooms: %w", err)
+	}
+
+	result.RoomsLeft = stats.RoomsLeft
+	result.RoomsLeaveSkip = stats.RoomsLeaveSkip
+	result.RoomsLeaveFailed = stats.RoomsLeaveFail
+
+	logger.Info("=== LeaveRooms Completed ===")
+	logger.Info("Total: left=%d, already-out=%d, failed=%d",
+		result.RoomsLeft, result.RoomsLeaveSkip, result.RoomsLeaveFailed)
+	if result.RoomsLeaveFailed > 0 {
+		logger.Warn("The migration admin is still in %d room(s); re-run 'import leave-rooms' or remove it manually", result.RoomsLeaveFailed)
+	} else {
+		logger.Success("Migration admin left all migrated rooms and spaces")
+	}
+
+	o.state.CompleteStep(StepLeaveRooms, "")
 	return result, o.SaveState()
 }
 

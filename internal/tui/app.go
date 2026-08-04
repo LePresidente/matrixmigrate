@@ -24,6 +24,7 @@ const (
 	ViewImportMemberships
 	ViewExportMessages
 	ViewImportMessages
+	ViewLeaveRooms
 	ViewTestConnection
 	ViewStatus
 	ViewSettings
@@ -125,6 +126,7 @@ func (m *Model) createMenuItems() []MenuItem {
 	canImportMemberships, _ := state.CanRunStep(migration.StepImportMemberships)
 	canExportMessages, _ := state.CanRunStep(migration.StepExportMessages)
 	canImportMessages, _ := state.CanRunStep(migration.StepImportMessages)
+	canLeaveRooms, _ := state.CanRunStep(migration.StepLeaveRooms)
 
 	return []MenuItem{
 		{
@@ -162,6 +164,12 @@ func (m *Model) createMenuItems() []MenuItem {
 			Desc:     "Import messages to Matrix rooms",
 			View:     ViewImportMessages,
 			Disabled: !canImportMessages,
+		},
+		{
+			Title:    locale.Menu.LeaveRooms,
+			Desc:     "Leave all migrated rooms and spaces (cleanup)",
+			View:     ViewLeaveRooms,
+			Disabled: !canLeaveRooms,
 		},
 		{
 			Title: locale.Menu.TestConnection,
@@ -300,6 +308,8 @@ func (m *Model) handleViewChange(view View) tea.Cmd {
 		return m.runExportMemberships()
 	case ViewImportMemberships:
 		return m.runImportMemberships()
+	case ViewLeaveRooms:
+		return m.runLeaveRooms()
 	case ViewExportMessages:
 		return m.runExportMessages()
 	case ViewImportMessages:
@@ -332,7 +342,7 @@ func (m Model) View() string {
 		return m.renderSuccess()
 	case ViewTestConnection:
 		return m.renderTestConnection()
-	case ViewExportAssets, ViewImportAssets, ViewExportMemberships, ViewImportMemberships, ViewExportMessages, ViewImportMessages:
+	case ViewExportAssets, ViewImportAssets, ViewExportMemberships, ViewImportMemberships, ViewExportMessages, ViewImportMessages, ViewLeaveRooms:
 		return m.renderProgress()
 	default:
 		return m.renderMenu()
@@ -409,6 +419,8 @@ func (m Model) renderProgress() string {
 		title = locale.Menu.ExportMemberships
 	case ViewImportMemberships:
 		title = locale.Menu.ImportMemberships
+	case ViewLeaveRooms:
+		title = locale.Menu.LeaveRooms
 	case ViewExportMessages:
 		title = locale.Menu.ExportMessages
 	case ViewImportMessages:
@@ -490,6 +502,7 @@ func (m Model) renderStatus() string {
 		migration.StepImportAssets,
 		migration.StepExportMemberships,
 		migration.StepImportMemberships,
+		migration.StepLeaveRooms,
 	}
 
 	var rows string
@@ -878,6 +891,35 @@ func (m *Model) runImportMemberships() tea.Cmd {
 		}
 
 		return operationCompleteMsg{message: "Memberships imported successfully!", result: result}
+	}
+}
+
+func (m *Model) runLeaveRooms() tea.Cmd {
+	return func() tea.Msg {
+		sendProgress("Connecting to Matrix...", 0, 0, "")
+
+		// Connect if not already
+		if err := m.orchestrator.ConnectMatrix(); err != nil {
+			return operationCompleteMsg{err: err}
+		}
+
+		sendProgress("Leaving migrated rooms and spaces...", 0, 0, "")
+
+		progress := func(stage string, current, total int, item string) {
+			sendProgress(stage, current, total, item)
+		}
+
+		result, err := m.orchestrator.LeaveRooms(progress)
+		if err != nil {
+			return operationCompleteMsg{err: err}
+		}
+
+		msg := "Left all migrated rooms and spaces!"
+		if result.RoomsLeaveFailed > 0 {
+			msg = fmt.Sprintf("Left %d room(s), but %d could not be left - re-run this step or check the log.",
+				result.RoomsLeft, result.RoomsLeaveFailed)
+		}
+		return operationCompleteMsg{message: msg, result: result}
 	}
 }
 

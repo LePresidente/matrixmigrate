@@ -22,14 +22,15 @@ func formatETA(d time.Duration) string {
 }
 
 var importCmd = &cobra.Command{
-	Use:   "import [assets|memberships|messages]",
+	Use:   "import [assets|memberships|messages|leave-rooms]",
 	Short: "Import data to Matrix",
 	Long: `Import data to Matrix Synapse server.
 
 Available subcommands:
   assets       - Create users, spaces, and rooms in Matrix
   memberships  - Apply team and channel memberships in Matrix
-  messages     - Import all messages to Matrix rooms`,
+  messages     - Import all messages to Matrix rooms
+  leave-rooms  - Make the migration admin leave all migrated rooms and spaces`,
 }
 
 var importAssetsCmd = &cobra.Command{
@@ -59,12 +60,27 @@ Requires: appservice.enabled=true and MATRIX_AS_TOKEN env var`,
 	RunE: runImportMessages,
 }
 
+var importLeaveRoomsCmd = &cobra.Command{
+	Use:     "leave-rooms",
+	Aliases: []string{"leave_rooms"},
+	Short:   "Leave all migrated rooms and spaces",
+	Long: `Make the migration admin user leave every room and space created during migration.
+
+The import steps already leave rooms as they go, but a failed leave is only logged
+as a warning, which leaves the admin account inside private rooms and other users'
+direct messages. Run this after the migration to clear those leftovers.
+
+Safe to re-run: a room the admin is not in counts as already left.`,
+	RunE: runImportLeaveRooms,
+}
+
 var membershipsSkipCompleted bool
 
 func init() {
 	importCmd.AddCommand(importAssetsCmd)
 	importCmd.AddCommand(importMembershipsCmd)
 	importCmd.AddCommand(importMessagesCmd)
+	importCmd.AddCommand(importLeaveRoomsCmd)
 
 	// By default, re-running membership import re-applies against the latest snapshot so
 	// users who joined channels after the first run get added (force-join is idempotent for
@@ -273,6 +289,56 @@ func runImportMessages(cmd *cobra.Command, args []string) error {
 	}
 
 	printSuccess(i18n.T("messages.step_completed", "import_messages"))
+
+	return nil
+}
+
+func runImportLeaveRooms(cmd *cobra.Command, args []string) error {
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+
+	printInfo(i18n.T("messages.migration_started"))
+
+	// Create orchestrator
+	orch, err := migration.NewOrchestrator(cfg)
+	if err != nil {
+		return fmt.Errorf("failed to create orchestrator: %w", err)
+	}
+	defer orch.Close()
+
+	// Check prerequisites
+	state := orch.GetState()
+	canRun, reason := state.CanRunStep(migration.StepLeaveRooms)
+	if !canRun {
+		return fmt.Errorf("cannot run step: %s", reason)
+	}
+
+	// Connect to Matrix
+	printInfo(i18n.T("progress.connecting", "Matrix"))
+	if err := orch.ConnectMatrix(); err != nil {
+		return err
+	}
+	printSuccess(i18n.T("progress.connected", "Matrix"))
+
+	printInfo(i18n.T("progress.leaving_rooms"))
+	progress := func(stage string, current, total int, item string) {
+		if total > 0 {
+			printProgress("%s: %d/%d", stage, current, total)
+		} else {
+			printProgress("%s...", stage)
+		}
+	}
+
+	result, err := orch.LeaveRooms(progress)
+	if err != nil {
+		return err
+	}
+
+	printInfo(fmt.Sprintf("  Rooms: left=%d, already-out=%d, failed=%d",
+		result.RoomsLeft, result.RoomsLeaveSkip, result.RoomsLeaveFailed))
+	printSuccess(i18n.T("messages.step_completed", "leave_rooms"))
 
 	return nil
 }

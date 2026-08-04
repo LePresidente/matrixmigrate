@@ -1984,3 +1984,75 @@ func (i *Importer) ImportMessagesWithFiles(
 
 	return result, nil
 }
+
+// LeaveMigratedRooms makes the migration admin leave every room and space it created,
+// given the room and space IDs from the asset mapping.
+//
+// The import steps already leave rooms inline once force-join is done, but a failure there
+// is only logged as a warning, which leaves the admin sitting in a private room or someone
+// else's DM. This is the sweep for those leftovers, and it is safe to re-run: a room the
+// admin is not in counts as already left, not as an error.
+func (i *Importer) LeaveMigratedRooms(roomIDs []string, progress ImportProgressCallback) (*ImportStats, error) {
+	stats := &ImportStats{}
+	total := len(roomIDs)
+
+	logger.Info("LeaveMigratedRooms: processing %d rooms and spaces", total)
+
+	seen := make(map[string]struct{}, total)
+	processed := 0
+
+	for _, roomID := range roomIDs {
+		if roomID == "" {
+			continue
+		}
+		// A room can appear under several Mattermost IDs; leaving it twice would report a
+		// spurious failure on the second attempt.
+		if _, dup := seen[roomID]; dup {
+			continue
+		}
+		seen[roomID] = struct{}{}
+
+		processed++
+		if progress != nil {
+			progress("leave_rooms", processed, total, roomID)
+		}
+
+		err := i.client.LeaveRoom(roomID)
+		if err == nil {
+			logger.Debug("LeaveMigratedRooms: left %s", roomID)
+			stats.RoomsLeft++
+			continue
+		}
+		if isNotInRoomError(err) {
+			logger.Debug("LeaveMigratedRooms: not a member of %s, nothing to do", roomID)
+			stats.RoomsLeaveSkip++
+			continue
+		}
+		logger.Warn("LeaveMigratedRooms: failed to leave %s: %v", roomID, err)
+		stats.RoomsLeaveFail++
+	}
+
+	logger.Info("LeaveMigratedRooms completed: left=%d, already-out=%d, failed=%d",
+		stats.RoomsLeft, stats.RoomsLeaveSkip, stats.RoomsLeaveFail)
+
+	return stats, nil
+}
+
+// isNotInRoomError reports whether a leave failed only because the user was not in the
+// room to begin with, which for a cleanup sweep is the desired end state rather than an
+// error. Synapse answers M_FORBIDDEN for an unknown membership, so the message is matched
+// as well as the error code.
+func isNotInRoomError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(msg, "not in room"),
+		strings.Contains(msg, "not a member"),
+		strings.Contains(msg, "unknown room"),
+		strings.Contains(msg, "m_not_found"):
+		return true
+	}
+	return false
+}

@@ -264,6 +264,9 @@ When `import_direct_messages` is `true`:
 ./matrixmigrate export messages
 ./matrixmigrate import messages
 
+# Cleanup: admin leaves every migrated room and space
+./matrixmigrate import leave-rooms
+
 # Run with specific config
 ./matrixmigrate --config ./config.yaml export assets
 ```
@@ -334,6 +337,23 @@ The connection test provides detailed step-by-step diagnostics:
 | 2b | `import memberships` | Apply memberships in Matrix |
 | 3a | `export messages` | Export all messages from Mattermost |
 | 3b | `import messages` | Import messages to Matrix rooms (requires Application Service for timestamps) |
+| 4 | `import leave-rooms` | Optional cleanup: make the migration admin leave every migrated room and space |
+
+### Leaving migrated rooms
+
+The import steps already have the admin leave rooms as they go, but a failed leave is only
+logged as a warning. With `force_join` and `import_direct_messages` enabled the admin enters
+a great many rooms, so a few leftovers are normal — and each one means the migration admin
+sits in a private room or someone else's direct message indefinitely.
+
+```bash
+./matrixmigrate import leave-rooms
+```
+
+It walks every room and space in the asset mapping, so it needs `import_assets` to have
+completed but has no other dependency, and it is safe to repeat: a room the admin is not in
+counts as already left rather than as a failure. Run it once at the end of a migration and
+check the summary line for a non-zero failure count.
 
 ## Architecture
 
