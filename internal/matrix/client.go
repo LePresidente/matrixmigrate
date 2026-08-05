@@ -129,7 +129,10 @@ func NewClientWithRateLimit(baseURL, adminToken, homeserver string, rlConfig Rat
 		adminToken: adminToken,
 		homeserver: homeserver,
 		httpClient: &http.Client{
-			Timeout: 30 * time.Second,
+			// Synapse can take well over 30s to answer createRoom while an import is
+			// hammering it, and a client-side timeout there is expensive: the server
+			// finishes the create regardless, so the room exists but we never see its ID.
+			Timeout: 120 * time.Second,
 		},
 		rateLimit:      rateLimit,
 		maxRetries:     maxRetries,
@@ -237,6 +240,10 @@ func (c *Client) doRequestWithRetry(method, endpoint string, body interface{}, r
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
+		if shouldRetryRequestErr(err) && isNonIdempotent(method, endpoint) {
+			logger.Warn("Request transport error on %s; not retrying (room may have been created): %v", endpoint, err)
+			return nil, 0, fmt.Errorf("%w: %v", ErrCreateRoomTimeout, err)
+		}
 		if shouldRetryRequestErr(err) && retryCount < c.maxRetries {
 			retryAfter := retryDelay(c.retryBaseDelay, retryCount)
 			logger.Warn("Request transport error, retrying in %v (%d/%d): %v", retryAfter, retryCount+1, c.maxRetries, err)
@@ -489,6 +496,122 @@ func (c *Client) CreateRoomAsUser(req *CreateRoomRequest, creatorUserID string) 
 	return &resp, nil
 }
 
+// ResolveRoomAlias returns the room ID behind a full room alias (e.g. #general:example.com).
+func (c *Client) ResolveRoomAlias(alias string) (string, error) {
+	endpoint := "/_matrix/client/v3/directory/room/" + url.PathEscape(alias)
+	body, statusCode, err := c.doRequest("GET", endpoint, nil)
+	if err != nil {
+		return "", err
+	}
+
+	var resp struct {
+		RoomID  string `json:"room_id"`
+		Errcode string `json:"errcode"`
+		Error   string `json:"error"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return "", fmt.Errorf("failed to parse response: %w", err)
+	}
+	if statusCode != http.StatusOK || resp.RoomID == "" {
+		return "", fmt.Errorf("API error (%d): %s - %s", statusCode, resp.Errcode, resp.Error)
+	}
+	return resp.RoomID, nil
+}
+
+// recoverRoomByAlias finds the room behind roomAliasLocalPart after a create attempt failed in a
+// way that means the room may already exist. Returns nil when there is no alias to resolve or the
+// alias does not resolve, so the caller can surface the original error.
+func (c *Client) recoverRoomByAlias(roomAliasLocalPart string, cause error) *CreateRoomResponse {
+	if roomAliasLocalPart == "" || c.homeserver == "" {
+		return nil
+	}
+	alias := fmt.Sprintf("#%s:%s", roomAliasLocalPart, c.homeserver)
+	roomID, err := c.ResolveRoomAlias(alias)
+	if err != nil {
+		logger.Warn("recoverRoomByAlias: %s did not resolve after %v: %v", alias, cause, err)
+		return nil
+	}
+	logger.Info("recoverRoomByAlias: reusing existing room %s for alias %s (create reported: %v)", roomID, alias, cause)
+	return &CreateRoomResponse{RoomID: roomID}
+}
+
+// joinedRoomIDs lists the rooms userID has joined, asked as that user via the AS token.
+func (c *Client) joinedRoomIDs(userID string) ([]string, error) {
+	params := url.Values{}
+	params.Set("user_id", userID)
+	endpoint := "/_matrix/client/v3/joined_rooms?" + params.Encode()
+
+	body, statusCode, err := c.doRequestWithToken("GET", endpoint, nil, c.asToken)
+	if err != nil {
+		return nil, err
+	}
+	var resp struct {
+		JoinedRooms []string `json:"joined_rooms"`
+		Errcode     string   `json:"errcode"`
+		Error       string   `json:"error"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("failed to parse response: %w", err)
+	}
+	if statusCode != http.StatusOK {
+		return nil, fmt.Errorf("API error (%d): %s - %s", statusCode, resp.Errcode, resp.Error)
+	}
+	return resp.JoinedRooms, nil
+}
+
+// joinedMemberIDs lists the joined members of roomID, asked as userID via the AS token.
+func (c *Client) joinedMemberIDs(roomID, userID string) ([]string, error) {
+	params := url.Values{}
+	params.Set("user_id", userID)
+	endpoint := fmt.Sprintf("/_matrix/client/v3/rooms/%s/joined_members?%s", url.PathEscape(roomID), params.Encode())
+
+	body, statusCode, err := c.doRequestWithToken("GET", endpoint, nil, c.asToken)
+	if err != nil {
+		return nil, err
+	}
+	var resp struct {
+		Joined  map[string]interface{} `json:"joined"`
+		Errcode string                 `json:"errcode"`
+		Error   string                 `json:"error"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("failed to parse response: %w", err)
+	}
+	if statusCode != http.StatusOK {
+		return nil, fmt.Errorf("API error (%d): %s - %s", statusCode, resp.Errcode, resp.Error)
+	}
+	members := make([]string, 0, len(resp.Joined))
+	for id := range resp.Joined {
+		members = append(members, id)
+	}
+	return members, nil
+}
+
+// findDirectRoomByMembers looks for an existing two-person room holding exactly creatorUserID and
+// otherUserID. A DM carries no alias, so this membership scan is the only way to find a room that
+// a timed-out create left behind. Returns "" when there is no such room or no AS token to ask with.
+func (c *Client) findDirectRoomByMembers(creatorUserID, otherUserID string) string {
+	if c.asToken == "" {
+		return ""
+	}
+	rooms, err := c.joinedRoomIDs(creatorUserID)
+	if err != nil {
+		logger.Warn("findDirectRoomByMembers: could not list rooms for %s: %v", creatorUserID, err)
+		return ""
+	}
+	for _, roomID := range rooms {
+		members, err := c.joinedMemberIDs(roomID, creatorUserID)
+		if err != nil || len(members) != 2 {
+			continue
+		}
+		if (members[0] == creatorUserID && members[1] == otherUserID) ||
+			(members[1] == creatorUserID && members[0] == otherUserID) {
+			return roomID
+		}
+	}
+	return ""
+}
+
 // CreateSpace creates a new space (a room with m.space type).
 // roomAliasLocalPart is optional; when set, the room gets #roomAliasLocalPart:homeserver.
 // ownerUserID is optional; when set, that user is the room creator (using AS token with user_id when available).
@@ -525,6 +648,13 @@ func (c *Client) CreateSpace(name, topic string, public bool, roomAliasLocalPart
 		reqNoAlias := *req
 		reqNoAlias.RoomAliasName = ""
 		resp, err = c.CreateRoomAsUser(&reqNoAlias, ownerUserID)
+	}
+	if roomMayExist(err) {
+		// Fall through rather than return: a recovered space still needs the owner and admin
+		// power levels below, which linking rooms into it later depends on.
+		if existing := c.recoverRoomByAlias(req.RoomAliasName, err); existing != nil {
+			resp, err = existing, nil
+		}
 	}
 	if err != nil {
 		return nil, err
@@ -579,6 +709,11 @@ func (c *Client) CreateRegularRoom(name, topic string, public bool, roomAliasLoc
 		reqNoAlias.RoomAliasName = ""
 		resp, err = c.CreateRoomAsUser(&reqNoAlias, ownerUserID)
 	}
+	if roomMayExist(err) {
+		if existing := c.recoverRoomByAlias(req.RoomAliasName, err); existing != nil {
+			resp, err = existing, nil
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -606,6 +741,18 @@ func (c *Client) CreateDirectRoom(creatorUserID, otherUserID string) (*CreateRoo
 	}
 	logger.Info("CreateDirectRoom: creator=%s other=%s (is_direct=true)", creatorUserID, otherUserID)
 	resp, err := c.CreateRoomAsUser(req, creatorUserID)
+	if errors.Is(err, ErrCreateRoomTimeout) {
+		// A DM has no alias to resolve, so look for the room by its membership before trying
+		// again — creating a second one would leave a duplicate DM with no way to tell which
+		// is which.
+		if roomID := c.findDirectRoomByMembers(creatorUserID, otherUserID); roomID != "" {
+			logger.Warn("CreateDirectRoom: create timed out but DM %s already exists; reusing it", roomID)
+			resp, err = &CreateRoomResponse{RoomID: roomID}, nil
+		} else {
+			logger.Warn("CreateDirectRoom: create timed out and no DM found for %s/%s; creating again", creatorUserID, otherUserID)
+			resp, err = c.CreateRoomAsUser(req, creatorUserID)
+		}
+	}
 	if err != nil {
 		return nil, fmt.Errorf("create DM room: %w", err)
 	}
@@ -1608,6 +1755,10 @@ func (c *Client) doRequestWithTokenAndRetry(method, endpoint string, body interf
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
+		if shouldRetryRequestErr(err) && isNonIdempotent(method, endpoint) {
+			logger.Warn("Request transport error on %s; not retrying (room may have been created): %v", endpoint, err)
+			return nil, 0, fmt.Errorf("%w: %v", ErrCreateRoomTimeout, err)
+		}
 		if shouldRetryRequestErr(err) && retryCount < c.maxRetries {
 			retryAfter := retryDelay(c.retryBaseDelay, retryCount)
 			logger.Warn("Request transport error, retrying in %v (%d/%d): %v", retryAfter, retryCount+1, c.maxRetries, err)
@@ -1683,6 +1834,27 @@ func threadRelation(rootEventID, latestEventID string) map[string]interface{} {
 			"event_id": fallback,
 		},
 	}
+}
+
+// ErrCreateRoomTimeout marks a createRoom request that failed at the transport layer.
+// The server may still have created the room, so callers must look the room up rather than
+// blindly issue the request again.
+var ErrCreateRoomTimeout = errors.New("createRoom request did not complete")
+
+// isNonIdempotent reports whether replaying the request could create a second copy of
+// something. createRoom is the case that matters here: every call makes a new room, so an
+// automatic retry after a transport timeout orphans the room the first attempt created.
+func isNonIdempotent(method, endpoint string) bool {
+	return method == "POST" && strings.HasPrefix(endpoint, "/_matrix/client/v3/createRoom")
+}
+
+// roomMayExist reports whether err leaves open the possibility that the room was created:
+// either the server rejected the alias as taken, or the request never came back to us.
+func roomMayExist(err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, ErrCreateRoomTimeout) || strings.Contains(err.Error(), "M_ROOM_IN_USE")
 }
 
 func shouldRetryRequestErr(err error) bool {
