@@ -84,11 +84,18 @@ func runConfigTests(cfg *config.Config, callback TestCallback) []TestStep {
 		Name:        "config_file",
 		Description: "Configuration file loaded",
 		Status:      TestPassed,
-		Details:     "config.yaml found and parsed",
 	}
-	if cfg == nil {
+	switch {
+	case cfg == nil:
 		step.Status = TestFailed
 		step.Error = "Configuration file not found or invalid"
+	case cfg.ConfigFile == "":
+		// No file was read, so everything below is running on built-in defaults. Saying
+		// "found and parsed" here sends people looking for the wrong problem.
+		step.Status = TestWarning
+		step.Details = "No config file found - using built-in defaults"
+	default:
+		step.Details = cfg.ConfigFile
 	}
 	if callback != nil {
 		callback("config", &step)

@@ -16,6 +16,10 @@ type Config struct {
 	Mattermost MattermostConfig `mapstructure:"mattermost"`
 	Matrix     MatrixConfig     `mapstructure:"matrix"`
 	Data       DataConfig       `mapstructure:"data"`
+
+	// ConfigFile records which file the settings came from. Empty means none was found and
+	// the built-in defaults are in effect, which is worth surfacing rather than assuming.
+	ConfigFile string `mapstructure:"-"`
 }
 
 // MattermostConfig holds Mattermost server configuration
@@ -190,14 +194,25 @@ func Load(cfgFile string) (*Config, error) {
 		// Search for config in current directory and home directory
 		v.SetConfigName("config")
 		v.SetConfigType("yaml")
-		v.AddConfigPath(".")
-		v.AddConfigPath("$HOME/.matrixmigrate")
+		for _, p := range configSearchPaths {
+			v.AddConfigPath(p)
+		}
 	}
 
 	// Read the config file
 	if err := v.ReadInConfig(); err != nil {
 		if _, ok := err.(viper.ConfigFileNotFoundError); ok {
-			// Config file not found, use defaults
+			// "Not found" is not always the truth. Viper resolves its search paths to
+			// absolute ones, so a config file sitting in the working directory becomes
+			// invisible when a directory *above* it cannot be traversed by the current user
+			// - running under `sudo -u` from a checkout in /root, for instance. Falling back
+			// to defaults there produces a run that looks configured and is not.
+			if found := findOverlookedConfigFile(configSearchPaths); found != "" {
+				return nil, fmt.Errorf("found %s but the config search could not use it; "+
+					"this usually means a directory above it is not readable by the current user - "+
+					"move the working copy somewhere that user can enter, or pass --config with an absolute path", found)
+			}
+			// Config file genuinely not found, use defaults
 			return loadDefaults(v)
 		}
 		return nil, fmt.Errorf("failed to read config file: %w", err)
@@ -211,6 +226,7 @@ func Load(cfgFile string) (*Config, error) {
 
 	// Expand paths
 	cfg.expandPaths()
+	cfg.ConfigFile = v.ConfigFileUsed()
 
 	// Validate config
 	if err := cfg.Validate(); err != nil {
@@ -254,7 +270,36 @@ func loadDefaults(v *viper.Viper) (*Config, error) {
 		return nil, fmt.Errorf("failed to unmarshal defaults: %w", err)
 	}
 	cfg.expandPaths()
+	cfg.ConfigFile = ""
 	return &cfg, nil
+}
+
+// configSearchPaths are the directories searched for config.yaml when --config is not given.
+var configSearchPaths = []string{".", "$HOME/.matrixmigrate"}
+
+// configFileNames are the file names viper would accept in those directories.
+var configFileNames = []string{"config.yaml", "config.yml", "config.json", "config.toml"}
+
+// findOverlookedConfigFile reports a config file that is reachable from here but that viper's
+// search reported as missing. It probes the paths directly, which succeeds in cases viper's
+// absolute-path resolution does not - notably a relative working directory whose ancestors
+// are not traversable. Returns the path, or "" when there is genuinely nothing there.
+func findOverlookedConfigFile(paths []string) string {
+	for _, dir := range paths {
+		dir = os.ExpandEnv(dir)
+		if dir == "" {
+			continue
+		}
+		for _, name := range configFileNames {
+			candidate := filepath.Join(dir, name)
+			if _, err := os.Stat(candidate); err == nil {
+				return candidate
+			} else if os.IsPermission(err) {
+				return candidate
+			}
+		}
+	}
+	return ""
 }
 
 // expandPaths expands ~ and environment variables in paths

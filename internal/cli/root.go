@@ -115,7 +115,10 @@ var versionCmd = &cobra.Command{
 func loadConfig() (*config.Config, error) {
 	cfg, err := config.Load(cfgFile)
 	if err != nil {
-		return nil, fmt.Errorf("%s: %w", i18n.T("errors.config_not_found", cfgFile), err)
+		// config.Load reports what actually went wrong and names the file; prefixing every
+		// failure with "not found" mislabels parse and validation errors, and prints an empty
+		// path when --config was not given.
+		return nil, err
 	}
 
 	if err := cfg.EnsureDataDirs(); err != nil {
