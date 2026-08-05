@@ -20,11 +20,15 @@ go.work
 *.swp
 *.swo
 *~
+.~lock.*#
 
 # Config with secrets
 config.yaml
 config.yaml.*
 *.bak
+
+# Internal migration runbook (site-specific hostnames, queries and procedures)
+RUNBOOK.md
 
 # Local environment scripts (export real tokens/passwords)
 startup.sh
