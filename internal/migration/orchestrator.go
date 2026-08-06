@@ -1017,6 +1017,36 @@ type ImportMessagesResult struct {
 	MappingFile      string
 }
 
+// messageCheckpointInterval is how many imported messages pass between mapping checkpoints.
+// Small enough that an interrupted multi-day import loses little work, large enough that
+// rewriting the mapping file stays a rounding error next to the import itself.
+const messageCheckpointInterval = 500
+
+// addMessageEntries adds mapping entries for posts not already recorded in m.
+// postByID indexes the export so this stays O(n) rather than rescanning every post.
+func addMessageEntries(m *MessageMapping, mapping map[string]string, postByID map[string]*mattermost.Post, assetMapping *Mapping) {
+	for mmID, mxEventID := range mapping {
+		if _, exists := m.Messages[mmID]; exists {
+			continue
+		}
+		post, ok := postByID[mmID]
+		if !ok {
+			continue
+		}
+		m.AddMessage(&MessageMapEntry{
+			MattermostID:  mmID,
+			MatrixEventID: mxEventID,
+			ChannelID:     post.ChannelID,
+			RoomID:        assetMapping.Channels[post.ChannelID],
+			UserID:        post.UserID,
+			MatrixUserID:  assetMapping.Users[post.UserID],
+			Timestamp:     post.CreateAt,
+			IsReply:       post.IsReply(),
+			RootID:        post.RootID,
+		})
+	}
+}
+
 // ImportMessages imports messages to Matrix
 func (o *Orchestrator) ImportMessages(progress matrix.MessageImportCallback) (*ImportMessagesResult, error) {
 	// Start step
@@ -1131,6 +1161,25 @@ func (o *Orchestrator) ImportMessages(progress matrix.MessageImportCallback) (*I
 	}
 	logger.Info("File mode: %s, S3 URL: %s", fileConfig.Mode, fileConfig.S3PublicURL)
 
+	// Index posts by ID once; both the checkpoint callback and the final mapping update need it.
+	postByID := make(map[string]*mattermost.Post, len(messages.Posts))
+	for idx := range messages.Posts {
+		postByID[messages.Posts[idx].ID] = &messages.Posts[idx]
+	}
+
+	// Checkpoint the mapping periodically. A large instance takes days to import, and without
+	// this the mapping only lands when the whole run finishes: any interruption would leave
+	// every sent message unrecorded, so a restart would import them a second time.
+	mappingFile := GenerateMessageMappingFilename(o.config.Data.MappingsDir)
+	importer.SetMessageCheckpoint(messageCheckpointInterval, func(partial map[string]string) {
+		addMessageEntries(msgMapping, partial, postByID, assetMapping)
+		if err := SaveMessageMapping(msgMapping, mappingFile); err != nil {
+			logger.Warn("Checkpoint: failed to save message mapping: %v", err)
+			return
+		}
+		logger.Info("Checkpoint: message mapping saved with %d entries to %s", len(msgMapping.Messages), mappingFile)
+	})
+
 	// Import messages with files
 	result, err := importer.ImportMessagesWithFiles(
 		messages.Posts,
@@ -1160,39 +1209,14 @@ func (o *Orchestrator) ImportMessages(progress matrix.MessageImportCallback) (*I
 		}
 	}
 
-	// Update message mapping with new imports.
-	// Index posts by ID once to avoid an O(N*M) scan over all posts per mapping entry.
-	postByID := make(map[string]*mattermost.Post, len(messages.Posts))
-	for idx := range messages.Posts {
-		postByID[messages.Posts[idx].ID] = &messages.Posts[idx]
-	}
-	for mmID, mxEventID := range result.Mapping {
-		if _, exists := msgMapping.Messages[mmID]; exists {
-			continue
-		}
-		post, ok := postByID[mmID]
-		if !ok {
-			continue
-		}
-		msgMapping.AddMessage(&MessageMapEntry{
-			MattermostID:  mmID,
-			MatrixEventID: mxEventID,
-			ChannelID:     post.ChannelID,
-			RoomID:        assetMapping.Channels[post.ChannelID],
-			UserID:        post.UserID,
-			MatrixUserID:  assetMapping.Users[post.UserID],
-			Timestamp:     post.CreateAt,
-			IsReply:       post.IsReply(),
-			RootID:        post.RootID,
-		})
-	}
+	// Update message mapping with new imports, then save to the same file the checkpoints
+	// have been writing so a run leaves exactly one mapping behind.
+	addMessageEntries(msgMapping, result.Mapping, postByID, assetMapping)
 
-	// Save message mapping
-	newMappingFile := GenerateMessageMappingFilename(o.config.Data.MappingsDir)
-	if err := SaveMessageMapping(msgMapping, newMappingFile); err != nil {
+	if err := SaveMessageMapping(msgMapping, mappingFile); err != nil {
 		logger.Warn("Failed to save message mapping: %v", err)
 	} else {
-		logger.Info("Message mapping saved to %s", newMappingFile)
+		logger.Info("Message mapping saved to %s", mappingFile)
 	}
 
 	logger.Info("=== ImportMessages Completed ===")
@@ -1205,7 +1229,7 @@ func (o *Orchestrator) ImportMessages(progress matrix.MessageImportCallback) (*I
 	logger.Success("Message import completed successfully")
 
 	// Complete step
-	o.state.CompleteStep(StepImportMessages, newMappingFile)
+	o.state.CompleteStep(StepImportMessages, mappingFile)
 	if err := o.SaveState(); err != nil {
 		return nil, err
 	}
@@ -1220,6 +1244,6 @@ func (o *Orchestrator) ImportMessages(progress matrix.MessageImportCallback) (*I
 		FilesUploaded:    result.Stats.FilesUploaded,
 		FilesSkipped:     result.Stats.FilesSkipped,
 		FilesTooLarge:    result.Stats.FilesTooLarge,
-		MappingFile:      newMappingFile,
+		MappingFile:      mappingFile,
 	}, nil
 }

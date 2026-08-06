@@ -54,6 +54,13 @@ type Importer struct {
 	// persist them. Empty when the policy generates no passwords.
 	generatedCredentials []UserCredential
 
+	// checkpointFn, when set, is called every checkpointEvery imported messages with the
+	// post ID -> event ID mapping so far. Message import runs for days on a large instance;
+	// without this, an interruption loses every message already sent, because the mapping is
+	// only written once the whole run finishes and a restart would re-import them as duplicates.
+	checkpointFn    func(map[string]string)
+	checkpointEvery int
+
 	// knownMentionUsers holds the localparts of users this run knows exist, derived from the
 	// migration's user mapping. A nil map disables mention gating.
 	knownMentionUsers map[string]struct{}
@@ -1355,6 +1362,30 @@ type ImportAssetsResult struct {
 	Stats        *ImportStats
 }
 
+// SetMessageCheckpoint installs fn, called every `every` imported messages with the
+// post ID -> event ID mapping accumulated so far. Passing a nil fn or every <= 0 disables
+// checkpointing. The mapping handed to fn is a copy, safe to persist without racing the import.
+func (i *Importer) SetMessageCheckpoint(every int, fn func(map[string]string)) {
+	i.checkpointEvery = every
+	i.checkpointFn = fn
+}
+
+// maybeCheckpoint hands the current mapping to the checkpoint callback every checkpointEvery
+// messages, so an interrupted import can resume from what it already sent.
+func (i *Importer) maybeCheckpoint(mapping map[string]string) {
+	if i.checkpointFn == nil || i.checkpointEvery <= 0 {
+		return
+	}
+	if len(mapping)%i.checkpointEvery != 0 {
+		return
+	}
+	snapshot := make(map[string]string, len(mapping))
+	for k, v := range mapping {
+		snapshot[k] = v
+	}
+	i.checkpointFn(snapshot)
+}
+
 // ExistingMappings holds existing mappings to skip already imported items
 type ExistingMappings struct {
 	Users  map[string]string
@@ -1736,6 +1767,7 @@ func (i *Importer) ImportMessages(
 		// Store mapping
 		result.Mapping[post.ID] = eventID
 		result.Stats.MessagesImported++
+		i.maybeCheckpoint(result.Mapping)
 
 		if progress != nil {
 			progress(idx+1, total, post.ChannelID, "imported")
@@ -1903,6 +1935,7 @@ func (i *Importer) ImportMessagesWithFiles(
 		// Store mapping
 		result.Mapping[post.ID] = eventID
 		result.Stats.MessagesImported++
+		i.maybeCheckpoint(result.Mapping)
 
 		if progress != nil {
 			progress(idx+1, total, post.ChannelID, "imported")
