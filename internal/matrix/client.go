@@ -63,6 +63,43 @@ type Client struct {
 	// joinedRooms: room IDs the admin has already joined (Synapse admin join API requires admin in room)
 	joinedRooms   map[string]struct{}
 	joinedRoomsMu sync.Mutex
+
+	// roomCreators caches room ID -> creator user ID, looked up when writing power levels
+	roomCreators   map[string]string
+	roomCreatorsMu sync.Mutex
+}
+
+// roomCreator returns the user that created roomID, or "" when it cannot be determined.
+// Results are cached because power levels are written repeatedly for the same rooms.
+func (c *Client) roomCreator(roomID string) string {
+	c.roomCreatorsMu.Lock()
+	if creator, ok := c.roomCreators[roomID]; ok {
+		c.roomCreatorsMu.Unlock()
+		return creator
+	}
+	c.roomCreatorsMu.Unlock()
+
+	creator := ""
+	endpoint := "/_synapse/admin/v1/rooms/" + url.PathEscape(roomID)
+	body, statusCode, err := c.doRequest("GET", endpoint, nil)
+	if err == nil && statusCode == http.StatusOK {
+		var resp struct {
+			Creator string `json:"creator"`
+		}
+		if json.Unmarshal(body, &resp) == nil {
+			creator = resp.Creator
+		}
+	} else if err != nil {
+		logger.Debug("roomCreator: could not look up creator of %s: %v", roomID, err)
+	}
+
+	c.roomCreatorsMu.Lock()
+	if c.roomCreators == nil {
+		c.roomCreators = make(map[string]string)
+	}
+	c.roomCreators[roomID] = creator
+	c.roomCreatorsMu.Unlock()
+	return creator
 }
 
 // NewClient creates a new Matrix API client with default rate limiting
@@ -1176,6 +1213,26 @@ func powerLevelForUser(content *PowerLevelsContent, userID string) int {
 }
 
 func (c *Client) setPowerLevelsWithToken(roomID string, content *PowerLevelsContent, token string) error {
+	// From room version 12 the creator holds implicit infinite power and the server rejects the
+	// whole event if the creator is listed in content.users ("Creator user ... must not appear in
+	// content.users"). Rooms here are created as their owner, so the owner is usually the creator
+	// and every power-level update would fail. Dropping the entry is safe: it cannot lower or
+	// raise a creator's power either way.
+	if creator := c.roomCreator(roomID); creator != "" && content != nil && content.Users != nil {
+		if _, listed := content.Users[creator]; listed {
+			stripped := make(map[string]int, len(content.Users))
+			for u, l := range content.Users {
+				if u != creator {
+					stripped[u] = l
+				}
+			}
+			trimmed := *content
+			trimmed.Users = stripped
+			content = &trimmed
+			logger.Debug("setPowerLevelsWithToken: dropped creator %s from content.users for room %s", creator, roomID)
+		}
+	}
+
 	endpoint := fmt.Sprintf("/_matrix/client/v3/rooms/%s/state/m.room.power_levels/", url.PathEscape(roomID))
 	body, statusCode, err := c.doRequestWithToken("PUT", endpoint, content, token)
 	if err != nil {
