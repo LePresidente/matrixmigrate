@@ -35,6 +35,11 @@ func TestCreatorMustBeAbsentFromPowerLevels(t *testing.T) {
 // newFakeSynapse serves the admin room-details endpoint with the given creator and room
 // version, and records the m.room.power_levels content it is asked to send.
 func newFakeSynapse(t *testing.T, creator, version string) (*httptest.Server, *PowerLevelsContent) {
+	return newFakeSynapseWithLevels(t, creator, version, map[string]int{creator: 100})
+}
+
+// newFakeSynapseWithLevels is newFakeSynapse with explicit starting power levels.
+func newFakeSynapseWithLevels(t *testing.T, creator, version string, levels map[string]int) (*httptest.Server, *PowerLevelsContent) {
 	t.Helper()
 	var sent PowerLevelsContent
 
@@ -53,7 +58,7 @@ func newFakeSynapse(t *testing.T, creator, version string) (*httptest.Server, *P
 			return
 		}
 		// getPowerLevels
-		json.NewEncoder(w).Encode(PowerLevelsContent{Users: map[string]int{creator: 100}})
+		json.NewEncoder(w).Encode(PowerLevelsContent{Users: levels})
 	})
 
 	srv := httptest.NewServer(mux)
@@ -92,5 +97,65 @@ func TestSetPowerLevelsDropsCreatorFromRoomVersion12(t *testing.T) {
 	}
 	if got := sent.Users["@matrix-admin:example.com"]; got != 100 {
 		t.Fatalf("target level = %d, want 100", got)
+	}
+}
+
+func TestCanChangeUserLevel(t *testing.T) {
+	current := &PowerLevelsContent{Users: map[string]int{
+		"@me:example.com":      100,
+		"@creator:example.com": 100,
+		"@mod:example.com":     50,
+	}}
+	const me = "@me:example.com"
+
+	tests := []struct {
+		name    string
+		target  string
+		newLvl  int
+		myLevel int
+		want    bool
+	}{
+		// The case from the field: the room creator sits at 100 in room versions before 12,
+		// exactly where the migration admin sits, and the server refuses the whole event.
+		{"equal level cannot be demoted", "@creator:example.com", 50, 100, false},
+		{"lower level can be changed", "@mod:example.com", 50, 100, true},
+		{"unlisted user can be raised below own level", "@new:example.com", 50, 100, true},
+		{"nobody can be raised above own level", "@new:example.com", 100, 50, false},
+		{"own entry is always allowed", me, 100, 100, true},
+		// An entry already at the wanted level is not a change, so there is nothing to
+		// authorise and it must not be filtered out.
+		{"no-op on an equal-level user is fine", "@creator:example.com", 100, 100, true},
+	}
+	for _, tt := range tests {
+		if got := canChangeUserLevel(current, me, tt.myLevel, tt.target, tt.newLvl); got != tt.want {
+			t.Errorf("%s: canChangeUserLevel(%s -> %d, myLevel=%d) = %v, want %v",
+				tt.name, tt.target, tt.newLvl, tt.myLevel, got, tt.want)
+		}
+	}
+}
+
+func TestSetPowerLevelsBulkKeepsGoingAroundAnUntouchableEntry(t *testing.T) {
+	// One entry the account may not change must not cost every other member their level.
+	srv, sent := newFakeSynapseWithLevels(t, "@creator:example.com", "11", map[string]int{
+		"@creator:example.com":      100,
+		"@matrix-admin:example.com": 100,
+	})
+	c := NewClient(srv.URL, "token", "example.com")
+
+	err := c.SetPowerLevelsBulk("!room:example.com", map[string]int{
+		"@creator:example.com": 50,
+		"@alice:example.com":   50,
+		"@bob:example.com":     50,
+	})
+	if err != nil {
+		t.Fatalf("SetPowerLevelsBulk returned error: %v", err)
+	}
+	if got := sent.Users["@creator:example.com"]; got != 100 {
+		t.Fatalf("creator level = %d, want 100 (left alone)", got)
+	}
+	for _, u := range []string{"@alice:example.com", "@bob:example.com"} {
+		if got := sent.Users[u]; got != 50 {
+			t.Fatalf("%s level = %d, want 50", u, got)
+		}
 	}
 }

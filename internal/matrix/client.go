@@ -1010,9 +1010,15 @@ func (c *Client) SetPowerLevels(roomID, userID string, level int) error {
 	if content.Users == nil {
 		content.Users = make(map[string]int)
 	}
+	myLevel := powerLevelForUser(content, me.UserID)
+
 	// Keep admin at PL 100 for state updates where possible, while preserving all existing entries.
 	if current, ok := content.Users[me.UserID]; !ok || current < 100 {
 		content.Users[me.UserID] = 100
+	}
+	if !canChangeUserLevel(content, me.UserID, myLevel, userID, level) {
+		return fmt.Errorf("cannot set %s to level %d: their current level (%d) is at or above this account's own (%d)",
+			userID, level, powerLevelForUser(content, userID), myLevel)
 	}
 	content.Users[userID] = level
 
@@ -1039,18 +1045,62 @@ func (c *Client) SetPowerLevelsBulk(roomID string, userLevels map[string]int) er
 		content.Users = make(map[string]int)
 	}
 
+	// Authority is judged against the state before this event, so the requester's level has
+	// to be read before it is raised below.
+	myLevel := powerLevelForUser(content, me.UserID)
+
 	if current, ok := content.Users[me.UserID]; !ok || current < 100 {
 		content.Users[me.UserID] = 100
 	}
+
+	applied, retained := 0, []string{}
 	for u, level := range userLevels {
+		if u != me.UserID && !canChangeUserLevel(content, me.UserID, myLevel, u, level) {
+			retained = append(retained, u)
+			continue
+		}
 		content.Users[u] = level
+		applied++
+	}
+	if len(retained) > 0 {
+		// Attempting these anyway costs the whole event, and with it the levels of every
+		// other member in the room.
+		logger.Info("SetPowerLevelsBulk: room %s: leaving %d user(s) at their current level, which is at or above this account's own (%d): %s",
+			roomID, len(retained), myLevel, strings.Join(retained, ", "))
+	}
+	if applied == 0 {
+		logger.Debug("SetPowerLevelsBulk: room %s: nothing left to change", roomID)
+		return nil
 	}
 
 	if err := c.setPowerLevelsWithToken(roomID, content, c.adminToken); err != nil {
 		return err
 	}
-	logger.Info("SetPowerLevelsBulk: set %d users in room %s", len(userLevels), roomID)
+	logger.Info("SetPowerLevelsBulk: set %d users in room %s", applied, roomID)
 	return nil
+}
+
+// canChangeUserLevel reports whether the account at myLevel may move targetUserID to
+// newLevel in a room whose current power levels are current.
+//
+// Matrix lets an account change only entries strictly below its own level, and never set
+// anyone above it. An entry at exactly the requester's level is refused with "You don't have
+// permission to remove ops level equal to your own" — which matters here because rooms are
+// created as their owner, leaving that owner at 100 in room versions before 12, exactly where
+// the migration admin sits. The server rejects the entire m.room.power_levels event in that
+// case, so one untouchable entry would otherwise cost every other member their level too.
+func canChangeUserLevel(current *PowerLevelsContent, meUserID string, myLevel int, targetUserID string, newLevel int) bool {
+	if targetUserID == meUserID {
+		return true
+	}
+	if newLevel > myLevel {
+		return false
+	}
+	targetLevel := powerLevelForUser(current, targetUserID)
+	if targetLevel == newLevel {
+		return true // no change, nothing for the server to authorise
+	}
+	return targetLevel < myLevel
 }
 
 // InviteUser invites a user to a room (as the current user, typically admin)
