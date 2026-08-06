@@ -1143,6 +1143,36 @@ func (i *Importer) ApplyChannelMemberships(
 	return stats, nil
 }
 
+// skipTally counts why items were skipped, in first-seen order, so a run can report the shape
+// of what it left behind rather than only how much. A bare "skipped=4" gives an operator
+// nothing to act on; "user-not-mapped=1" points straight at a person who lost every DM.
+type skipTally struct {
+	order  []string
+	counts map[string]int
+}
+
+func (t *skipTally) add(reason string) {
+	if t.counts == nil {
+		t.counts = make(map[string]int)
+	}
+	if _, seen := t.counts[reason]; !seen {
+		t.order = append(t.order, reason)
+	}
+	t.counts[reason]++
+}
+
+// String renders the tally as "reason=n, reason=n", or "" when nothing was skipped.
+func (t *skipTally) String() string {
+	if len(t.order) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(t.order))
+	for _, reason := range t.order {
+		parts = append(parts, fmt.Sprintf("%s=%d", reason, t.counts[reason]))
+	}
+	return strings.Join(parts, ", ")
+}
+
 // ImportDirectChannelsAsDMs imports Mattermost direct message channels (type D) as Matrix DMs.
 // Room creator is preferred as a real user (not the AS); is_direct and m.direct are set so both users see the room under "People".
 // When channel has no creator_id, name format is "senderID_receiverID" (first = sender, second = receiver); sender is used as room creator.
@@ -1172,19 +1202,26 @@ func (i *Importer) ImportDirectChannelsAsDMs(
 
 	logger.Info("ImportDirectChannelsAsDMs: processing %d direct channels", total)
 
+	// Skipping a DM means a conversation does not arrive. Reasons that are deliberate stay at
+	// info; reasons that mean lost content are warnings, so they are visible without turning
+	// on debug logging after the fact.
+	skips := &skipTally{}
+
 	for idx, channel := range directChannels {
 		if progress != nil {
 			progress("dm_rooms", idx+1, total, channel.ID)
 		}
 
 		if channel.IsDeleted() {
-			logger.Debug("DM channel %s deleted, skipping", channel.ID)
+			logger.Debug("DM channel %s deleted in Mattermost, skipping", channel.ID)
+			skips.add("deleted")
 			stats.RoomsSkipped++
 			continue
 		}
 
 		if _, exists := existingMapping[channel.ID]; exists {
 			logger.Debug("DM channel %s already imported, skipping", channel.ID)
+			skips.add("already-imported")
 			stats.RoomsSkipped++
 			continue
 		}
@@ -1192,24 +1229,30 @@ func (i *Importer) ImportDirectChannelsAsDMs(
 		// Resolve the two Matrix user IDs for this DM
 		senderID, receiverID, err := channel.DMParticipantIDs()
 		if err != nil {
-			logger.Debug("ImportDirectChannelsAsDMs: channel %s has insufficient/invalid participants (%v), skipping", channel.ID, err)
+			logger.Warn("DM channel %s skipped: cannot determine participants from name %q (%v) - this conversation is not migrated",
+				channel.ID, channel.Name, err)
+			skips.add("unparseable-name")
 			stats.RoomsSkipped++
 			continue
 		}
 		if lockedUserByID[senderID] && lockedUserByID[receiverID] {
-			logger.Debug("ImportDirectChannelsAsDMs: channel %s skipped because both participants are locked/deleted (%s, %s)", channel.ID, senderID, receiverID)
+			logger.Info("DM channel %s skipped: both participants are locked/deleted in Mattermost (%s, %s)", channel.ID, senderID, receiverID)
+			skips.add("both-participants-locked")
 			stats.RoomsSkipped++
 			continue
 		}
 		creatorMX, ok1 := userMapping[senderID]
 		otherMX, ok2 := userMapping[receiverID]
 		if !ok1 || !ok2 {
-			if !ok1 {
-				logger.Debug("ImportDirectChannelsAsDMs: channel %s sender %s not in user mapping, skipping", channel.ID, senderID)
+			// The missing user has no Matrix account, so *every* DM of theirs is skipped, not
+			// just this one. Usually ignored_users, or a user whose creation failed earlier.
+			missing := senderID
+			if ok1 {
+				missing = receiverID
 			}
-			if !ok2 {
-				logger.Debug("ImportDirectChannelsAsDMs: channel %s receiver %s not in user mapping, skipping", channel.ID, receiverID)
-			}
+			logger.Warn("DM channel %s skipped: participant %s has no Matrix user - all of their direct conversations are affected",
+				channel.ID, missing)
+			skips.add("user-not-mapped")
 			stats.RoomsSkipped++
 			continue
 		}
@@ -1226,7 +1269,9 @@ func (i *Importer) ImportDirectChannelsAsDMs(
 		}
 
 		if creatorMX == "" || otherMX == "" {
-			logger.Debug("ImportDirectChannelsAsDMs: channel %s could not resolve both users (creator=%q other=%q), skipping", channel.ID, creatorMX, otherMX)
+			logger.Warn("DM channel %s skipped: could not resolve both users (creator=%q other=%q) - this conversation is not migrated",
+				channel.ID, creatorMX, otherMX)
+			skips.add("unresolved-users")
 			stats.RoomsSkipped++
 			continue
 		}
@@ -1254,8 +1299,13 @@ func (i *Importer) ImportDirectChannelsAsDMs(
 		stats.RoomsCreated++
 	}
 
-	logger.Info("ImportDirectChannelsAsDMs completed: created=%d, skipped=%d, failed=%d",
-		stats.RoomsCreated, stats.RoomsSkipped, stats.RoomsFailed)
+	if breakdown := skips.String(); breakdown != "" {
+		logger.Info("ImportDirectChannelsAsDMs completed: created=%d, skipped=%d (%s), failed=%d",
+			stats.RoomsCreated, stats.RoomsSkipped, breakdown, stats.RoomsFailed)
+	} else {
+		logger.Info("ImportDirectChannelsAsDMs completed: created=%d, skipped=%d, failed=%d",
+			stats.RoomsCreated, stats.RoomsSkipped, stats.RoomsFailed)
+	}
 
 	return mapping, stats, nil
 }
