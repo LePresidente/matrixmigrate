@@ -108,6 +108,13 @@ func (m *MASClient) getToken() (string, error) {
 	return tok.AccessToken, nil
 }
 
+// isHTTPSuccess reports whether status is any 2xx. The MAS admin API is not uniform about
+// which one it returns - creating a user answers 201, setting a password answers 204 - and
+// comparing against a single code produced warnings for calls that had in fact succeeded.
+func isHTTPSuccess(status int) bool {
+	return status >= 200 && status < 300
+}
+
 // masAddUserRequest is the request body for POST /api/admin/v1/users
 type masAddUserRequest struct {
 	Username           string `json:"username"`
@@ -221,15 +228,18 @@ func (m *MASClient) CreateUser(username string, req *CreateUserRequest) (*UserRe
 		setPassBody, passCode, passErr := m.doRequest("POST",
 			fmt.Sprintf("/api/admin/v1/users/%s/set-password", url.PathEscape(masUserID)),
 			map[string]string{"password": req.Password})
-		if passErr != nil {
+		switch {
+		case passErr != nil:
 			logger.Warn("MAS set-password failed for '%s': %v (user was created)", username, passErr)
-		} else if passCode != http.StatusOK {
-			bodyStr := string(setPassBody)
-			if passCode == http.StatusForbidden && strings.Contains(bodyStr, "Password auth is disabled") {
-				logger.Info("MAS set-password skipped for '%s': OIDC-only MAS (users will sign in via SSO)", username)
-			} else {
-				logger.Warn("MAS set-password failed for '%s': status %d %s", username, passCode, bodyStr)
-			}
+		case isHTTPSuccess(passCode):
+			// MAS answers 204 No Content here, not 200.
+		case passCode == http.StatusForbidden && strings.Contains(string(setPassBody), "Password auth is disabled"):
+			// Not a transient failure: the account has no way in unless it can use SSO. With
+			// user_password.mode local_only or random the operator asked for a password, so
+			// this needs to be visible rather than a footnote.
+			logger.Warn("MAS set-password rejected for '%s': password auth is disabled in MAS - this account cannot sign in with a password. Set passwords.enabled: true, or use user_password.mode: none if SSO is the only intended path", username)
+		default:
+			logger.Warn("MAS set-password failed for '%s': status %d %s", username, passCode, string(setPassBody))
 		}
 	}
 
