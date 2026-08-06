@@ -404,6 +404,19 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("matrix.import.user_password.length must be between 12 and 128, got %d", l)
 	}
 
+	// Validate file attachment config. Without this the run gets all the way to message
+	// import before failing once per file, having already created users, rooms and
+	// memberships.
+	switch c.Mattermost.Files.Mode {
+	case "", "link", "upload", "skip":
+		// valid
+	default:
+		return fmt.Errorf("mattermost.files.mode must be \"link\", \"upload\" or \"skip\", got %q", c.Mattermost.Files.Mode)
+	}
+	if c.GetFileMode() == "upload" && c.Mattermost.Files.LocalDataPath == "" {
+		return fmt.Errorf("mattermost.files.local_data_path is required when mattermost.files.mode is \"upload\"")
+	}
+
 	// Validate MAS config when enabled
 	if c.Matrix.MAS.Enabled {
 		if c.Matrix.MAS.Endpoint == "" {

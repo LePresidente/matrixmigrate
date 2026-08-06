@@ -286,6 +286,57 @@ func runMattermostTests(cfg *config.Config, callback TestCallback) []TestStep {
 	}
 	steps = append(steps, step)
 
+	// Step 5: File attachment storage. Only meaningful for upload mode, where a wrong or
+	// unreadable path is otherwise not noticed until message import is already running and
+	// every attachment is skipped one by one.
+	if cfg.GetFileMode() == "upload" {
+		step = TestStep{
+			Name:        "mm_files",
+			Description: "Attachment storage",
+			Status:      TestRunning,
+			Details:     cfg.Mattermost.Files.LocalDataPath,
+		}
+		if callback != nil {
+			callback("mattermost", &step)
+		}
+
+		path := cfg.Mattermost.Files.LocalDataPath
+		switch info, err := os.Stat(path); {
+		case err == nil && !info.IsDir():
+			step.Status = TestFailed
+			step.Error = fmt.Sprintf("%s is not a directory", path)
+		case err == nil:
+			// Reachable from here. Confirm it can actually be read, and that it holds
+			// something: an empty directory usually means the wrong level was configured
+			// (the parent of data/, or a copy that never finished).
+			entries, readErr := os.ReadDir(path)
+			switch {
+			case readErr != nil:
+				step.Status = TestFailed
+				step.Error = fmt.Sprintf("%s is not readable by the current user: %v", path, readErr)
+			case len(entries) == 0:
+				step.Status = TestWarning
+				step.Details = fmt.Sprintf("%s is empty - is this the Mattermost data directory?", path)
+			default:
+				step.Status = TestPassed
+				step.Details = fmt.Sprintf("%s (%d entries)", path, len(entries))
+			}
+		case sshEnabled:
+			// Not present locally, but a Mattermost SSH host is configured, so the importer
+			// will read it over SSH instead. Nothing to check from here.
+			step.Status = TestSkipped
+			step.Details = fmt.Sprintf("%s not present locally; will be read over SSH", path)
+		default:
+			step.Status = TestFailed
+			step.Error = fmt.Sprintf("%s does not exist, and no mattermost.ssh.host is configured to read it from: %v", path, err)
+		}
+
+		if callback != nil {
+			callback("mattermost", &step)
+		}
+		steps = append(steps, step)
+	}
+
 	return steps
 }
 
@@ -556,4 +607,3 @@ func GetTestStatusIcon(status TestStatus) string {
 		return "?"
 	}
 }
-
