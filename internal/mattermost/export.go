@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/aligundogdu/matrixmigrate/internal/logger"
 )
 
 // Exporter handles exporting data from Mattermost
@@ -304,6 +306,29 @@ func (e *Exporter) ExportMessages(progress ExportProgressCallback) (*Messages, e
 		messages.Files = files
 		if progress != nil {
 			progress("files", len(files), len(files))
+		}
+	}
+
+	// Export reactions. Non-fatal like files, but loudly: a silent failure here would look
+	// exactly like an instance where nobody ever reacted to anything.
+	if progress != nil {
+		reactionCount, countErr := e.client.GetReactionCount()
+		if countErr != nil {
+			reactionCount = 0
+		}
+		progress("reactions", 0, reactionCount)
+	}
+
+	reactions, err := e.client.GetReactions()
+	if err != nil {
+		logger.Warn("Failed to export reactions, continuing without them: %v", err)
+	} else {
+		messages.Reactions = reactions
+		if len(reactions) == 0 {
+			logger.Info("No reactions found to export")
+		}
+		if progress != nil {
+			progress("reactions", len(reactions), len(reactions))
 		}
 	}
 

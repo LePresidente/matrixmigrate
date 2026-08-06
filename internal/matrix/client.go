@@ -1861,6 +1861,64 @@ func (c *Client) SendReplyWithTimestamp(roomID, message string, threadRootEventI
 	return &resp, nil
 }
 
+// SendReactionWithTimestamp annotates an existing event with an emoji reaction.
+//
+// The key is the reaction as it will be displayed — a Unicode emoji, or any other string;
+// Matrix does not constrain it. An m.reaction event carries no body and no msgtype, only the
+// relation, which is why this cannot go through SendMessageWithTimestamp.
+//
+// Like the message senders, the original timestamp and author survive only with an
+// Application Service token; without one the reaction lands as the admin, now.
+func (c *Client) SendReactionWithTimestamp(roomID, targetEventID, key string, timestamp int64, senderUserID string) (*SendMessageResponse, error) {
+	txnID := c.getNextTxnID()
+
+	endpoint := fmt.Sprintf("/_matrix/client/v3/rooms/%s/send/m.reaction/%s",
+		url.PathEscape(roomID), url.PathEscape(txnID))
+
+	params := url.Values{}
+
+	if timestamp > 0 && c.asToken != "" {
+		params.Set("ts", strconv.FormatInt(timestamp, 10))
+	}
+
+	if senderUserID != "" && c.asToken != "" {
+		params.Set("user_id", senderUserID)
+	}
+
+	if len(params) > 0 {
+		endpoint += "?" + params.Encode()
+	}
+
+	content := map[string]interface{}{
+		"m.relates_to": map[string]string{
+			"rel_type": "m.annotation",
+			"event_id": targetEventID,
+			"key":      key,
+		},
+	}
+
+	token := c.adminToken
+	if c.asToken != "" {
+		token = c.asToken
+	}
+
+	body, statusCode, err := c.doRequestWithToken("PUT", endpoint, content, token)
+	if err != nil {
+		return nil, err
+	}
+
+	var resp SendMessageResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("failed to parse response: %w", err)
+	}
+
+	if statusCode != http.StatusOK {
+		return nil, fmt.Errorf("API error (%d): %s - %s", statusCode, resp.Errcode, resp.Error)
+	}
+
+	return &resp, nil
+}
+
 // doRequestWithToken performs an HTTP request with a specific token
 func (c *Client) doRequestWithToken(method, endpoint string, body interface{}, token string) ([]byte, int, error) {
 	return c.doRequestWithTokenAndRetry(method, endpoint, body, token, 0)

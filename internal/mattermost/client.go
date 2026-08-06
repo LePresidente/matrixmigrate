@@ -521,6 +521,112 @@ func (c *Client) GetFileInfoTotalSize() (int64, error) {
 	return size, err
 }
 
+// reactionsSchema describes what the reactions table looks like on this server.
+//
+// The table is not as stable as the rest of the schema: it only exists from Mattermost 3.x
+// onwards, and the soft-delete column only from 5.x. Probing beats a blind SELECT, which
+// would fail the whole message export on an older installation.
+type reactionsSchema struct {
+	exists      bool
+	hasDeleteAt bool
+}
+
+// inspectReactions reports what the reactions table offers on this server.
+//
+// The schema filter matters: without it a same-named table in another schema would be
+// mistaken for this one, and the resulting query could then reference columns that the table
+// actually on the search path does not have.
+func (c *Client) inspectReactions() (reactionsSchema, error) {
+	var schema reactionsSchema
+
+	rows, err := c.db.Query(`
+		SELECT column_name FROM information_schema.columns
+		WHERE table_schema = current_schema() AND table_name = 'reactions'
+	`)
+	if err != nil {
+		return schema, fmt.Errorf("failed to inspect reactions table: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var column string
+		if err := rows.Scan(&column); err != nil {
+			return schema, fmt.Errorf("failed to scan reactions column name: %w", err)
+		}
+		schema.exists = true
+		if column == "deleteat" {
+			schema.hasDeleteAt = true
+		}
+	}
+
+	if err := rows.Err(); err != nil {
+		return schema, fmt.Errorf("error iterating reactions columns: %w", err)
+	}
+
+	return schema, nil
+}
+
+// GetReactions retrieves all emoji reactions on posts.
+//
+// An installation without a reactions table returns no reactions and no error, so an old
+// Mattermost still exports its messages.
+func (c *Client) GetReactions() ([]Reaction, error) {
+	schema, err := c.inspectReactions()
+	if err != nil {
+		return nil, err
+	}
+	if !schema.exists {
+		return nil, nil
+	}
+
+	query := `SELECT userid, postid, emojiname, createat FROM reactions`
+	if schema.hasDeleteAt {
+		query += ` WHERE deleteat = 0`
+	}
+	query += ` ORDER BY createat ASC`
+
+	rows, err := c.db.Query(query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query reactions: %w", err)
+	}
+	defer rows.Close()
+
+	var reactions []Reaction
+	for rows.Next() {
+		var r Reaction
+		if err := rows.Scan(&r.UserID, &r.PostID, &r.EmojiName, &r.CreateAt); err != nil {
+			return nil, fmt.Errorf("failed to scan reaction: %w", err)
+		}
+		reactions = append(reactions, r)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating reactions: %w", err)
+	}
+
+	return reactions, nil
+}
+
+// GetReactionCount returns the total number of reactions, or 0 when the table is absent.
+func (c *Client) GetReactionCount() (int, error) {
+	schema, err := c.inspectReactions()
+	if err != nil {
+		return 0, err
+	}
+	if !schema.exists {
+		return 0, nil
+	}
+
+	query := "SELECT COUNT(*) FROM reactions"
+	if schema.hasDeleteAt {
+		query += " WHERE deleteat = 0"
+	}
+
+	var count int
+	err = c.db.QueryRow(query).Scan(&count)
+	return count, err
+}
+
 
 
 

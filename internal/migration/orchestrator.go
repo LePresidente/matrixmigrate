@@ -1210,7 +1210,13 @@ type ImportMessagesResult struct {
 	FilesUploaded    int
 	FilesSkipped     int
 	FilesTooLarge    int
-	MappingFile      string
+
+	ReactionsImported    int
+	ReactionsSkipped     int
+	ReactionsFailed      int
+	ReactionsCustomEmoji int
+
+	MappingFile string
 }
 
 // messageCheckpointInterval is how many imported messages pass between mapping checkpoints.
@@ -1376,6 +1382,35 @@ func (o *Orchestrator) ImportMessages(progress matrix.MessageImportCallback) (*I
 		logger.Info("Checkpoint: message mapping saved with %d entries to %s", len(msgMapping.Messages), mappingFile)
 	})
 
+	// Reactions ride along with the message import: they need the event IDs it produces.
+	var reactionImport *matrix.ReactionImport
+	switch {
+	case !o.config.Matrix.Import.ImportReactions:
+		logger.Info("Reaction import disabled (matrix.import.import_reactions: false)")
+	case len(messages.Reactions) == 0:
+		// An export taken before reactions were supported has no such field, and looks exactly
+		// like an instance where nobody ever reacted. Say so, rather than silently doing nothing.
+		logger.Info("No reactions in the message export - re-run 'export messages' if the instance has any")
+	default:
+		reactionImport = &matrix.ReactionImport{
+			Reactions:       messages.Reactions,
+			AlreadyImported: msgMapping.ReactionKeys(),
+		}
+		logger.Info("Reaction import enabled: %d reactions in export, %d already sent by earlier runs",
+			len(messages.Reactions), len(reactionImport.AlreadyImported))
+
+		importer.SetReactionCheckpoint(messageCheckpointInterval, func(partial map[string]string) {
+			for key, eventID := range partial {
+				msgMapping.AddReaction(key, eventID)
+			}
+			if err := SaveMessageMapping(msgMapping, mappingFile); err != nil {
+				logger.Warn("Checkpoint: failed to save reaction mapping: %v", err)
+				return
+			}
+			logger.Info("Checkpoint: reaction mapping saved with %d entries to %s", msgMapping.ReactionCount(), mappingFile)
+		})
+	}
+
 	// Import messages with files
 	result, err := importer.ImportMessagesWithFiles(
 		messages.Posts,
@@ -1384,6 +1419,7 @@ func (o *Orchestrator) ImportMessages(progress matrix.MessageImportCallback) (*I
 		existingMapping,       // existing message mapping
 		filesByPost,           // post ID -> files
 		fileConfig,            // file migration settings
+		reactionImport,        // reactions, or nil to skip them
 		progress,
 	)
 	if err != nil {
@@ -1400,14 +1436,17 @@ func (o *Orchestrator) ImportMessages(progress matrix.MessageImportCallback) (*I
 		} else {
 			c := CategorizeMessageErrors(result.Errors)
 			logger.Warn("Message import had %d errors; details written to %s", len(result.Errors), path)
-			logger.Warn("Message error categories: no_room=%d send_error=%d reply_error=%d parent_missing=%d other=%d",
-				c["no_room"], c["send_error"], c["reply_error"], c["parent_missing"], c["other"])
+			logger.Warn("Message error categories: no_room=%d send_error=%d reply_error=%d reaction_error=%d parent_missing=%d other=%d",
+				c["no_room"], c["send_error"], c["reply_error"], c["reaction_error"], c["parent_missing"], c["other"])
 		}
 	}
 
 	// Update message mapping with new imports, then save to the same file the checkpoints
 	// have been writing so a run leaves exactly one mapping behind.
 	addMessageEntries(msgMapping, result.Mapping, postByID, assetMapping)
+	for key, eventID := range result.ReactionMapping {
+		msgMapping.AddReaction(key, eventID)
+	}
 
 	if err := SaveMessageMapping(msgMapping, mappingFile); err != nil {
 		logger.Warn("Failed to save message mapping: %v", err)
@@ -1422,6 +1461,11 @@ func (o *Orchestrator) ImportMessages(progress matrix.MessageImportCallback) (*I
 		result.Stats.RepliesImported, result.Stats.RepliesFailed)
 	logger.Info("Files: linked=%d, uploaded=%d, skipped=%d, too_large=%d",
 		result.Stats.FilesLinked, result.Stats.FilesUploaded, result.Stats.FilesSkipped, result.Stats.FilesTooLarge)
+	if reactionImport != nil {
+		logger.Info("Reactions: imported=%d, skipped=%d, failed=%d, custom_emoji=%d",
+			result.Stats.ReactionsImported, result.Stats.ReactionsSkipped,
+			result.Stats.ReactionsFailed, result.Stats.ReactionsCustomEmoji)
+	}
 	logger.Success("Message import completed successfully")
 
 	// Complete step
@@ -1440,6 +1484,12 @@ func (o *Orchestrator) ImportMessages(progress matrix.MessageImportCallback) (*I
 		FilesUploaded:    result.Stats.FilesUploaded,
 		FilesSkipped:     result.Stats.FilesSkipped,
 		FilesTooLarge:    result.Stats.FilesTooLarge,
-		MappingFile:      mappingFile,
+
+		ReactionsImported:    result.Stats.ReactionsImported,
+		ReactionsSkipped:     result.Stats.ReactionsSkipped,
+		ReactionsFailed:      result.Stats.ReactionsFailed,
+		ReactionsCustomEmoji: result.Stats.ReactionsCustomEmoji,
+
+		MappingFile: mappingFile,
 	}, nil
 }

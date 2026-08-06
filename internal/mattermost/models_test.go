@@ -38,6 +38,35 @@ func TestDMParticipantIDs(t *testing.T) {
 	}
 }
 
+func TestReactionKeyIsUnambiguous(t *testing.T) {
+	// The key is the only thing standing between a resumed import and a second copy of every
+	// reaction, so distinct reactions must never collide - including the cases where the parts
+	// would run together under a naive concatenation.
+	reactions := []Reaction{
+		{PostID: "post1", UserID: "alice", EmojiName: "+1"},
+		{PostID: "post1", UserID: "alice", EmojiName: "tada"},
+		{PostID: "post1", UserID: "bob_dev", EmojiName: "+1"},
+		{PostID: "post2", UserID: "alice", EmojiName: "+1"},
+		{PostID: "post", UserID: "1alice", EmojiName: "+1"},
+	}
+
+	seen := make(map[string]Reaction, len(reactions))
+	for _, r := range reactions {
+		key := r.Key()
+		if other, clash := seen[key]; clash {
+			t.Fatalf("key %q collides: %+v and %+v", key, other, r)
+		}
+		seen[key] = r
+	}
+
+	// The same reaction must produce the same key across runs, otherwise resuming re-sends it.
+	first := Reaction{PostID: "post1", UserID: "alice", EmojiName: "+1", CreateAt: 1}
+	second := Reaction{PostID: "post1", UserID: "alice", EmojiName: "+1", CreateAt: 999}
+	if first.Key() != second.Key() {
+		t.Fatalf("key must not depend on CreateAt: %q vs %q", first.Key(), second.Key())
+	}
+}
+
 func TestIsSystemMessage(t *testing.T) {
 	tests := []struct {
 		name string

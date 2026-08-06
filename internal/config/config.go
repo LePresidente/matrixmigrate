@@ -89,6 +89,11 @@ type ImportConfig struct {
 	// ImportDirectMessages: when true, export and import Mattermost direct message channels (D type) as Matrix DMs.
 	// Rooms appear under "People" for both users with is_direct set. Requires Application Service for m.direct account_data.
 	ImportDirectMessages bool `mapstructure:"import_direct_messages"`
+	// ImportReactions: when true (the default), emoji reactions are imported as Matrix
+	// m.reaction annotations after the messages they belong to. Each reaction costs one
+	// rate-limited API call, so a busy instance can spend a noticeable part of the message
+	// import on them; set false to trade the reactions for the time.
+	ImportReactions bool `mapstructure:"import_reactions"`
 	// UserPassword: how passwords are assigned to newly created Matrix users.
 	UserPassword UserPasswordConfig `mapstructure:"user_password"`
 }
@@ -260,6 +265,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("matrix.import.force_join", false)
 	v.SetDefault("matrix.import.public_room_join_rules", "space_members")
 	v.SetDefault("matrix.import.space_visibility", "invite_only")
+	v.SetDefault("matrix.import.import_reactions", true)
 	v.SetDefault("matrix.import.user_password.mode", UserPasswordModeAuto)
 	v.SetDefault("matrix.import.user_password.length", 24)
 	v.SetDefault("matrix.import.user_password.write_file", true)

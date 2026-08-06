@@ -174,6 +174,7 @@ Under `matrix.import` in `config.yaml` you can set:
 | `force_join` | `false` | Add users to rooms/spaces via Synapse admin API (joined directly, no invite to accept). Use when users are already expected to be members. |
 | **`public_room_join_rules`** | **`space_members`** | Who can join public (Mattermost) channels in Matrix. **`space_members`**: only members of the parent space/team can join (restricted join rule). **`public`**: anyone can join (default Matrix join rule). |
 | `import_direct_messages` | `false` | Export and import Mattermost **direct message** channels (D type) as Matrix DMs. Rooms appear under **People** for both users. See [Direct messages import](#direct-messages-import) below. |
+| `import_reactions` | `true` | Import emoji reactions as Matrix `m.reaction` annotations, after the messages they belong to. See [Reactions import](#reactions-import) below. |
 | `space_visibility` | `invite_only` | Visibility of Matrix spaces created from Mattermost teams. **`invite_only`**: spaces are private (recommended; matches Mattermost team behaviour). **`public`**: spaces are publicly joinable. **`from_mattermost`**: derive per team from its type (`O` → public, `I` → invite-only). |
 | `fallback_room_creator` | — | Matrix username (**localpart only**, e.g. `admin` for `@admin:domain`) used as room creator when the Mattermost channel has an empty `creator_id`, or when the real creator is a locked/deactivated account. If the user does not exist, the admin account from `auth.username` is used instead. Only meaningful with `preserve_owner_and_alias: true`. |
 | `user_password.mode` | `auto` | How imported users get a password. **`auto`**: no password when `matrix.mas.enabled` is true (accounts are SSO-only), a random password otherwise. **`random`**: always generate a distinct random password per user. **`local_only`**: generate one only for users whose Mattermost account had no SSO provider (`auth_service` empty) — see [Mixed workspaces](#mixed-workspaces-mode-local_only). **`none`**: never set a password. |
@@ -240,6 +241,32 @@ When `import_direct_messages` is `true`:
   - If DMs are created but do not show under People for a user, ensure the Application Service token is valid and the AS registration allows the `user_id` query parameter for account_data.
   - Check logs for `ImportDirectChannelsAsDMs` and `CreateDirectRoom` to see which channels were skipped (e.g. missing user mapping, duplicate users, or API errors).
   - “Sender/receiver” from the Mattermost name format is used only when `creator_id` is empty; when `creator_id` is set, that user is used as the room creator and the other participant is taken from the channel name.
+
+#### Reactions import
+
+Reactions ride along with `import messages` as a second pass, once every message has an event
+ID to point at. They are not a separate step.
+
+- **Export**: `export messages` also reads the Mattermost `reactions` table. An installation
+  without that table (Mattermost before 3.x) exports normally, with no reactions. **An export
+  taken with an older version of this tool has no reactions in it** — re-run `export messages`
+  or the import will find none.
+- **Emoji**: shortcodes are resolved to Unicode from the bundled gemoji table. A **custom
+  Mattermost emoji** has no Matrix equivalent and is imported as the literal text `:name:`,
+  counted separately in the run summary as `custom_emoji`.
+- **Requirements**: the **Application Service** token, as for messages. Without it reactions
+  land as the admin account with the current timestamp instead of the original author's.
+- **Skipped reactions** are counted by reason in the log rather than reported one by one. The
+  reasons that matter:
+  - `target message not imported` — the post itself never reached Matrix (a system message, a
+    deleted post, or a failed send).
+  - `sender left the channel` — Synapse refuses an event from a non-member even through the
+    Application Service. These are **not** force-joined: putting someone back into a room they
+    left to recover a thumbs-up is the wrong trade.
+  - `user not mapped` — the reacting account was not imported (e.g. in `ignored_users`).
+- **Re-runs are safe**: sent reactions are recorded in `message-mapping-<timestamp>.json` under
+  `reactions`. Matrix does **not** deduplicate annotations server-side, so this record is the
+  only thing preventing a second run from stacking a duplicate of every reaction.
 
 ## Usage
 

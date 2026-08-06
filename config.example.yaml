@@ -158,6 +158,12 @@ matrix:
     # When true, Mattermost direct message channels (D type) are exported and imported as Matrix DMs.
     # They show under "People" for both users. Requires Application Service (appservice.enabled) for setting m.direct.
     # import_direct_messages: false
+    # When true (the default), emoji reactions are imported as Matrix m.reaction annotations
+    # right after the messages they belong to, preserving author and timestamp via the
+    # Application Service. Each reaction is one rate-limited API call, so set this to false to
+    # trade the reactions for a shorter message import. Custom Mattermost emoji have no Matrix
+    # equivalent and arrive as literal ":name:" text.
+    # import_reactions: true
     # When true, users are added to rooms/spaces via Synapse admin API (joined directly, no invite to accept).
     # Use for migrations where users are already members. Default: false (invite; users must accept).
     # force_join: false

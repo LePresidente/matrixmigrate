@@ -253,6 +253,28 @@ type Post struct {
 	FileIDs   string `json:"file_ids" db:"fileids"`    // JSON array of file IDs
 }
 
+// Reaction represents a Mattermost emoji reaction on a post.
+//
+// Mattermost has no surrogate key for these: the primary key is (userid, postid, emojiname),
+// so a reaction is identified by what it is rather than by an ID. Key() rebuilds that
+// identity for the import side.
+type Reaction struct {
+	UserID    string `json:"user_id" db:"userid"`
+	PostID    string `json:"post_id" db:"postid"`
+	EmojiName string `json:"emoji_name" db:"emojiname"` // Shortcode without colons, e.g. "+1"
+	CreateAt  int64  `json:"create_at" db:"createat"`
+}
+
+// reactionKeySep separates the three parts of a reaction key. ASCII unit separator is used
+// because Mattermost IDs and emoji names cannot contain it, so the key cannot be ambiguous.
+const reactionKeySep = "\x1f"
+
+// Key returns the stable identity of a reaction, used to record it as already imported so a
+// re-run does not send it a second time.
+func (r *Reaction) Key() string {
+	return r.PostID + reactionKeySep + r.UserID + reactionKeySep + r.EmojiName
+}
+
 // FileInfo represents a Mattermost file attachment
 type FileInfo struct {
 	ID              string `json:"id" db:"id"`
@@ -393,7 +415,8 @@ type Messages struct {
 	ExportedAt int64      `json:"exported_at"`
 	Version    string     `json:"version"`
 	Posts      []Post     `json:"posts"`
-	Files      []FileInfo `json:"files,omitempty"` // File attachments
+	Files      []FileInfo `json:"files,omitempty"`     // File attachments
+	Reactions  []Reaction `json:"reactions,omitempty"` // Emoji reactions on posts
 }
 
 // MessageStats holds statistics about messages

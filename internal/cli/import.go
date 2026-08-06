@@ -7,6 +7,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/aligundogdu/matrixmigrate/internal/i18n"
+	"github.com/aligundogdu/matrixmigrate/internal/matrix"
 	"github.com/aligundogdu/matrixmigrate/internal/migration"
 )
 
@@ -246,9 +247,20 @@ func runImportMessages(cmd *cobra.Command, args []string) error {
 	startedAt := time.Now()
 	lastProgressPrint := time.Time{}
 	const progressPrintInterval = 10 * time.Second
+	// The reaction pass reuses this callback with a counter of its own, so the label, the rate
+	// and the ETA all have to start over when it begins - otherwise reactions are reported as
+	// messages, at a rate averaged over a run that has already finished.
+	label := "Messages"
+	unit := "msg"
 	progress := func(current, total int, channelName, status string) {
 		if total <= 0 {
 			return
+		}
+		if channelName == matrix.ReactionProgressStage && label != "Reactions" {
+			label = "Reactions"
+			unit = "reactions"
+			startedAt = time.Now()
+			lastProgressPrint = time.Time{}
 		}
 		now := time.Now()
 		if current < total && !lastProgressPrint.IsZero() && now.Sub(lastProgressPrint) < progressPrintInterval {
@@ -267,8 +279,8 @@ func runImportMessages(cmd *cobra.Command, args []string) error {
 			etaText = "00:00:00"
 		}
 
-		printInfo("Messages: %d/%d (%.1f%%) | rate: %.1f msg/s | ETA: %s | %s",
-			current, total, percent, ratePerSec, etaText, status)
+		printInfo("%s: %d/%d (%.1f%%) | rate: %.1f %s/s | ETA: %s | %s",
+			label, current, total, percent, ratePerSec, unit, etaText, status)
 		lastProgressPrint = now
 	}
 
@@ -283,6 +295,8 @@ func runImportMessages(cmd *cobra.Command, args []string) error {
 		result.RepliesImported, result.RepliesFailed))
 	printInfo(fmt.Sprintf("  Files: linked=%d, uploaded=%d, skipped=%d, too_large=%d",
 		result.FilesLinked, result.FilesUploaded, result.FilesSkipped, result.FilesTooLarge))
+	printInfo(fmt.Sprintf("  Reactions: imported=%d, skipped=%d, failed=%d, custom_emoji=%d",
+		result.ReactionsImported, result.ReactionsSkipped, result.ReactionsFailed, result.ReactionsCustomEmoji))
 
 	if result.MappingFile != "" {
 		printSuccess(i18n.T("messages.mapping_saved", result.MappingFile))

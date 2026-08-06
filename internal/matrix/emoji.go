@@ -1,5 +1,7 @@
 package matrix
 
+import "strings"
+
 // emojiShortcodes maps Mattermost/GitHub emoji shortcodes to their Unicode characters.
 // Matrix has no shortcode syntax and clients do not expand them, so a migrated :smile:
 // would otherwise stay literal text.
@@ -1920,4 +1922,22 @@ var emojiShortcodes = map[string]string{
 	"zombie_man":                           "🧟‍♂️",
 	"zombie_woman":                         "🧟‍♀️",
 	"zzz":                                  "💤",
+}
+
+// ReactionKey converts a Mattermost emoji name into the key of a Matrix m.reaction event,
+// and reports whether it fell back to the literal form.
+//
+// Matrix reaction keys are free-form strings, so an unknown name — a custom Mattermost emoji,
+// or a skin-tone variant gemoji does not carry — comes through as ":name:" and clients render
+// it as text. That keeps the reaction and its author visible, which is more than dropping it
+// would, even though the picture is lost.
+func ReactionKey(emojiName string) (key string, custom bool) {
+	name := strings.Trim(strings.TrimSpace(emojiName), ":")
+	if name == "" {
+		return "", true
+	}
+	if unicode, ok := emojiShortcodes[name]; ok {
+		return unicode, false
+	}
+	return ":" + name + ":", true
 }

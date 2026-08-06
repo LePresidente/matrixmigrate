@@ -62,6 +62,13 @@ type Importer struct {
 	checkpointFn    func(map[string]string)
 	checkpointEvery int
 
+	// reactionCheckpointFn mirrors checkpointFn for the reaction pass, which faces the same
+	// problem: a busy instance has thousands of reactions, each one an API call under the rate
+	// limiter, and Matrix does not deduplicate annotations server-side. Losing the record of
+	// what was already sent means the next run stacks a second copy of every reaction.
+	reactionCheckpointFn    func(map[string]string)
+	reactionCheckpointEvery int
+
 	// knownMentionUsers holds the localparts of users this run knows exist, derived from the
 	// migration's user mapping. A nil map disables mention gating.
 	knownMentionUsers map[string]struct{}
@@ -1499,6 +1506,30 @@ func (i *Importer) maybeCheckpoint(mapping map[string]string) {
 	i.checkpointFn(snapshot)
 }
 
+// SetReactionCheckpoint installs fn, called every `every` sent reactions with the
+// reaction key -> event ID mapping accumulated so far. Same contract as SetMessageCheckpoint:
+// nil fn or every <= 0 disables it, and the mapping handed to fn is a copy.
+func (i *Importer) SetReactionCheckpoint(every int, fn func(map[string]string)) {
+	i.reactionCheckpointEvery = every
+	i.reactionCheckpointFn = fn
+}
+
+// maybeReactionCheckpoint hands the reaction mapping to the checkpoint callback every
+// reactionCheckpointEvery sent reactions.
+func (i *Importer) maybeReactionCheckpoint(mapping map[string]string) {
+	if i.reactionCheckpointFn == nil || i.reactionCheckpointEvery <= 0 {
+		return
+	}
+	if len(mapping)%i.reactionCheckpointEvery != 0 {
+		return
+	}
+	snapshot := make(map[string]string, len(mapping))
+	for k, v := range mapping {
+		snapshot[k] = v
+	}
+	i.reactionCheckpointFn(snapshot)
+}
+
 // ExistingMappings holds existing mappings to skip already imported items
 type ExistingMappings struct {
 	Users  map[string]string
@@ -1585,6 +1616,11 @@ type MessageImportStats struct {
 	FilesUploaded    int `json:"files_uploaded"`  // Files uploaded to Matrix
 	FilesSkipped     int `json:"files_skipped"`   // Files skipped
 	FilesTooLarge    int `json:"files_too_large"` // Files rejected for exceeding max_upload_size_mb
+
+	ReactionsImported    int `json:"reactions_imported"`
+	ReactionsSkipped     int `json:"reactions_skipped"`      // Already imported, or no reachable target
+	ReactionsFailed      int `json:"reactions_failed"`       // Send failed for an unexpected reason
+	ReactionsCustomEmoji int `json:"reactions_custom_emoji"` // Imported as literal :name: text
 }
 
 // FileConfig holds file migration settings
@@ -1752,6 +1788,9 @@ type ImportMessagesResult struct {
 	Stats   *MessageImportStats
 	Mapping map[string]string // MattermostID -> MatrixEventID
 	Errors  []string
+	// ReactionMapping records the reactions sent by this run, keyed by mattermost.Reaction.Key().
+	// Mattermost reactions have no ID of their own, so this is what makes a re-run idempotent.
+	ReactionMapping map[string]string
 }
 
 // ImportMessages imports messages from Mattermost posts to Matrix rooms
@@ -1912,12 +1951,14 @@ func (i *Importer) ImportMessagesWithFiles(
 	existingMapping map[string]string,
 	filesByPost map[string][]mattermost.FileInfo,
 	fileConfig *FileConfig,
+	reactionImport *ReactionImport,
 	progress MessageImportCallback,
 ) (*ImportMessagesResult, error) {
 	result := &ImportMessagesResult{
-		Stats:   &MessageImportStats{},
-		Mapping: make(map[string]string),
-		Errors:  []string{},
+		Stats:           &MessageImportStats{},
+		Mapping:         make(map[string]string),
+		Errors:          []string{},
+		ReactionMapping: make(map[string]string),
 	}
 
 	if !i.client.HasASToken() {
@@ -1956,6 +1997,16 @@ func (i *Importer) ImportMessagesWithFiles(
 	// points at the previous message rather than always at the root. Posts arrive in
 	// chronological order, so this needs no sorting.
 	threadLatest := make(map[string]string)
+
+	// Index every post's target room up front. The reaction pass needs the room of a post that
+	// the loop below may skip as already imported, and those skips `continue` before the room
+	// is ever resolved.
+	roomByPost := make(map[string]string, len(posts))
+	for _, post := range posts {
+		if roomID, ok := channelToRoom[post.ChannelID]; ok {
+			roomByPost[post.ID] = roomID
+		}
+	}
 
 	// Process messages in order
 	totalTooLarge := 0
@@ -2080,6 +2131,12 @@ func (i *Importer) ImportMessagesWithFiles(
 
 	}
 
+	// Reactions come last: an annotation can only point at an event that already exists.
+	if reactionImport != nil && len(reactionImport.Reactions) > 0 {
+		i.importReactions(result, reactionImport.Reactions, roomByPost, userMapping,
+			reactionImport.AlreadyImported, progress)
+	}
+
 	logger.Info("Message import completed: imported=%d, skipped=%d, failed=%d, replies=%d, files_uploaded=%d, files_linked=%d",
 		result.Stats.MessagesImported, result.Stats.MessagesSkipped,
 		result.Stats.MessagesFailed, result.Stats.RepliesImported, result.Stats.FilesUploaded, result.Stats.FilesLinked)
@@ -2089,6 +2146,135 @@ func (i *Importer) ImportMessagesWithFiles(
 	}
 
 	return result, nil
+}
+
+// ReactionProgressStage is passed in the channel slot of MessageImportCallback while the
+// reaction pass runs, so a front end can label the progress and restart its rate estimate
+// instead of reporting reactions as messages.
+const ReactionProgressStage = "reactions"
+
+// ReactionImport carries everything the reaction pass needs. A nil value turns reactions off.
+type ReactionImport struct {
+	Reactions []mattermost.Reaction
+	// AlreadyImported holds the reaction keys sent by earlier runs, so a resumed import does
+	// not annotate the same event twice.
+	AlreadyImported map[string]string
+}
+
+// reactionSkipReason reports why a reaction cannot be sent, or "" when it can.
+//
+// Kept free of I/O so every branch is testable: a reaction silently vanishing is the failure
+// mode that matters here, and each of these reasons has a different remedy.
+func reactionSkipReason(targetEventID, roomID, senderID, emojiKey string) string {
+	switch {
+	case targetEventID == "":
+		// The post never reached Matrix: a system message, deleted, or a failed send.
+		return "target message not imported"
+	case roomID == "":
+		return "no room mapping"
+	case senderID == "":
+		return "user not mapped"
+	case emojiKey == "":
+		return "empty emoji name"
+	}
+	return ""
+}
+
+// importReactions annotates already-imported messages with the reactions they carried in
+// Mattermost. It runs after the message pass because an annotation needs the event ID of its
+// target, which only exists once that message has been sent.
+//
+// Reactions from people who have since left the channel are skipped rather than force-joined:
+// Synapse refuses an event from a non-member even through the Application Service, and
+// re-adding them would put someone back into a room they deliberately left. The tally names
+// that case explicitly so the loss is visible rather than silent.
+func (i *Importer) importReactions(
+	result *ImportMessagesResult,
+	reactions []mattermost.Reaction,
+	roomByPost map[string]string,
+	userMapping map[string]string,
+	alreadyImported map[string]string,
+	progress MessageImportCallback,
+) {
+	total := len(reactions)
+	logger.Info("Starting reaction import: %d reactions to process", total)
+
+	tally := &skipTally{}
+
+	for idx, reaction := range reactions {
+		key := reaction.Key()
+
+		if _, done := alreadyImported[key]; done {
+			result.Stats.ReactionsSkipped++
+			tally.add("already imported")
+			if progress != nil {
+				progress(idx+1, total, ReactionProgressStage, "skipped")
+			}
+			continue
+		}
+		if _, done := result.ReactionMapping[key]; done {
+			// Duplicate row for the same (post, user, emoji). Should not happen given the
+			// primary key, but a hand-edited dump could contain one.
+			result.Stats.ReactionsSkipped++
+			tally.add("duplicate in export")
+			continue
+		}
+
+		targetEventID := result.Mapping[reaction.PostID]
+		roomID := roomByPost[reaction.PostID]
+		senderID := userMapping[reaction.UserID]
+		emojiKey, custom := ReactionKey(reaction.EmojiName)
+
+		if reason := reactionSkipReason(targetEventID, roomID, senderID, emojiKey); reason != "" {
+			result.Stats.ReactionsSkipped++
+			tally.add(reason)
+			if progress != nil {
+				progress(idx+1, total, ReactionProgressStage, "skipped")
+			}
+			continue
+		}
+
+		resp, err := i.client.SendReactionWithTimestamp(roomID, targetEventID, emojiKey, reaction.CreateAt, senderID)
+		if err != nil {
+			if isNotInRoomError(err) {
+				result.Stats.ReactionsSkipped++
+				tally.add("sender left the channel")
+				if progress != nil {
+					progress(idx+1, total, ReactionProgressStage, "skipped")
+				}
+				continue
+			}
+			result.Stats.ReactionsFailed++
+			result.Errors = append(result.Errors,
+				fmt.Sprintf("Failed to send reaction %s on post %s: %v", reaction.EmojiName, reaction.PostID, err))
+			if progress != nil {
+				progress(idx+1, total, ReactionProgressStage, "failed")
+			}
+			continue
+		}
+
+		result.ReactionMapping[key] = resp.EventID
+		result.Stats.ReactionsImported++
+		if custom {
+			result.Stats.ReactionsCustomEmoji++
+		}
+		i.maybeReactionCheckpoint(result.ReactionMapping)
+
+		if progress != nil {
+			progress(idx+1, total, ReactionProgressStage, "imported")
+		}
+	}
+
+	logger.Info("Reaction import completed: imported=%d, skipped=%d, failed=%d, custom_emoji=%d",
+		result.Stats.ReactionsImported, result.Stats.ReactionsSkipped,
+		result.Stats.ReactionsFailed, result.Stats.ReactionsCustomEmoji)
+	if summary := tally.String(); summary != "" {
+		logger.Info("Reactions skipped by reason: %s", summary)
+	}
+	if result.Stats.ReactionsCustomEmoji > 0 {
+		logger.Info("%d reaction(s) used a custom Mattermost emoji and were imported as literal :name: text",
+			result.Stats.ReactionsCustomEmoji)
+	}
 }
 
 // LeaveMigratedRooms makes the migration admin leave every room and space it created,

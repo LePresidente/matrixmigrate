@@ -9,6 +9,7 @@ import (
 
 	"github.com/aligundogdu/matrixmigrate/internal/config"
 	"github.com/aligundogdu/matrixmigrate/internal/i18n"
+	"github.com/aligundogdu/matrixmigrate/internal/matrix"
 	"github.com/aligundogdu/matrixmigrate/internal/migration"
 	"github.com/aligundogdu/matrixmigrate/internal/version"
 )
@@ -960,7 +961,12 @@ func (m *Model) runImportMessages() tea.Cmd {
 		sendProgress("Importing messages...", 0, 0, "")
 
 		progress := func(current, total int, channelName, status string) {
-			sendProgress(fmt.Sprintf("Messages: %s", status), current, total, channelName)
+			// The reaction pass shares this callback but counts its own items.
+			label := "Messages"
+			if channelName == matrix.ReactionProgressStage {
+				label = "Reactions"
+			}
+			sendProgress(fmt.Sprintf("%s: %s", label, status), current, total, channelName)
 		}
 
 		result, err := m.orchestrator.ImportMessages(progress)
@@ -968,9 +974,10 @@ func (m *Model) runImportMessages() tea.Cmd {
 			return operationCompleteMsg{err: err}
 		}
 
-		msg := fmt.Sprintf("Messages imported: %d imported, %d skipped, %d failed, files linked=%d uploaded=%d skipped=%d too_large=%d",
+		msg := fmt.Sprintf("Messages imported: %d imported, %d skipped, %d failed, files linked=%d uploaded=%d skipped=%d too_large=%d, reactions imported=%d skipped=%d failed=%d",
 			result.MessagesImported, result.MessagesSkipped, result.MessagesFailed,
-			result.FilesLinked, result.FilesUploaded, result.FilesSkipped, result.FilesTooLarge)
+			result.FilesLinked, result.FilesUploaded, result.FilesSkipped, result.FilesTooLarge,
+			result.ReactionsImported, result.ReactionsSkipped, result.ReactionsFailed)
 		return operationCompleteMsg{message: msg}
 	}
 }

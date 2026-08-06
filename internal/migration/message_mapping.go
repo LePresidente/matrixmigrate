@@ -41,6 +41,8 @@ func CategorizeMessageErrors(errs []string) map[string]int {
 			counts["reply_error"]++
 		case strings.Contains(e, "Failed to send message"):
 			counts["send_error"]++
+		case strings.Contains(e, "Failed to send reaction"):
+			counts["reaction_error"]++
 		case strings.Contains(e, "Parent post"):
 			counts["parent_missing"]++
 		default:
@@ -57,7 +59,12 @@ type MessageMapping struct {
 	UpdatedAt  int64                      `json:"updated_at"`
 	Homeserver string                     `json:"homeserver"`
 	Messages   map[string]*MessageMapEntry `json:"messages"` // key: Mattermost post ID
-	mu         sync.RWMutex               `json:"-"`
+	// Reactions records which reactions have been sent, keyed by mattermost.Reaction.Key()
+	// (post ID, user ID and emoji name joined). Mattermost gives reactions no ID of their own,
+	// and Matrix does not deduplicate annotations, so without this a second run would stack a
+	// duplicate of every reaction on top of the first.
+	Reactions map[string]string `json:"reactions,omitempty"`
+	mu        sync.RWMutex      `json:"-"`
 }
 
 // MessageMapEntry represents a single message mapping
@@ -83,6 +90,7 @@ func NewMessageMapping(homeserver string) *MessageMapping {
 		UpdatedAt:  now,
 		Homeserver: homeserver,
 		Messages:   make(map[string]*MessageMapEntry),
+		Reactions:  make(map[string]string),
 	}
 }
 
@@ -112,6 +120,47 @@ func (m *MessageMapping) HasMessage(mattermostID string) bool {
 	
 	_, exists := m.Messages[mattermostID]
 	return exists
+}
+
+// AddReaction records a sent reaction under its Mattermost reaction key.
+func (m *MessageMapping) AddReaction(reactionKey, matrixEventID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.Reactions == nil {
+		m.Reactions = make(map[string]string)
+	}
+	m.Reactions[reactionKey] = matrixEventID
+	m.UpdatedAt = time.Now().UnixMilli()
+}
+
+// HasReaction reports whether a reaction has already been sent.
+func (m *MessageMapping) HasReaction(reactionKey string) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	_, exists := m.Reactions[reactionKey]
+	return exists
+}
+
+// ReactionCount returns the number of recorded reactions.
+func (m *MessageMapping) ReactionCount() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return len(m.Reactions)
+}
+
+// ReactionKeys returns a copy of the recorded reaction keys and their event IDs, for handing
+// to an import run as the set it should not send again.
+func (m *MessageMapping) ReactionKeys() map[string]string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	out := make(map[string]string, len(m.Reactions))
+	for k, v := range m.Reactions {
+		out[k] = v
+	}
+	return out
 }
 
 // GetMatrixEventID returns the Matrix event ID for a Mattermost post
@@ -195,6 +244,10 @@ func LoadMessageMapping(filepath string) (*MessageMapping, error) {
 	
 	if mapping.Messages == nil {
 		mapping.Messages = make(map[string]*MessageMapEntry)
+	}
+	// Mapping files written before reactions existed have no such key.
+	if mapping.Reactions == nil {
+		mapping.Reactions = make(map[string]string)
 	}
 	
 	return &mapping, nil
