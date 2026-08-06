@@ -890,10 +890,13 @@ func (o *Orchestrator) ImportMemberships(progress ProgressCallback) (*OperationR
 	// Load assets to get channel list (needed for group channel equal power levels and DM memberships)
 	// and to resolve ignored usernames -> user IDs for membership filtering.
 	var channels []mattermost.Channel
+	var users []mattermost.User
 	if assetFile := o.state.GetStepOutputFile(StepExportAssets); assetFile != "" {
 		var assets mattermost.Assets
 		if err := archive.LoadGzipJSON(assetFile, &assets); err == nil {
 			channels = append(assets.Channels, assets.DirectChannels...)
+			// Needed to explain why a channel referenced by a membership has no room.
+			users = assets.Users
 			logger.Info("Loaded %d channels (%d regular + %d direct) from assets for membership import", len(channels), len(assets.Channels), len(assets.DirectChannels))
 
 			if len(o.config.Mattermost.IgnoredUsers) > 0 {
@@ -958,7 +961,7 @@ func (o *Orchestrator) ImportMemberships(progress ProgressCallback) (*OperationR
 	if progress != nil {
 		progress("channel_memberships", 0, len(memberships.ChannelMembers), "")
 	}
-	channelStats, err := importer.ApplyChannelMemberships(channels, memberships.ChannelMembers, mapping.Users, mapping.Channels, defaultChannelOwnerID, importProgress)
+	channelStats, err := importer.ApplyChannelMemberships(channels, users, memberships.ChannelMembers, mapping.Users, mapping.Channels, defaultChannelOwnerID, importProgress)
 	if err != nil {
 		o.state.FailStep(StepImportMemberships, err)
 		o.SaveState()

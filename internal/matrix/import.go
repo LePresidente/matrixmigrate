@@ -5,6 +5,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
 	"strings"
 	"unicode"
 
@@ -809,6 +810,7 @@ func (i *Importer) ApplyTeamMemberships(
 // channels is used to identify group and direct channels; can be nil (then no equal power levels, and no DM skip).
 func (i *Importer) ApplyChannelMemberships(
 	channels []mattermost.Channel,
+	users []mattermost.User,
 	memberships []mattermost.ChannelMember,
 	userMapping map[string]string,
 	roomMapping map[string]string,
@@ -826,6 +828,12 @@ func (i *Importer) ApplyChannelMemberships(
 		}
 		m["?"]++
 	}
+
+	// Channels referenced by memberships that never got a Matrix room. Collected with a
+	// reason and reported once at the end: warning per membership says the same thing dozens
+	// of times without ever saying why the room is missing.
+	unmapped := make(map[string]*unmappedChannel)
+	unmappedTotal := 0
 
 	channelByID := make(map[string]mattermost.Channel)
 	groupChannelIDs := make(map[string]bool)
@@ -916,7 +924,17 @@ func (i *Importer) ApplyChannelMemberships(
 				logger.Warn("Channel membership %d/%d skipped: user %s not in mapping", idx+1, total, membership.UserID)
 			}
 			if !roomExists {
-				logger.Warn("Channel membership %d/%d skipped: channel %s not in mapping", idx+1, total, membership.ChannelID)
+				entry, seen := unmapped[membership.ChannelID]
+				if !seen {
+					ch, known := channelByID[membership.ChannelID]
+					entry = &unmappedChannel{
+						name:   ch.DisplayName,
+						reason: unmappedChannelReason(ch, known, users),
+					}
+					unmapped[membership.ChannelID] = entry
+				}
+				entry.count++
+				unmappedTotal++
 			}
 			bump(skippedByType, channelType)
 			stats.MembersSkipped++
@@ -1072,6 +1090,19 @@ func (i *Importer) ApplyChannelMemberships(
 		stats.MembersAdded++
 	}
 
+	if len(unmapped) > 0 {
+		ids := make([]string, 0, len(unmapped))
+		for id := range unmapped {
+			ids = append(ids, id)
+		}
+		sort.Strings(ids)
+		logger.Warn("ApplyChannelMemberships: %d membership(s) skipped across %d channel(s) with no Matrix room:", unmappedTotal, len(unmapped))
+		for _, id := range ids {
+			e := unmapped[id]
+			logger.Warn("  channel %s %q: %s (%d membership(s))", id, e.name, e.reason, e.count)
+		}
+	}
+
 	// For group channels, set equal power levels (50) for all members to match Mattermost
 	for roomID, memberIDs := range groupRoomMembers {
 		if len(memberIDs) == 0 {
@@ -1141,6 +1172,31 @@ func (i *Importer) ApplyChannelMemberships(
 	}
 
 	return stats, nil
+}
+
+// unmappedChannel records a channel that memberships referenced but that has no Matrix room.
+type unmappedChannel struct {
+	name   string
+	reason string
+	count  int
+}
+
+// unmappedChannelReason explains why a channel has no room, mirroring the conditions under
+// which room import skips one. "Not in mapping" on its own sends the reader to the wrong
+// place: most of these are deliberate, and the one that is not looks exactly the same.
+func unmappedChannelReason(ch mattermost.Channel, known bool, users []mattermost.User) string {
+	switch {
+	case !known:
+		return "not present in the exported assets - re-run export assets"
+	case ch.IsDeleted():
+		return "deleted in Mattermost, so no room was created"
+	case ch.IsDirect():
+		return "direct channel - imported separately, and only when matrix.import.import_direct_messages is set"
+	case ch.IsGroup() && groupParticipantsAllLocked(ch.DisplayName, users):
+		return "group conversation whose participants are all locked or deleted in Mattermost"
+	default:
+		return "room creation did not succeed - look for this channel in the import assets log"
+	}
 }
 
 // skipTally counts why items were skipped, in first-seen order, so a run can report the shape
