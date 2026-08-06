@@ -84,42 +84,70 @@ type Client struct {
 	joinedRooms   map[string]struct{}
 	joinedRoomsMu sync.Mutex
 
-	// roomCreators caches room ID -> creator user ID, looked up when writing power levels
-	roomCreators   map[string]string
-	roomCreatorsMu sync.Mutex
+	// roomInfos caches room ID -> creator and room version, looked up when writing power levels
+	roomInfos   map[string]roomInfo
+	roomInfosMu sync.Mutex
 }
 
-// roomCreator returns the user that created roomID, or "" when it cannot be determined.
-// Results are cached because power levels are written repeatedly for the same rooms.
-func (c *Client) roomCreator(roomID string) string {
-	c.roomCreatorsMu.Lock()
-	if creator, ok := c.roomCreators[roomID]; ok {
-		c.roomCreatorsMu.Unlock()
-		return creator
-	}
-	c.roomCreatorsMu.Unlock()
+// roomInfo is the part of the admin room details needed to write power levels correctly.
+type roomInfo struct {
+	creator string
+	version string
+}
 
-	creator := ""
+// lookupRoomInfo returns the creator and room version of roomID, both "" when they cannot be
+// determined. Results are cached because power levels are written repeatedly for the same
+// rooms, and creator and version arrive in the same response.
+func (c *Client) lookupRoomInfo(roomID string) roomInfo {
+	c.roomInfosMu.Lock()
+	if info, ok := c.roomInfos[roomID]; ok {
+		c.roomInfosMu.Unlock()
+		return info
+	}
+	c.roomInfosMu.Unlock()
+
+	var info roomInfo
 	endpoint := "/_synapse/admin/v1/rooms/" + url.PathEscape(roomID)
 	body, statusCode, err := c.doRequest("GET", endpoint, nil)
 	if err == nil && statusCode == http.StatusOK {
 		var resp struct {
 			Creator string `json:"creator"`
+			Version string `json:"version"`
 		}
 		if json.Unmarshal(body, &resp) == nil {
-			creator = resp.Creator
+			info.creator = resp.Creator
+			info.version = resp.Version
 		}
 	} else if err != nil {
-		logger.Debug("roomCreator: could not look up creator of %s: %v", roomID, err)
+		logger.Debug("lookupRoomInfo: could not look up %s: %v", roomID, err)
 	}
 
-	c.roomCreatorsMu.Lock()
-	if c.roomCreators == nil {
-		c.roomCreators = make(map[string]string)
+	c.roomInfosMu.Lock()
+	if c.roomInfos == nil {
+		c.roomInfos = make(map[string]roomInfo)
 	}
-	c.roomCreators[roomID] = creator
-	c.roomCreatorsMu.Unlock()
-	return creator
+	c.roomInfos[roomID] = info
+	c.roomInfosMu.Unlock()
+	return info
+}
+
+// creatorMustBeAbsentFromPowerLevels reports whether the room version forbids listing the
+// creator in m.room.power_levels content.users.
+//
+// Room version 12 gave creators implicit infinite power and made their presence in
+// content.users a rejection reason. Before that the creator is an ordinary entry, normally at
+// level 100 — and removing it is a power-level change like any other, which the server refuses
+// when the requester's own level merely equals it ("You don't have permission to remove ops
+// level equal to your own"). So the rule has to follow the version rather than apply always.
+//
+// Unparseable or unknown versions are treated as not requiring it: leaving an entry alone is
+// recoverable, removing one the server will not let us remove is not.
+func creatorMustBeAbsentFromPowerLevels(version string) bool {
+	v, err := strconv.Atoi(strings.TrimSpace(version))
+	if err != nil {
+		return false
+	}
+	return v >= 12
 }
 
 // NewClient creates a new Matrix API client with default rate limiting
@@ -1430,7 +1458,9 @@ func (c *Client) setPowerLevelsWithToken(roomID string, content *PowerLevelsCont
 	// content.users"). Rooms here are created as their owner, so the owner is usually the creator
 	// and every power-level update would fail. Dropping the entry is safe: it cannot lower or
 	// raise a creator's power either way.
-	if creator := c.roomCreator(roomID); creator != "" && content != nil && content.Users != nil {
+	if info := c.lookupRoomInfo(roomID); info.creator != "" && content != nil && content.Users != nil &&
+		creatorMustBeAbsentFromPowerLevels(info.version) {
+		creator := info.creator
 		if _, listed := content.Users[creator]; listed {
 			stripped := make(map[string]int, len(content.Users))
 			for u, l := range content.Users {
