@@ -17,15 +17,24 @@ type CreateUserRequest struct {
 	Deactivated bool   `json:"deactivated"`
 }
 
+// Threepid is a third-party identifier attached to a Matrix account. Only the email medium
+// matters here: Synapse refuses to create an email pusher whose pushkey is not one of the
+// user's own threepids, so this is what email notifications ultimately hang on.
+type Threepid struct {
+	Medium  string `json:"medium"`
+	Address string `json:"address"`
+}
+
 // UserResponse is the response from the Admin API for user operations
 type UserResponse struct {
-	Name        string `json:"name"`
-	UserID      string `json:"user_id,omitempty"`
-	DisplayName string `json:"displayname,omitempty"`
-	Admin       bool   `json:"admin"`
-	Deactivated bool   `json:"deactivated"`
-	Errcode     string `json:"errcode,omitempty"`
-	Error       string `json:"error,omitempty"`
+	Name        string     `json:"name"`
+	UserID      string     `json:"user_id,omitempty"`
+	DisplayName string     `json:"displayname,omitempty"`
+	Threepids   []Threepid `json:"threepids,omitempty"`
+	Admin       bool       `json:"admin"`
+	Deactivated bool       `json:"deactivated"`
+	Errcode     string     `json:"errcode,omitempty"`
+	Error       string     `json:"error,omitempty"`
 }
 
 // Room represents a Matrix room

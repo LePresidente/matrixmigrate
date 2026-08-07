@@ -515,6 +515,103 @@ func (c *Client) updateUserProfile(userID, displayName, email string) error {
 	return nil
 }
 
+// EnsureUserProfile fills in a display name and an email address on an account that already
+// exists, without overwriting anything that is already there.
+//
+// This is the repair path for accounts the import skips. A user who signed in through SSO
+// before the migration already exists in MAS, so ImportUsers only records the mapping and
+// never calls CreateUser — which means updateUserProfile never runs and the account ends up
+// with no email address, and therefore no email notifications. The display name can still be
+// present, because MAS sets that from the upstream provider's claims.
+//
+// Nothing is overwritten: the display name is only set when the account has none, and the
+// address is appended to the existing threepids. That second point is not cosmetic — the
+// admin API's threepids parameter "entirely replaces" the list, so writing it blind would
+// delete an address the person added themselves.
+func (c *Client) EnsureUserProfile(matrixUserID, displayName, email string) error {
+	displayName = strings.TrimSpace(displayName)
+	email = strings.ToLower(strings.TrimSpace(email))
+	if displayName == "" && email == "" {
+		return nil
+	}
+
+	current, err := c.GetUser(matrixUserID)
+	if err != nil {
+		return fmt.Errorf("could not read current profile: %w", err)
+	}
+	if current == nil {
+		return fmt.Errorf("user %s does not exist", matrixUserID)
+	}
+
+	body := make(map[string]interface{})
+
+	if displayName != "" && strings.TrimSpace(current.DisplayName) == "" {
+		body["displayname"] = displayName
+	}
+
+	if email != "" && !hasEmailThreepid(current.Threepids, email) {
+		merged := make([]map[string]string, 0, len(current.Threepids)+1)
+		for _, tp := range current.Threepids {
+			merged = append(merged, map[string]string{"medium": tp.Medium, "address": tp.Address})
+		}
+		merged = append(merged, map[string]string{"medium": "email", "address": email})
+		body["threepids"] = merged
+	}
+
+	// Nothing missing. Skipping the write keeps a re-run from touching accounts it has
+	// nothing to add to.
+	if len(body) == 0 {
+		return nil
+	}
+
+	endpoint := fmt.Sprintf("/_synapse/admin/v2/users/%s", url.PathEscape(matrixUserID))
+	_, statusCode, err := c.doRequest("PUT", endpoint, body)
+	if err != nil {
+		return err
+	}
+	if statusCode != http.StatusOK && statusCode != http.StatusCreated {
+		return fmt.Errorf("profile update returned status %d", statusCode)
+	}
+
+	_, setName := body["displayname"]
+	_, setEmail := body["threepids"]
+	logger.Info("Completed profile for existing user %s (display name set: %v, email added: %v)",
+		matrixUserID, setName, setEmail)
+	return nil
+}
+
+// EnsureMASEmail attaches an email address to an existing MAS account, for accounts the
+// import skipped. A no-op when MAS is not in use, and never fatal: the address notifications
+// depend on is the Synapse threepid, which EnsureUserProfile handles.
+func (c *Client) EnsureMASEmail(username, email string) {
+	if c.masClient == nil || email == "" {
+		return
+	}
+	ulid, err := c.masClient.UserULID(username)
+	if err != nil {
+		logger.Warn("Could not look up MAS user '%s' to add an email address: %v", username, err)
+		return
+	}
+	if ulid == "" {
+		return
+	}
+	if err := c.masClient.AddEmail(ulid, email); err != nil {
+		logger.Warn("MAS add-email failed for existing user '%s': %v", username, err)
+	}
+}
+
+// hasEmailThreepid reports whether address is already among the user's email threepids.
+// Addresses are compared case-insensitively because Synapse canonicalises a pusher's pushkey
+// but stores whatever the admin API was given, so the two can differ only in case.
+func hasEmailThreepid(threepids []Threepid, address string) bool {
+	for _, tp := range threepids {
+		if tp.Medium == "email" && strings.EqualFold(tp.Address, address) {
+			return true
+		}
+	}
+	return false
+}
+
 // UserExists checks if a user exists
 func (c *Client) UserExists(username string) (bool, error) {
 	if c.masClient != nil {

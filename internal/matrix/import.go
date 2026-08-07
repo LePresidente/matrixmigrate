@@ -335,6 +335,18 @@ func (i *Importer) ImportUsers(users []mattermost.User, existingMapping map[stri
 			exists = existsCheck
 		}
 
+		// Display name from Mattermost, used both for accounts we create and for filling in
+		// the gaps on accounts that already exist.
+		displayName := strings.TrimSpace(user.FirstName + " " + user.LastName)
+		if displayName == "" {
+			displayName = user.Username
+		}
+		// Lower-cased once, here. Synapse canonicalises a pusher's pushkey but stores the
+		// threepid exactly as the admin API was given it, so an address with capitals would
+		// later fail the pusher's ownership check with THREEPID_NOT_FOUND and leave that
+		// person without email notifications, for no visible reason.
+		email := strings.ToLower(strings.TrimSpace(user.Email))
+
 		if exists {
 			// User already exists, add to mapping
 			mxID := i.client.FormatUserID(user.Username)
@@ -347,16 +359,21 @@ func (i *Importer) ImportUsers(users []mattermost.User, existingMapping map[stri
 					logger.Info("User '%s' already exists; set deactivated (locked) to match Mattermost", user.Username)
 				}
 			}
+			// Anyone who signed in through SSO before the migration lands here, and would
+			// otherwise keep an account with no email address - and so no email notifications.
+			// Additive: nothing already on the account is overwritten.
+			if err := i.client.EnsureUserProfile(mxID, displayName, email); err != nil {
+				logger.Warn("Failed to complete profile for existing user '%s': %v", user.Username, err)
+			}
+			if email != "" {
+				i.client.EnsureMASEmail(user.Username, email)
+			}
 			logger.Info("User '%s' already exists, skipped", user.Username)
 			stats.UsersSkipped++
 			continue
 		}
 
 		// Create the user (CreateUser is idempotent - if user exists, it will update)
-		displayName := strings.TrimSpace(user.FirstName + " " + user.LastName)
-		if displayName == "" {
-			displayName = user.Username
-		}
 
 		// An empty password means "do not set one" (PasswordModeNone, or PasswordModeLocalOnly
 		// for a user who had SSO in Mattermost); the account is then reachable only via
@@ -371,7 +388,7 @@ func (i *Importer) ImportUsers(users []mattermost.User, existingMapping map[stri
 		req := &CreateUserRequest{
 			Password:    password,
 			DisplayName: displayName,
-			Email:       strings.TrimSpace(user.Email),
+			Email:       email,
 			Admin:       false,
 			Deactivated: deactivated,
 		}

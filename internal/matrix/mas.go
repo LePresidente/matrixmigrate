@@ -243,6 +243,15 @@ func (m *MASClient) CreateUser(username string, req *CreateUserRequest) (*UserRe
 		}
 	}
 
+	// Attach the email address. Best effort: the address that notifications depend on is the
+	// Synapse threepid, set separately by the caller, so a failure here costs the MAS account
+	// page and account recovery, not the migration.
+	if req != nil && req.Email != "" && masUserID != "" {
+		if err := m.AddEmail(masUserID, req.Email); err != nil {
+			logger.Warn("MAS add-email failed for '%s': %v", username, err)
+		}
+	}
+
 	userID := m.FormatUserID(username)
 	logger.Success("Created user in MAS: %s -> %s", username, userID)
 	return &UserResponse{
@@ -283,6 +292,66 @@ func (m *MASClient) VerifyCredentials() error {
 		return err
 	}
 	return nil
+}
+
+// UserULID returns the MAS-internal ULID for a username, or "" when MAS does not know it.
+// The admin API identifies users by this ULID rather than by localpart.
+func (m *MASClient) UserULID(username string) (string, error) {
+	path := "/api/admin/v1/users/by-username/" + url.PathEscape(username)
+	body, statusCode, err := m.doRequest("GET", path, nil)
+	if err != nil {
+		return "", err
+	}
+	if statusCode == http.StatusNotFound {
+		return "", nil
+	}
+	if statusCode != http.StatusOK {
+		return "", fmt.Errorf("MAS API error (%d): %s", statusCode, string(body))
+	}
+	var resp masSingleUserResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return "", fmt.Errorf("parse MAS user response: %w", err)
+	}
+	return resp.Data.ID, nil
+}
+
+// AddEmail attaches an email address to a MAS account, given the account's ULID.
+//
+// MAS and Synapse keep separate address books: an address set through the Synapse admin API
+// is invisible to MAS and vice versa. Email notifications hang on the Synapse threepid alone;
+// this one is what MAS shows on the account page and uses for account recovery.
+//
+// The route was added in MAS 0.15.0. On an older MAS it simply does not exist, which must not
+// be allowed to fail a migration over a convenience feature — hence the explicit 404 branch.
+func (m *MASClient) AddEmail(userULID, email string) error {
+	body, statusCode, err := m.doRequest("POST", "/api/admin/v1/user-emails",
+		map[string]string{"user_id": userULID, "email": email})
+	if err != nil {
+		return err
+	}
+
+	switch {
+	case isHTTPSuccess(statusCode):
+		return nil
+	case statusCode == http.StatusNotFound:
+		return fmt.Errorf("MAS has no /api/admin/v1/user-emails route (added in MAS 0.15.0); "+
+			"the address is set in Synapse and notifications work, but MAS will not show it: %s", string(body))
+	case statusCode == http.StatusConflict:
+		// Already attached. The endpoint adds a single address rather than replacing a list,
+		// so there is nothing to reconcile.
+		return nil
+	default:
+		var errResp masErrorResponse
+		_ = json.Unmarshal(body, &errResp)
+		msg := string(body)
+		if len(errResp.Errors) > 0 {
+			msg = errResp.Errors[0].Title
+		}
+		if strings.Contains(strings.ToLower(msg), "already exists") {
+			return nil
+		}
+		return fmt.Errorf("MAS API error (%d): %s", statusCode, msg)
+	}
 }
 
 // FormatUserID returns the full Matrix user ID for the given localpart.

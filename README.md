@@ -228,6 +228,30 @@ This file is plaintext credentials. It is created `0600`, is gitignored, and sho
 deleted once the passwords have been distributed. If it is lost, affected users can only get
 in via SSO or an admin-initiated password reset — the passwords are not stored anywhere else.
 
+#### Accounts that already exist
+
+An account can already exist before the import — most often because the person signed in
+through SSO at some point, which creates them in MAS. Those are not created again; the import
+records the mapping and moves on.
+
+They do get their profile completed, additively:
+
+- **Display name** is set only if the account has none. A name the person chose themselves, or
+  one MAS imported from the upstream provider's claims, is left alone.
+- **Email address** is appended to the account's existing third-party IDs. This matters: the
+  admin API's `threepids` parameter *replaces* the whole list, so writing it blind would delete
+  an address the person added themselves.
+- With MAS, the address is also attached to the MAS account. MAS and Synapse keep separate
+  address books — an address set through one is invisible to the other. Synapse's copy is what
+  email notifications depend on; the MAS copy is what its account page shows and what account
+  recovery uses. A MAS older than 0.15.0 has no route for this and is reported as a warning,
+  not a failure.
+
+Email addresses are lower-cased on the way in. Synapse canonicalises a pusher's push key but
+stores the third-party ID exactly as given, so an address with capitals would later fail an
+email pusher's ownership check with `THREEPID_NOT_FOUND` — leaving that person without email
+notifications for no visible reason.
+
 #### Direct messages import
 
 When `import_direct_messages` is `true`:
