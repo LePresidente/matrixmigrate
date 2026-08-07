@@ -97,10 +97,20 @@ func (i *Importer) GeneratedCredentials() []UserCredential {
 // ImportProgressCallback is called to report import progress
 type ImportProgressCallback func(stage string, current, total int, item string)
 
-var mattermostBroadcastMentions = map[string]struct{}{
-	"all":     {},
-	"channel": {},
-	"here":    {},
+// matrixRoomMention is what Matrix calls a message addressed to everyone in the room.
+const matrixRoomMention = "@room"
+
+// mattermostBroadcastMentions maps Mattermost's channel-wide mentions to their Matrix
+// spelling, or to "" where Matrix has nothing equivalent.
+//
+// @all and @channel mean the same thing in Mattermost and translate cleanly. @here does not:
+// it addresses whoever happens to be online, a distinction Matrix has no concept of, and
+// rendering it as @room in the archive would claim the author addressed more people than they
+// did. It stays as written.
+var mattermostBroadcastMentions = map[string]string{
+	"all":     matrixRoomMention,
+	"channel": matrixRoomMention,
+	"here":    "",
 }
 
 func isMentionChar(b byte) bool {
@@ -157,8 +167,12 @@ func (i *Importer) normalizeMatrixMentions(message string) string {
 			continue
 		}
 
-		if _, isBroadcast := mattermostBroadcastMentions[strings.ToLower(username)]; isBroadcast {
-			out.WriteString(message[idx:j])
+		if replacement, isBroadcast := mattermostBroadcastMentions[strings.ToLower(username)]; isBroadcast {
+			if replacement != "" {
+				out.WriteString(replacement)
+			} else {
+				out.WriteString(message[idx:j])
+			}
 			idx = j
 			continue
 		}

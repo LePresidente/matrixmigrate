@@ -195,9 +195,27 @@ func TestNormalizeMatrixMentions(t *testing.T) {
 			want: "mail me at alice@example.com",
 		},
 		{
-			name: "broadcast mentions are not changed",
+			// @all and @channel become Matrix's @room; @here has no Matrix equivalent and
+			// stays as written rather than claiming a wider audience than the author meant.
+			name: "channel-wide mentions map to @room, @here does not",
 			in:   "@here @all @channel",
-			want: "@here @all @channel",
+			want: "@here @room @room",
+		},
+		{
+			name: "broadcast mentions are matched case-insensitively",
+			in:   "@All hands, @Channel too",
+			want: "@room hands, @room too",
+		},
+		{
+			// The rewrite must not consume the surrounding punctuation or run into the next word.
+			name: "@all keeps its surroundings",
+			in:   "(@all) done, @all.",
+			want: "(@room) done, @room.",
+		},
+		{
+			name: "a user actually called all is not a broadcast",
+			in:   "mail me at all@example.com",
+			want: "mail me at all@example.com",
 		},
 		{
 			name: "trailing period is preserved outside mention",

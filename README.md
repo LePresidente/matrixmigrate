@@ -420,6 +420,32 @@ check the summary line for a non-zero failure count.
 | User | User |
 | Team Membership | Space Membership |
 | Channel Membership | Room Membership |
+| `@username` | `@username:domain` (rendered as a pill, listed in `m.mentions.user_ids`) |
+| `@all`, `@channel` | `@room` (text only — see below) |
+| `@here` | unchanged — Matrix has no "whoever is online" concept |
+| Reaction | `m.reaction` annotation |
+
+### Mentions and notifications
+
+Migrated messages are history, not news, so the import goes out of its way not to notify
+anybody about them.
+
+`@all` and `@channel` are rewritten to Matrix's `@room` so the archive reads correctly, but
+**`m.mentions.room` is never set**. Declaring a real room mention would fire
+`.m.rule.is_room_mention` for any sender above the `notifications.room` power level — and with
+`preserve_owner_and_alias: true` the channel creator holds PL 100 — pinging everyone in the
+room about an announcement from years ago.
+
+For the same reason **every message this tool sends carries an `m.mentions` property, empty
+when nobody is mentioned**. Per [MSC3952](https://github.com/matrix-org/matrix-spec-proposals/blob/main/proposals/3952-intentional-mentions.md)
+the legacy push rules — `.m.rule.contains_display_name`, `.m.rule.contains_user_name` and
+`.m.rule.roomnotif` — apply only while `m.mentions` is *missing*, and they match on the message
+text rather than on any declared intent. Omitting the property would mean every migrated
+message that merely contains someone's display name notifies them, including the filenames of
+migrated attachments.
+
+Genuine `@username` mentions still populate `m.mentions.user_ids`, so a real mention in the
+history is attributed and rendered as a pill.
 
 ## Environment Variables
 

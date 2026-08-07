@@ -1714,16 +1714,23 @@ type SendMessageRequest struct {
 
 // Mentions carries the intentional-mentions metadata (MSC3952) so mentioned users are
 // notified and clients render the mention as a pill.
+//
+// An empty value is meaningful and must still be sent: see mentionsFor. Room-wide mentions
+// (m.mentions.room) are deliberately never set — see normalizeMatrixMentions.
 type Mentions struct {
 	UserIDs []string `json:"user_ids,omitempty"`
 }
 
-// mentionsOrNil returns a *Mentions for the given user IDs, or nil when there are none
-// (so the field is omitted from the event content).
-func mentionsOrNil(userIDs []string) *Mentions {
-	if len(userIDs) == 0 {
-		return nil
-	}
+// mentionsFor returns the m.mentions value for the given user IDs. It is never nil, so the
+// property is present on every message this tool sends — empty when nobody is mentioned.
+//
+// That emptiness is the point. Per MSC3952 the legacy push rules
+// (.m.rule.contains_display_name, .m.rule.contains_user_name, .m.rule.roomnotif) apply only
+// while m.mentions is *missing*, and those rules match on the message text. Omitting the
+// property would mean every migrated message that happens to contain someone's display name,
+// or the word @room, notifies them — years after the fact, for a conversation they already
+// had. Declaring "this message mentions nobody" is both true and the only way to say it.
+func mentionsFor(userIDs []string) *Mentions {
 	return &Mentions{UserIDs: userIDs}
 }
 
@@ -1775,7 +1782,7 @@ func (c *Client) SendMessageWithTimestamp(roomID, message string, timestamp int6
 		Body:          message,
 		Format:        "org.matrix.custom.html",
 		FormattedBody: formattedBody,
-		Mentions:      mentionsOrNil(mentionIDs),
+		Mentions:      mentionsFor(mentionIDs),
 	}
 
 	// Use AS token if available, otherwise use admin token
@@ -1833,9 +1840,8 @@ func (c *Client) SendReplyWithTimestamp(roomID, message string, threadRootEventI
 		"format":         "org.matrix.custom.html",
 		"formatted_body": formattedBody,
 		"m.relates_to":   threadRelation(threadRootEventID, threadLatestEventID),
-	}
-	if len(mentionIDs) > 0 {
-		content["m.mentions"] = map[string]interface{}{"user_ids": mentionIDs}
+		// Always present, even when empty - see mentionsFor.
+		"m.mentions": mentionsFor(mentionIDs),
 	}
 
 	// Use AS token if available
@@ -2161,6 +2167,10 @@ type FileMessageContent struct {
 	URL      string    `json:"url,omitempty"` // mxc:// URI (for uploaded files)
 	Filename string    `json:"filename,omitempty"`
 	Info     *FileInfo `json:"info,omitempty"`
+	// Mentions is set by SendFileMessage and is empty in practice. The body of a file event is
+	// the filename, and a filename like "Angebot_Anna.pdf" is enough for the legacy
+	// display-name push rule to notify Anna about a document from three years ago.
+	Mentions *Mentions `json:"m.mentions,omitempty"`
 }
 
 // FileInfo contains metadata about the file
@@ -2184,6 +2194,11 @@ type ThumbnailInfo struct {
 
 // SendFileMessage sends a file message to a room
 func (c *Client) SendFileMessage(roomID string, content *FileMessageContent, timestamp int64, senderUserID string) (*SendMessageResponse, error) {
+	// Set here rather than at every call site, so no future caller can forget it.
+	if content.Mentions == nil {
+		content.Mentions = mentionsFor(nil)
+	}
+
 	txnID := c.getNextTxnID()
 
 	endpoint := fmt.Sprintf("/_matrix/client/v3/rooms/%s/send/m.room.message/%s",
@@ -2307,6 +2322,8 @@ func (c *Client) SendUploadedFileAsReply(roomID, mxcURI, filename, mimeType stri
 			"size":     fileSize,
 		},
 		"m.relates_to": threadRelation(threadRootEventID, threadLatestEventID),
+		// Always present, even when empty - see mentionsFor.
+		"m.mentions": mentionsFor(nil),
 	}
 	if width > 0 && height > 0 {
 		info := content["info"].(map[string]interface{})
