@@ -30,6 +30,7 @@ const (
 	StepExportMessages     StepName = "export_messages"
 	StepImportMessages     StepName = "import_messages"
 	StepLeaveRooms         StepName = "leave_rooms"
+	StepEnableNotifications StepName = "enable_notifications"
 )
 
 // StepState represents the state of a single migration step
@@ -175,6 +176,20 @@ func (s *MigrationState) CanRunStep(name StepName) (bool, string) {
 		importAssetsStep := s.GetStep(StepImportAssets)
 		if importAssetsStep.Status != StatusCompleted {
 			return false, "import_assets must be completed first (for room and space mappings)"
+		}
+		return true, ""
+	case StepEnableNotifications:
+		// Needs the asset mapping to know which accounts exist and what their addresses are.
+		importAssetsStep := s.GetStep(StepImportAssets)
+		if importAssetsStep.Status != StatusCompleted {
+			return false, "import_assets must be completed first (for the user mapping)"
+		}
+		// And it must not run before the messages are in. A new pusher starts from the
+		// current stream position, so every message imported afterwards counts as new and
+		// would mail the whole migration to everyone.
+		importMessagesStep := s.GetStep(StepImportMessages)
+		if importMessagesStep.Status != StatusCompleted && importMessagesStep.Status != StatusSkipped {
+			return false, "import_messages must be completed (or skipped) first, otherwise every imported message notifies everyone by email"
 		}
 		return true, ""
 	}

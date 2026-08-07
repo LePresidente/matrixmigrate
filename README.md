@@ -228,6 +228,39 @@ This file is plaintext credentials. It is created `0600`, is gitignored, and sho
 deleted once the passwords have been distributed. If it is lost, affected users can only get
 in via SSO or an admin-initiated password reset — the passwords are not stored anywhere else.
 
+#### Email notifications
+
+`matrixmigrate import enable-notifications` registers an email pusher for every migrated user
+who has an address, so people are told by email about what they missed without having to find
+the setting first.
+
+Nothing does this by itself. Synapse only creates a pusher on its own registration path, which
+never runs when accounts come from MAS — and even natively it is skipped for SSO logins
+([synapse#10882](https://github.com/element-hq/synapse/issues/10882)) and ignored for accounts
+created through the admin API
+([#7135](https://github.com/matrix-org/synapse/issues/7135)).
+
+- **Run it last.** A new pusher starts from the current stream position, so running it before
+  the messages are in would email the entire import to everyone. The step refuses to run until
+  `import_messages` has completed or been skipped.
+- **Requires the Application Service.** The pusher has to be registered *as* the user, and
+  `?user_id=` is the only way to do that.
+- **Requires `email.enable_notifs` and `email.notif_from` on the homeserver.** Synapse only
+  registers the `email` pusher type when notifications are configured; without it every call
+  fails the same way, which the run reports as one server-side omission rather than hundreds of
+  broken accounts.
+- **Skipped users are counted by reason**: `no email address`, `user not mapped`,
+  `account deactivated`, and `address not set on the account` — the last one meaning the
+  address is missing from the account itself, which re-running `import assets` fixes.
+- **Safe to re-run**: Synapse updates the existing pusher when `app_id` and `pushkey` match
+  rather than adding a second one.
+
+Push rules are left alone, so this does not change what notifies on desktop or mobile. Push
+rules apply per user rather than per pusher, so restricting email to mentions and DMs would
+also silence channel messages everywhere else. Synapse throttles the mails instead: one digest
+per room, the first after `email.notif_delay_before_mail`, then a growing interval up to 24
+hours, reset after 12 hours of quiet.
+
 #### Accounts that already exist
 
 An account can already exist before the import — most often because the person signed in

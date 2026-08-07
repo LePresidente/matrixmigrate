@@ -580,6 +580,52 @@ func (c *Client) EnsureUserProfile(matrixUserID, displayName, email string) erro
 	return nil
 }
 
+// SetEmailPusher turns on email notifications for one user by registering an email pusher on
+// their behalf.
+//
+// Nothing creates this by itself here. Synapse only adds one on its own registration path,
+// which never runs in this setup because the accounts are created in MAS — and even natively
+// it is skipped for SSO logins (synapse#10882) and ignored for accounts made through the
+// admin API (#7135).
+//
+// Requires the Application Service token: the pusher has to be registered *as* the user, and
+// ?user_id= is the only way to do that. Synapse checks the pushkey against the user's own
+// third-party IDs, so EnsureUserProfile must have put the address there first.
+//
+// Repeating this is harmless: Synapse updates the existing pusher when app_id and pushkey
+// match rather than adding a second one.
+func (c *Client) SetEmailPusher(matrixUserID, email string) error {
+	if c.asToken == "" {
+		return fmt.Errorf("no Application Service token: a pusher must be registered as the user, which needs ?user_id=")
+	}
+
+	endpoint := "/_matrix/client/v3/pushers/set?" + url.Values{"user_id": {matrixUserID}}.Encode()
+
+	// lang is required by the specification but Synapse never reads it: notification templates
+	// are loaded once at startup and shared by every pusher, so there is one language for the
+	// whole server regardless of what is claimed here.
+	content := map[string]interface{}{
+		"kind":                "email",
+		"app_id":              "m.email",
+		"app_display_name":    "Email Notifications",
+		"device_display_name": email,
+		"pushkey":             email,
+		"lang":                "en",
+		"data":                map[string]interface{}{},
+	}
+
+	body, statusCode, err := c.doRequestWithToken("POST", endpoint, content, c.asToken)
+	if err != nil {
+		return err
+	}
+	if statusCode != http.StatusOK {
+		var resp GenericResponse
+		json.Unmarshal(body, &resp)
+		return fmt.Errorf("API error (%d): %s - %s", statusCode, resp.Errcode, resp.Error)
+	}
+	return nil
+}
+
 // EnsureMASEmail attaches an email address to an existing MAS account, for accounts the
 // import skipped. A no-op when MAS is not in use, and never fatal: the address notifications
 // depend on is the Synapse threepid, which EnsureUserProfile handles.

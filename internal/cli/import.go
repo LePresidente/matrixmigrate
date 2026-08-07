@@ -23,15 +23,16 @@ func formatETA(d time.Duration) string {
 }
 
 var importCmd = &cobra.Command{
-	Use:   "import [assets|memberships|messages|leave-rooms]",
+	Use:   "import [assets|memberships|messages|leave-rooms|enable-notifications]",
 	Short: "Import data to Matrix",
 	Long: `Import data to Matrix Synapse server.
 
 Available subcommands:
-  assets       - Create users, spaces, and rooms in Matrix
-  memberships  - Apply team and channel memberships in Matrix
-  messages     - Import all messages to Matrix rooms
-  leave-rooms  - Make the migration admin leave all migrated rooms and spaces`,
+  assets                - Create users, spaces, and rooms in Matrix
+  memberships           - Apply team and channel memberships in Matrix
+  messages              - Import all messages to Matrix rooms
+  leave-rooms           - Make the migration admin leave all migrated rooms and spaces
+  enable-notifications  - Turn on email notifications for migrated users`,
 }
 
 var importAssetsCmd = &cobra.Command{
@@ -75,6 +76,26 @@ Safe to re-run: a room the admin is not in counts as already left.`,
 	RunE: runImportLeaveRooms,
 }
 
+var importEnableNotificationsCmd = &cobra.Command{
+	Use:     "enable-notifications",
+	Aliases: []string{"enable_notifications"},
+	Short:   "Turn on email notifications for migrated users",
+	Long: `Register an email pusher for every migrated user who has an email address, so they
+are told by email about messages they missed without having to find the setting first.
+
+Nothing does this by itself: Synapse only creates a pusher on its own registration path,
+which never runs when accounts come from MAS, and even natively it is skipped for SSO logins.
+
+Run this AFTER importing messages. A new pusher starts from the current stream position, so
+running it earlier would email the entire message import to everyone.
+
+Requires: appservice.enabled=true, and email.enable_notifs plus email.notif_from configured
+on the homeserver.
+
+Safe to re-run: Synapse updates the existing pusher rather than adding a second one.`,
+	RunE: runImportEnableNotifications,
+}
+
 var membershipsSkipCompleted bool
 
 func init() {
@@ -82,6 +103,7 @@ func init() {
 	importCmd.AddCommand(importMembershipsCmd)
 	importCmd.AddCommand(importMessagesCmd)
 	importCmd.AddCommand(importLeaveRoomsCmd)
+	importCmd.AddCommand(importEnableNotificationsCmd)
 
 	// By default, re-running membership import re-applies against the latest snapshot so
 	// users who joined channels after the first run get added (force-join is idempotent for
@@ -353,6 +375,53 @@ func runImportLeaveRooms(cmd *cobra.Command, args []string) error {
 	printInfo(fmt.Sprintf("  Rooms: left=%d, already-out=%d, failed=%d",
 		result.RoomsLeft, result.RoomsLeaveSkip, result.RoomsLeaveFailed))
 	printSuccess(i18n.T("messages.step_completed", "leave_rooms"))
+
+	return nil
+}
+
+func runImportEnableNotifications(cmd *cobra.Command, args []string) error {
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+
+	printInfo(i18n.T("messages.migration_started"))
+
+	orch, err := migration.NewOrchestrator(cfg)
+	if err != nil {
+		return fmt.Errorf("failed to create orchestrator: %w", err)
+	}
+	defer orch.Close()
+
+	state := orch.GetState()
+	canRun, reason := state.CanRunStep(migration.StepEnableNotifications)
+	if !canRun {
+		return fmt.Errorf("cannot run step: %s", reason)
+	}
+
+	printInfo(i18n.T("progress.connecting", "Matrix"))
+	if err := orch.ConnectMatrix(); err != nil {
+		return err
+	}
+	printSuccess(i18n.T("progress.connected", "Matrix"))
+
+	printInfo(i18n.T("progress.enabling_notifications"))
+	progress := func(stage string, current, total int, item string) {
+		if total > 0 {
+			printProgress("%s: %d/%d", stage, current, total)
+		} else {
+			printProgress("%s...", stage)
+		}
+	}
+
+	result, err := orch.EnableEmailNotifications(progress)
+	if err != nil {
+		return err
+	}
+
+	printInfo(fmt.Sprintf("  Users: enabled=%d, skipped=%d, failed=%d",
+		result.UsersCreated, result.UsersSkipped, result.UsersFailed))
+	printSuccess(i18n.T("messages.step_completed", "enable_notifications"))
 
 	return nil
 }

@@ -2308,6 +2308,100 @@ func (i *Importer) importReactions(
 	}
 }
 
+// emailNotificationsDisabledHint recognises the answer Synapse gives when the server has no
+// email configuration at all. PusherFactory only registers the "email" pusher type when
+// email.enable_notifs is true, so without it every single call fails the same way — which
+// is a server-side omission, not hundreds of broken accounts.
+func emailNotificationsDisabledHint(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "unknown pusher type") || strings.Contains(msg, "pusher type")
+}
+
+// EnableEmailNotifications registers an email pusher for every mapped user who has an address,
+// so people are told by email about what they missed without having to find the setting first.
+//
+// Must run after the messages are imported: a new pusher starts from the current stream
+// position, so anything imported afterwards counts as unread and would be mailed out.
+func (i *Importer) EnableEmailNotifications(
+	users []mattermost.User,
+	userMapping map[string]string,
+	progress ImportProgressCallback,
+) (*ImportStats, error) {
+	stats := &ImportStats{}
+	total := len(users)
+	tally := &skipTally{}
+
+	logger.Info("Enabling email notifications for %d users", total)
+
+	if !i.client.HasASToken() {
+		return nil, fmt.Errorf("email notifications need the Application Service token: a pusher is registered as the user, which requires ?user_id=")
+	}
+
+	serverSideMissing := false
+
+	for idx, user := range users {
+		if progress != nil {
+			progress("enable_notifications", idx+1, total, user.Username)
+		}
+
+		email := strings.ToLower(strings.TrimSpace(user.Email))
+		matrixUserID, mapped := userMapping[user.ID]
+
+		switch {
+		case email == "":
+			stats.UsersSkipped++
+			tally.add("no email address")
+			continue
+		case !mapped:
+			stats.UsersSkipped++
+			tally.add("user not mapped")
+			continue
+		case user.IsDeleted():
+			// Deactivated accounts cannot read the mail anyway.
+			stats.UsersSkipped++
+			tally.add("account deactivated")
+			continue
+		}
+
+		if err := i.client.SetEmailPusher(matrixUserID, email); err != nil {
+			if emailNotificationsDisabledHint(err) {
+				serverSideMissing = true
+				stats.UsersFailed++
+				tally.add("email notifications not enabled on the server")
+				continue
+			}
+			if strings.Contains(strings.ToUpper(err.Error()), "THREEPID_NOT_FOUND") {
+				// The address is not on the account, so Synapse refuses to let the user be
+				// notified at it. Re-running 'import assets' fills these in.
+				stats.UsersFailed++
+				tally.add("address not set on the account")
+				continue
+			}
+			logger.Warn("Failed to enable email notifications for %s: %v", matrixUserID, err)
+			stats.UsersFailed++
+			tally.add("api error")
+			continue
+		}
+
+		stats.UsersCreated++
+	}
+
+	logger.Info("Email notifications: enabled=%d, skipped=%d, failed=%d",
+		stats.UsersCreated, stats.UsersSkipped, stats.UsersFailed)
+	if summary := tally.String(); summary != "" {
+		logger.Info("Email notifications by reason: %s", summary)
+	}
+	if serverSideMissing {
+		logger.Warn("Synapse has no email configuration: set email.enable_notifs and email.notif_from, " +
+			"roll it out, then run this step again. Until then no pusher of kind 'email' can exist.")
+	}
+
+	return stats, nil
+}
+
 // LeaveMigratedRooms makes the migration admin leave every room and space it created,
 // given the room and space IDs from the asset mapping.
 //

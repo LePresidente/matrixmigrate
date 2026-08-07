@@ -1086,6 +1086,98 @@ func (o *Orchestrator) LeaveRooms(progress ProgressCallback) (*OperationResult, 
 	return result, o.SaveState()
 }
 
+// EnableEmailNotifications registers an email pusher for every migrated user with an address,
+// so email notifications are on from the start rather than waiting for each person to find
+// the setting.
+//
+// Deliberately a separate step at the end of a migration: a new pusher starts from the current
+// stream position, so running this before the messages are imported would mail the entire
+// migration to everyone.
+func (o *Orchestrator) EnableEmailNotifications(progress ProgressCallback) (*OperationResult, error) {
+	result := &OperationResult{}
+
+	logger.Info("=== EnableEmailNotifications Started ===")
+
+	if o.mxClient == nil {
+		logger.Error("Not connected to Matrix")
+		return nil, fmt.Errorf("not connected to Matrix")
+	}
+
+	canRun, reason := o.state.CanRunStep(StepEnableNotifications)
+	if !canRun {
+		logger.Error("Cannot run step: %s", reason)
+		return nil, fmt.Errorf("cannot run step: %s", reason)
+	}
+
+	if !o.config.UseAppService() {
+		err := fmt.Errorf("email notifications need the Application Service: a pusher is registered as the user, which requires ?user_id=. Set matrix.appservice.enabled and the as_token_env variable")
+		logger.Error("%v", err)
+		return nil, err
+	}
+
+	// Addresses come from the assets export; the mapping only holds IDs.
+	assetsFile := o.state.GetStepOutputFile(StepExportAssets)
+	if assetsFile == "" {
+		return nil, fmt.Errorf("no assets export file found")
+	}
+	var assets mattermost.Assets
+	if err := archive.LoadGzipJSON(assetsFile, &assets); err != nil {
+		return nil, fmt.Errorf("failed to load assets: %w", err)
+	}
+
+	mappingFile := o.state.GetStepOutputFile(StepImportAssets)
+	if mappingFile == "" {
+		return nil, fmt.Errorf("no mapping file found from import assets step")
+	}
+	mapping, err := LoadMapping(mappingFile)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load mapping: %w", err)
+	}
+	logger.Info("Loaded %d users from %s and %d mappings from %s",
+		len(assets.Users), assetsFile, len(mapping.Users), mappingFile)
+
+	o.state.StartStep(StepEnableNotifications)
+	if err := o.SaveState(); err != nil {
+		return nil, err
+	}
+
+	o.mxClient.SetASToken(o.config.GetASToken())
+
+	importer := matrix.NewImporter(o.mxClient)
+
+	var importProgress matrix.ImportProgressCallback
+	if progress != nil {
+		importProgress = func(stage string, current, total int, item string) {
+			progress(stage, current, total, item)
+			o.state.UpdateStepProgress(StepEnableNotifications, current, total)
+		}
+	}
+
+	stats, err := importer.EnableEmailNotifications(assets.Users, mapping.Users, importProgress)
+	if err != nil {
+		logger.Error("Failed to enable email notifications: %v", err)
+		o.state.FailStep(StepEnableNotifications, err)
+		o.SaveState()
+		return nil, err
+	}
+
+	result.UsersCreated = stats.UsersCreated
+	result.UsersSkipped = stats.UsersSkipped
+	result.UsersFailed = stats.UsersFailed
+
+	logger.Info("=== EnableEmailNotifications Completed ===")
+	logger.Info("Total: enabled=%d, skipped=%d, failed=%d",
+		result.UsersCreated, result.UsersSkipped, result.UsersFailed)
+	if result.UsersFailed > 0 {
+		logger.Warn("%d user(s) did not get email notifications; see the reasons above and re-run this step once fixed", result.UsersFailed)
+	} else {
+		logger.Success("Email notifications enabled")
+	}
+
+	o.state.CompleteStep(StepEnableNotifications, "")
+	return result, o.SaveState()
+}
+
 // TestMattermostConnection tests the Mattermost connection
 func (o *Orchestrator) TestMattermostConnection() error {
 	cfg := o.config.Mattermost

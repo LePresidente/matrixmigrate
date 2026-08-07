@@ -26,6 +26,7 @@ const (
 	ViewExportMessages
 	ViewImportMessages
 	ViewLeaveRooms
+	ViewEnableNotifications
 	ViewTestConnection
 	ViewStatus
 	ViewSettings
@@ -128,6 +129,7 @@ func (m *Model) createMenuItems() []MenuItem {
 	canExportMessages, _ := state.CanRunStep(migration.StepExportMessages)
 	canImportMessages, _ := state.CanRunStep(migration.StepImportMessages)
 	canLeaveRooms, _ := state.CanRunStep(migration.StepLeaveRooms)
+	canEnableNotifications, _ := state.CanRunStep(migration.StepEnableNotifications)
 
 	return []MenuItem{
 		{
@@ -171,6 +173,12 @@ func (m *Model) createMenuItems() []MenuItem {
 			Desc:     "Leave all migrated rooms and spaces (cleanup)",
 			View:     ViewLeaveRooms,
 			Disabled: !canLeaveRooms,
+		},
+		{
+			Title:    locale.Menu.EnableNotifs,
+			Desc:     "Turn on email notifications for migrated users (run after messages)",
+			View:     ViewEnableNotifications,
+			Disabled: !canEnableNotifications,
 		},
 		{
 			Title: locale.Menu.TestConnection,
@@ -311,6 +319,8 @@ func (m *Model) handleViewChange(view View) tea.Cmd {
 		return m.runImportMemberships()
 	case ViewLeaveRooms:
 		return m.runLeaveRooms()
+	case ViewEnableNotifications:
+		return m.runEnableNotifications()
 	case ViewExportMessages:
 		return m.runExportMessages()
 	case ViewImportMessages:
@@ -343,7 +353,7 @@ func (m Model) View() string {
 		return m.renderSuccess()
 	case ViewTestConnection:
 		return m.renderTestConnection()
-	case ViewExportAssets, ViewImportAssets, ViewExportMemberships, ViewImportMemberships, ViewExportMessages, ViewImportMessages, ViewLeaveRooms:
+	case ViewExportAssets, ViewImportAssets, ViewExportMemberships, ViewImportMemberships, ViewExportMessages, ViewImportMessages, ViewLeaveRooms, ViewEnableNotifications:
 		return m.renderProgress()
 	default:
 		return m.renderMenu()
@@ -422,6 +432,8 @@ func (m Model) renderProgress() string {
 		title = locale.Menu.ImportMemberships
 	case ViewLeaveRooms:
 		title = locale.Menu.LeaveRooms
+	case ViewEnableNotifications:
+		title = locale.Menu.EnableNotifs
 	case ViewExportMessages:
 		title = locale.Menu.ExportMessages
 	case ViewImportMessages:
@@ -504,6 +516,7 @@ func (m Model) renderStatus() string {
 		migration.StepExportMemberships,
 		migration.StepImportMemberships,
 		migration.StepLeaveRooms,
+		migration.StepEnableNotifications,
 	}
 
 	var rows string
@@ -892,6 +905,34 @@ func (m *Model) runImportMemberships() tea.Cmd {
 		}
 
 		return operationCompleteMsg{message: "Memberships imported successfully!", result: result}
+	}
+}
+
+func (m *Model) runEnableNotifications() tea.Cmd {
+	return func() tea.Msg {
+		sendProgress("Connecting to Matrix...", 0, 0, "")
+
+		if err := m.orchestrator.ConnectMatrix(); err != nil {
+			return operationCompleteMsg{err: err}
+		}
+
+		sendProgress("Enabling email notifications...", 0, 0, "")
+
+		progress := func(stage string, current, total int, item string) {
+			sendProgress(stage, current, total, item)
+		}
+
+		result, err := m.orchestrator.EnableEmailNotifications(progress)
+		if err != nil {
+			return operationCompleteMsg{err: err}
+		}
+
+		msg := fmt.Sprintf("Email notifications enabled for %d user(s).", result.UsersCreated)
+		if result.UsersFailed > 0 {
+			msg = fmt.Sprintf("Enabled for %d user(s), %d failed - see the log for the reasons.",
+				result.UsersCreated, result.UsersFailed)
+		}
+		return operationCompleteMsg{message: msg, result: result}
 	}
 }
 
