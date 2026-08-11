@@ -265,6 +265,16 @@ func (m *MASClient) UserExists(username string) (bool, error) {
 	return resp.Data.Attributes.Username != "", nil
 }
 
+// VerifyCredentials checks that MAS is reachable and accepts the configured OAuth2
+// client credentials. Without this, bad credentials only surface once user creation
+// starts, by which point rooms have already been created with a fallback owner.
+func (m *MASClient) VerifyCredentials() error {
+	if _, err := m.getToken(); err != nil {
+		return err
+	}
+	return nil
+}
+
 // FormatUserID returns the full Matrix user ID for the given localpart.
 func (m *MASClient) FormatUserID(username string) string {
 	return fmt.Sprintf("@%s:%s", username, m.homeserver)

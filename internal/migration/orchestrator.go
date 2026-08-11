@@ -3,6 +3,7 @@ package migration
 import (
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/aligundogdu/matrixmigrate/internal/config"
@@ -19,9 +20,10 @@ type Orchestrator struct {
 	state         *MigrationState
 	tunnelManager *ssh.TunnelManager
 
-	mmClient *mattermost.Client
-	mxClient *matrix.Client
-	mxToken  string // Matrix access token (from login or config)
+	mmClient  *mattermost.Client
+	mxClient  *matrix.Client
+	masClient *matrix.MASClient // set only when MAS is enabled
+	mxToken   string            // Matrix access token (from login or config)
 
 	// forceMembershipReplay re-applies channel/team memberships even when the step already
 	// completed, so members who joined after the first run get added on a later run.
@@ -320,6 +322,7 @@ func (o *Orchestrator) ConnectMatrix() error {
 			homeserver,
 		)
 		client.SetMASClient(masClient)
+		o.masClient = masClient
 		logger.Info("Matrix Authentication Service enabled for user creation")
 	}
 
@@ -327,6 +330,15 @@ func (o *Orchestrator) ConnectMatrix() error {
 	if o.config.UseAppService() {
 		client.SetASToken(o.config.GetASToken())
 		logger.Info("Application Service token set for room creator and message import")
+	}
+
+	// Verify every configured credential before any step can write to the homeserver.
+	// A credential that is present but not accepted does not fail cleanly later: room
+	// creation degrades to the admin user, and a room's creator cannot be changed
+	// afterwards, so a partial run leaves permanently mis-owned rooms behind.
+	if err := o.verifyCredentials(client); err != nil {
+		o.tunnelManager.CloseTunnel("matrix")
+		return err
 	}
 
 	// Force-join: add users to rooms/spaces via Synapse admin API (no invite to accept)
@@ -337,6 +349,42 @@ func (o *Orchestrator) ConnectMatrix() error {
 
 	o.mxClient = client
 	o.state.MatrixHost = cfg.SSH.Host
+	return nil
+}
+
+// verifyCredentials checks each configured Matrix credential against the live server and
+// reports every failure at once, so a run stops before it writes anything rather than
+// degrading part-way through. The admin token is already covered by TestConnection.
+func (o *Orchestrator) verifyCredentials(client *matrix.Client) error {
+	var problems []string
+
+	if o.config.UseAppService() {
+		userID, err := client.VerifyASToken()
+		if err != nil {
+			problems = append(problems, fmt.Sprintf(
+				"application service token (%s) rejected by homeserver: %v — check as_token in the registration file matches, and that Synapse loaded it (app_service_config_files)",
+				o.config.Matrix.AppService.ASTokenEnv, err))
+		} else {
+			logger.Info("Preflight: application service token OK (authenticates as %s)", userID)
+		}
+	}
+
+	if o.masClient != nil {
+		if err := o.masClient.VerifyCredentials(); err != nil {
+			problems = append(problems, fmt.Sprintf(
+				"MAS client credentials (%s/%s) rejected by %s: %v",
+				o.config.Matrix.MAS.ClientIDEnv, o.config.Matrix.MAS.ClientSecretEnv,
+				o.config.Matrix.MAS.Endpoint, err))
+		} else {
+			logger.Info("Preflight: MAS client credentials OK")
+		}
+	}
+
+	if len(problems) > 0 {
+		return fmt.Errorf("credential preflight failed:\n  - %s", strings.Join(problems, "\n  - "))
+	}
+
+	logger.Info("Preflight: all configured Matrix credentials verified")
 	return nil
 }
 

@@ -320,6 +320,32 @@ func (c *Client) TestConnection() error {
 	return err
 }
 
+// VerifyASToken checks that the homeserver accepts the Application Service token and
+// returns the user ID it authenticates as. A token that is merely present but not
+// registered on the homeserver fails every AS-path call (room creation, message import)
+// with M_UNKNOWN_TOKEN, so this is checked up front rather than per item.
+func (c *Client) VerifyASToken() (string, error) {
+	if c.asToken == "" {
+		return "", fmt.Errorf("no application service token configured")
+	}
+
+	body, statusCode, err := c.doRequestWithToken("GET", "/_matrix/client/v3/account/whoami", nil, c.asToken)
+	if err != nil {
+		return "", err
+	}
+
+	var resp WhoAmIResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return "", fmt.Errorf("failed to parse response: %w", err)
+	}
+
+	if statusCode != http.StatusOK {
+		return "", fmt.Errorf("API error (%d): %s - %s", statusCode, resp.Errcode, resp.Error)
+	}
+
+	return resp.UserID, nil
+}
+
 // CreateUser creates or updates a user via the Admin API (or MAS when configured)
 func (c *Client) CreateUser(username string, req *CreateUserRequest) (*UserResponse, error) {
 	if c.masClient != nil {
