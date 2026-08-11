@@ -1511,7 +1511,7 @@ func (c *Client) SendMessageWithTimestamp(roomID, message string, timestamp int6
 }
 
 // SendReplyWithTimestamp sends a reply to a message with a specific timestamp
-func (c *Client) SendReplyWithTimestamp(roomID, message string, replyToEventID string, timestamp int64, senderUserID string) (*SendMessageResponse, error) {
+func (c *Client) SendReplyWithTimestamp(roomID, message string, threadRootEventID, threadLatestEventID string, timestamp int64, senderUserID string) (*SendMessageResponse, error) {
 	txnID := c.getNextTxnID()
 
 	// Build endpoint
@@ -1533,18 +1533,14 @@ func (c *Client) SendReplyWithTimestamp(roomID, message string, replyToEventID s
 		endpoint += "?" + params.Encode()
 	}
 
-	// Create reply content with relation
+	// Create reply content with thread relation
 	formattedBody, mentionIDs := renderMatrixMessageHTML(message)
 	content := map[string]interface{}{
 		"msgtype":        "m.text",
 		"body":           message,
 		"format":         "org.matrix.custom.html",
 		"formatted_body": formattedBody,
-		"m.relates_to": map[string]interface{}{
-			"m.in_reply_to": map[string]string{
-				"event_id": replyToEventID,
-			},
-		},
+		"m.relates_to":   threadRelation(threadRootEventID, threadLatestEventID),
 	}
 	if len(mentionIDs) > 0 {
 		content["m.mentions"] = map[string]interface{}{"user_ids": mentionIDs}
@@ -1856,7 +1852,7 @@ func (c *Client) SendFileLink(roomID, filename, fileURL, mimeType string, fileSi
 }
 
 // SendFileLinkAsReply sends a file link as a reply message (external URL).
-func (c *Client) SendFileLinkAsReply(roomID, filename, fileURL, mimeType string, fileSize int64, replyToEventID string, timestamp int64, senderUserID string) (*SendMessageResponse, error) {
+func (c *Client) SendFileLinkAsReply(roomID, filename, fileURL, mimeType string, fileSize int64, threadRootEventID, threadLatestEventID string, timestamp int64, senderUserID string) (*SendMessageResponse, error) {
 	emoji := "📎"
 	if strings.HasPrefix(mimeType, "image/") {
 		emoji = "🖼️"
@@ -1867,7 +1863,7 @@ func (c *Client) SendFileLinkAsReply(roomID, filename, fileURL, mimeType string,
 	}
 
 	message := fmt.Sprintf("%s [%s](%s)", emoji, filename, fileURL)
-	return c.SendReplyWithTimestamp(roomID, message, replyToEventID, timestamp, senderUserID)
+	return c.SendReplyWithTimestamp(roomID, message, threadRootEventID, threadLatestEventID, timestamp, senderUserID)
 }
 
 // SendUploadedFile sends a file that was already uploaded to Matrix
@@ -1901,7 +1897,7 @@ func (c *Client) SendUploadedFile(roomID, mxcURI, filename, mimeType string, fil
 }
 
 // SendUploadedFileAsReply sends an already-uploaded file event as a reply.
-func (c *Client) SendUploadedFileAsReply(roomID, mxcURI, filename, mimeType string, fileSize int64, width, height int, replyToEventID string, timestamp int64, senderUserID string) (*SendMessageResponse, error) {
+func (c *Client) SendUploadedFileAsReply(roomID, mxcURI, filename, mimeType string, fileSize int64, width, height int, threadRootEventID, threadLatestEventID string, timestamp int64, senderUserID string) (*SendMessageResponse, error) {
 	msgType := "m.file"
 	if strings.HasPrefix(mimeType, "image/") {
 		msgType = "m.image"
@@ -1920,11 +1916,7 @@ func (c *Client) SendUploadedFileAsReply(roomID, mxcURI, filename, mimeType stri
 			"mimetype": mimeType,
 			"size":     fileSize,
 		},
-		"m.relates_to": map[string]interface{}{
-			"m.in_reply_to": map[string]string{
-				"event_id": replyToEventID,
-			},
-		},
+		"m.relates_to": threadRelation(threadRootEventID, threadLatestEventID),
 	}
 	if width > 0 && height > 0 {
 		info := content["info"].(map[string]interface{})

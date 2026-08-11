@@ -1507,7 +1507,8 @@ func (i *Importer) sendLinkOrSkip(
 	fileConfig *FileConfig,
 	timestamp int64,
 	senderID string,
-	replyToEventID string,
+	threadRootEventID string,
+	threadLatestEventID string,
 	reason string,
 ) {
 	if fileConfig.S3PublicURL == "" {
@@ -1517,8 +1518,8 @@ func (i *Importer) sendLinkOrSkip(
 	}
 	fileURL := buildPublicFileURL(fileConfig.S3PublicURL, file.Path)
 	var err error
-	if replyToEventID != "" {
-		_, err = i.client.SendFileLinkAsReply(roomID, file.Name, fileURL, file.MimeType, file.Size, replyToEventID, timestamp, senderID)
+	if threadRootEventID != "" {
+		_, err = i.client.SendFileLinkAsReply(roomID, file.Name, fileURL, file.MimeType, file.Size, threadRootEventID, threadLatestEventID, timestamp, senderID)
 	} else {
 		_, err = i.client.SendFileLink(roomID, file.Name, fileURL, file.MimeType, file.Size, timestamp, senderID)
 	}
@@ -1537,7 +1538,8 @@ func (i *Importer) importPostFiles(
 	fileConfig *FileConfig,
 	timestamp int64,
 	senderID string,
-	replyToEventID string,
+	threadRootEventID string,
+	threadLatestEventID string,
 ) (int, int64) {
 	tooLargeCount := 0
 	var maxTooLargeSize int64
@@ -1556,7 +1558,7 @@ func (i *Importer) importPostFiles(
 				maxTooLargeSize = file.Size
 			}
 			if fileConfig.UploadFallbackToLink {
-				i.sendLinkOrSkip(result, roomID, file, fileConfig, timestamp, senderID, replyToEventID, "file exceeds max_upload_size_mb")
+				i.sendLinkOrSkip(result, roomID, file, fileConfig, timestamp, senderID, threadRootEventID, threadLatestEventID, "file exceeds max_upload_size_mb")
 			} else {
 				result.Stats.FilesSkipped++
 				result.Errors = append(result.Errors, fmt.Sprintf("Skipped file %s for post %s: file size %d exceeds max_upload_size_mb (%d bytes)", file.Name, file.PostID, file.Size, fileConfig.MaxUploadSize))
@@ -1566,7 +1568,7 @@ func (i *Importer) importPostFiles(
 		if fileConfig.LocalDataPath == "" {
 			logger.Debug("importPostFiles: local_data_path empty for file id=%s name=%s", file.ID, file.Name)
 			if fileConfig.UploadFallbackToLink {
-				i.sendLinkOrSkip(result, roomID, file, fileConfig, timestamp, senderID, replyToEventID, "mattermost.files.local_data_path is empty")
+				i.sendLinkOrSkip(result, roomID, file, fileConfig, timestamp, senderID, threadRootEventID, threadLatestEventID, "mattermost.files.local_data_path is empty")
 			} else {
 				result.Stats.FilesSkipped++
 				result.Errors = append(result.Errors, fmt.Sprintf("Skipped file %s for post %s: mattermost.files.local_data_path is empty", file.Name, file.PostID))
@@ -1584,7 +1586,7 @@ func (i *Importer) importPostFiles(
 		if err != nil {
 			logger.Debug("importPostFiles: read failed id=%s name=%s err=%v", file.ID, file.Name, err)
 			if fileConfig.UploadFallbackToLink {
-				i.sendLinkOrSkip(result, roomID, file, fileConfig, timestamp, senderID, replyToEventID, fmt.Sprintf("cannot read attachment bytes from %s: %v", file.Path, err))
+				i.sendLinkOrSkip(result, roomID, file, fileConfig, timestamp, senderID, threadRootEventID, threadLatestEventID, fmt.Sprintf("cannot read attachment bytes from %s: %v", file.Path, err))
 			} else {
 				result.Stats.FilesSkipped++
 				result.Errors = append(result.Errors, fmt.Sprintf("Skipped file %s for post %s: cannot read attachment bytes from %s: %v", file.Name, file.PostID, file.Path, err))
@@ -1600,7 +1602,7 @@ func (i *Importer) importPostFiles(
 		if err != nil {
 			logger.Debug("importPostFiles: upload failed id=%s name=%s err=%v", file.ID, file.Name, err)
 			if fileConfig.UploadFallbackToLink {
-				i.sendLinkOrSkip(result, roomID, file, fileConfig, timestamp, senderID, replyToEventID, fmt.Sprintf("upload failed: %v", err))
+				i.sendLinkOrSkip(result, roomID, file, fileConfig, timestamp, senderID, threadRootEventID, threadLatestEventID, fmt.Sprintf("upload failed: %v", err))
 			} else {
 				result.Stats.FilesSkipped++
 				result.Errors = append(result.Errors, fmt.Sprintf("Skipped file %s for post %s: upload failed: %v", file.Name, file.PostID, err))
@@ -1608,15 +1610,15 @@ func (i *Importer) importPostFiles(
 			continue
 		}
 		logger.Debug("importPostFiles: upload success id=%s name=%s mxc=%s", file.ID, file.Name, uploadResp.ContentURI)
-		if replyToEventID != "" {
-			_, err = i.client.SendUploadedFileAsReply(roomID, uploadResp.ContentURI, file.Name, mimeType, file.Size, file.Width, file.Height, replyToEventID, timestamp, senderID)
+		if threadRootEventID != "" {
+			_, err = i.client.SendUploadedFileAsReply(roomID, uploadResp.ContentURI, file.Name, mimeType, file.Size, file.Width, file.Height, threadRootEventID, threadLatestEventID, timestamp, senderID)
 		} else {
 			_, err = i.client.SendUploadedFile(roomID, uploadResp.ContentURI, file.Name, mimeType, file.Size, file.Width, file.Height, timestamp, senderID)
 		}
 		if err != nil {
 			logger.Debug("importPostFiles: send uploaded file failed id=%s name=%s err=%v", file.ID, file.Name, err)
 			if fileConfig.UploadFallbackToLink {
-				i.sendLinkOrSkip(result, roomID, file, fileConfig, timestamp, senderID, replyToEventID, fmt.Sprintf("send uploaded file failed: %v", err))
+				i.sendLinkOrSkip(result, roomID, file, fileConfig, timestamp, senderID, threadRootEventID, threadLatestEventID, fmt.Sprintf("send uploaded file failed: %v", err))
 			} else {
 				result.Stats.FilesSkipped++
 				result.Errors = append(result.Errors, fmt.Sprintf("Skipped file %s for post %s: send uploaded file failed: %v", file.Name, file.PostID, err))
@@ -1671,6 +1673,11 @@ func (i *Importer) ImportMessages(
 
 	// Sort posts by timestamp (they should already be sorted, but just in case)
 	// This ensures parent messages are imported before replies
+
+	// Newest Matrix event per Mattermost thread root, so a thread's compatibility reply
+	// points at the previous message rather than always at the root. Posts arrive in
+	// chronological order, so this needs no sorting.
+	threadLatest := make(map[string]string)
 
 	// Process messages in order
 	for idx, post := range posts {
@@ -1737,8 +1744,8 @@ func (i *Importer) ImportMessages(
 				}
 				eventID = resp.EventID
 			} else {
-				// Send as reply
-				resp, sendErr := i.client.SendReplyWithTimestamp(roomID, messageContent, parentEventID, post.CreateAt, senderID)
+				// Send into the thread rooted at the parent post
+				resp, sendErr := i.client.SendReplyWithTimestamp(roomID, messageContent, parentEventID, threadLatest[post.RootID], post.CreateAt, senderID)
 				if sendErr != nil {
 					result.Stats.RepliesFailed++
 					result.Errors = append(result.Errors, fmt.Sprintf("Failed to send reply %s: %v", post.ID, sendErr))
@@ -1748,6 +1755,7 @@ func (i *Importer) ImportMessages(
 					continue
 				}
 				eventID = resp.EventID
+				threadLatest[post.RootID] = eventID
 				result.Stats.RepliesImported++
 			}
 		} else {
@@ -1831,6 +1839,11 @@ func (i *Importer) ImportMessagesWithFiles(
 		result.Mapping[k] = v
 	}
 
+	// Newest Matrix event per Mattermost thread root, so a thread's compatibility reply
+	// points at the previous message rather than always at the root. Posts arrive in
+	// chronological order, so this needs no sorting.
+	threadLatest := make(map[string]string)
+
 	// Process messages in order
 	totalTooLarge := 0
 	var largestTooLargeSize int64
@@ -1906,7 +1919,7 @@ func (i *Importer) ImportMessagesWithFiles(
 				}
 				eventID = resp.EventID
 			} else {
-				resp, sendErr := i.client.SendReplyWithTimestamp(roomID, messageContent, parentEventID, post.CreateAt, senderID)
+				resp, sendErr := i.client.SendReplyWithTimestamp(roomID, messageContent, parentEventID, threadLatest[post.RootID], post.CreateAt, senderID)
 				if sendErr != nil {
 					result.Stats.RepliesFailed++
 					result.Errors = append(result.Errors, fmt.Sprintf("Failed to send reply %s: %v", post.ID, sendErr))
@@ -1916,6 +1929,7 @@ func (i *Importer) ImportMessagesWithFiles(
 					continue
 				}
 				eventID = resp.EventID
+				threadLatest[post.RootID] = eventID
 				result.Stats.RepliesImported++
 				attachmentReplyToEventID = parentEventID
 			}
@@ -1944,7 +1958,7 @@ func (i *Importer) ImportMessagesWithFiles(
 		// Upload or link files after the message event is imported.
 		// Matrix file attachments are sent as separate m.room.message events.
 		if fileConfig.Mode == "upload" && len(files) > 0 {
-			tooLargeCount, maxTooLargeSize := i.importPostFiles(result, roomID, files, fileConfig, post.CreateAt, senderID, attachmentReplyToEventID)
+			tooLargeCount, maxTooLargeSize := i.importPostFiles(result, roomID, files, fileConfig, post.CreateAt, senderID, attachmentReplyToEventID, threadLatest[post.RootID])
 			totalTooLarge += tooLargeCount
 			if maxTooLargeSize > largestTooLargeSize {
 				largestTooLargeSize = maxTooLargeSize
