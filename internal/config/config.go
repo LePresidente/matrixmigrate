@@ -168,6 +168,57 @@ type DatabaseConfig struct {
 	Name        string `mapstructure:"name"`
 	User        string `mapstructure:"user"`
 	PasswordEnv string `mapstructure:"password_env"`
+	// SSLMode is the lib/pq sslmode for the database connection: "disable", "require",
+	// "verify-ca" or "verify-full". Empty selects a default from the connection's host -
+	// see ResolveDBSSLMode.
+	SSLMode string `mapstructure:"ssl_mode"`
+}
+
+// Postgres sslmode values lib/pq accepts. It rejects libpq's "allow" and "prefer", so
+// offering them here would only produce a connection error further along.
+const (
+	DBSSLModeDisable    = "disable"
+	DBSSLModeRequire    = "require"
+	DBSSLModeVerifyCA   = "verify-ca"
+	DBSSLModeVerifyFull = "verify-full"
+)
+
+// ResolveDBSSLMode decides the sslmode for a database connection.
+//
+// Precedence is explicit config, then whatever Mattermost's own DataSource asked for
+// (matching how Mattermost itself reaches the database), then a default taken from the
+// host: connections that never leave the machine get "disable", anything else gets
+// "require".
+//
+// The host-derived default is what keeps the password off the wire. A unix socket or a
+// loopback address - which is also where an SSH tunnel terminates - cannot be observed by
+// anything that isn't already on the host, so TLS there buys nothing and would break the
+// common case of a PostgreSQL built without it. A remote host is the opposite: without TLS
+// the password and the entire message history cross the network in cleartext.
+func ResolveDBSSLMode(configured, discovered, host string) string {
+	if configured != "" {
+		return configured
+	}
+	if discovered != "" {
+		return discovered
+	}
+	if isLocalDBHost(host) {
+		return DBSSLModeDisable
+	}
+	return DBSSLModeRequire
+}
+
+// isLocalDBHost reports whether a connection to host stays on this machine. lib/pq treats a
+// host beginning with "/" as the directory holding a unix socket.
+func isLocalDBHost(host string) bool {
+	if strings.HasPrefix(host, "/") {
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(host)) {
+	case "localhost", "127.0.0.1", "::1", "[::1]":
+		return true
+	}
+	return false
 }
 
 // APIConfig holds Matrix API configuration
@@ -423,6 +474,17 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("mattermost.files.local_data_path is required when mattermost.files.mode is \"upload\"")
 	}
 
+	// Validate the database sslmode against what lib/pq accepts, rather than letting an
+	// unsupported value surface as a connection error at the first query.
+	switch c.Mattermost.Database.SSLMode {
+	case "", DBSSLModeDisable, DBSSLModeRequire, DBSSLModeVerifyCA, DBSSLModeVerifyFull:
+		// valid
+	default:
+		return fmt.Errorf("mattermost.database.ssl_mode must be %q, %q, %q or %q, got %q",
+			DBSSLModeDisable, DBSSLModeRequire, DBSSLModeVerifyCA, DBSSLModeVerifyFull,
+			c.Mattermost.Database.SSLMode)
+	}
+
 	// Validate MAS config when enabled
 	if c.Matrix.MAS.Enabled {
 		if c.Matrix.MAS.Endpoint == "" {
@@ -572,16 +634,19 @@ func (c *Config) EnsureDataDirs() error {
 	return nil
 }
 
-// MattermostDSN returns the PostgreSQL connection string for Mattermost
+// MattermostDSN returns the PostgreSQL connection string for the manually configured
+// Mattermost database. sslmode follows ResolveDBSSLMode, so a remote database is not
+// reached in cleartext just because the connection string was assembled here.
 func (c *Config) MattermostDSN() string {
 	password := c.GetMattermostDBPassword()
 	return fmt.Sprintf(
-		"host=%s port=%d user=%s password=%s dbname=%s sslmode=disable",
+		"host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
 		c.Mattermost.Database.Host,
 		c.Mattermost.Database.Port,
 		c.Mattermost.Database.User,
 		password,
 		c.Mattermost.Database.Name,
+		ResolveDBSSLMode(c.Mattermost.Database.SSLMode, "", c.Mattermost.Database.Host),
 	)
 }
 

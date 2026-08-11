@@ -92,9 +92,11 @@ func ReadConfigFromRemote(sshCfg config.SSHConfig, passphrase, password string, 
 
 // ParseDataSource parses the PostgreSQL connection string from Mattermost config
 func ParseDataSource(dataSource string) (*DatabaseCredentials, error) {
+	// SSLMode is deliberately left empty when the DataSource does not name one: the caller
+	// distinguishes "Mattermost asked for no TLS" from "Mattermost said nothing", and picks
+	// a default from the host in the second case.
 	creds := &DatabaseCredentials{
-		Port:    5432,
-		SSLMode: "disable",
+		Port: 5432,
 	}
 
 	// Mattermost uses format: postgres://user:password@host:port/database?sslmode=disable

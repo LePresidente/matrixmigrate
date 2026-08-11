@@ -153,6 +153,8 @@ func (o *Orchestrator) ConnectMattermost() error {
 	var dbUser string
 	var dbPassword string
 	var dbName string
+	// sslmode as discovered from Mattermost's own DataSource; "" means it said nothing.
+	var dbSSLMode string
 
 	// Direct mode: no ssh.host means the database is reachable from here, so the
 	// credentials cannot come from a config.json read over SSH.
@@ -176,6 +178,11 @@ func (o *Orchestrator) ConnectMattermost() error {
 		dbUser = creds.User
 		dbPassword = creds.Password
 		dbName = creds.Database
+		// Direct mode is the only mode whose connection goes where Mattermost's own goes,
+		// so it is the only one where inheriting Mattermost's sslmode is meaningful. Over a
+		// tunnel the connection terminates at 127.0.0.1, where "verify-full" could not match
+		// the certificate anyway.
+		dbSSLMode = creds.SSLMode
 	} else {
 		// Read from Mattermost config.json via SSH
 		creds, err := mattermost.GetDatabaseCredentials(cfg.SSH, passphrase, sshPassword, cfg.ConfigPath)
@@ -220,7 +227,12 @@ func (o *Orchestrator) ConnectMattermost() error {
 		connHost, connPort = "127.0.0.1", localPort
 	}
 
-	dsn := buildPostgresDSN(connHost, connPort, dbUser, dbPassword, dbName)
+	sslMode := config.ResolveDBSSLMode(cfg.Database.SSLMode, dbSSLMode, connHost)
+	if sslMode != config.DBSSLModeDisable {
+		logger.Info("Connecting to the Mattermost database with sslmode=%s", sslMode)
+	}
+
+	dsn := buildPostgresDSN(connHost, connPort, dbUser, dbPassword, dbName, sslMode)
 
 	// Connect to database
 	client, err := mattermost.NewClient(dsn)

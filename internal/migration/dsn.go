@@ -17,14 +17,19 @@ import (
 // Empty passwords are the normal case for peer or trust authentication over a unix socket,
 // which is how the bundled PostgreSQL in a GitLab Omnibus install is reached. Quoting also
 // makes passwords containing spaces or quotes work, which they previously did not.
-func buildPostgresDSN(host string, port int, user, password, dbname string) string {
+//
+// sslMode is passed through as given - callers resolve it with config.ResolveDBSSLMode. It is
+// the one value left unquoted: lib/pq compares it against a fixed set of literals, and a
+// quoted value matches none of them.
+func buildPostgresDSN(host string, port int, user, password, dbname, sslMode string) string {
 	return fmt.Sprintf(
-		"host=%s port=%d user=%s password=%s dbname=%s sslmode=disable",
+		"host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
 		quoteDSNValue(host),
 		port,
 		quoteDSNValue(user),
 		quoteDSNValue(password),
 		quoteDSNValue(dbname),
+		sslMode,
 	)
 }
 

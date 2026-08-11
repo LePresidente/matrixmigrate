@@ -87,6 +87,25 @@ public URL is a valid combination.
 Note that `mattermost.database` is not optional in direct mode. Credential auto-discovery
 reads `config.json` over SSH, so with no SSH host it cannot run.
 
+Direct mode is also the case where the database connection can leave the machine. Without
+TLS, the database password and then the entire message history cross the network in
+cleartext, so a connection to a **remote** host defaults to `sslmode=require`. Connections
+that stay local — a unix socket, `localhost`, `127.0.0.1`, or the local end of the SSH
+tunnel — keep `sslmode=disable`, which is what every tunnelled setup already used. Override
+per deployment:
+
+```yaml
+mattermost:
+  database:
+    ssl_mode: "verify-full"   # disable | require | verify-ca | verify-full
+```
+
+When credentials are auto-discovered in direct mode, the `sslmode` in Mattermost's own
+`DataSource` takes precedence over the host-derived default: matching how Mattermost itself
+reaches the database beats failing against a server with no TLS configured. An explicit
+`ssl_mode` wins over both. `prefer` and `allow` are rejected — the `lib/pq` driver does not
+implement them, so accepting them would only defer the failure to the first query.
+
 ### SSH Key Authentication (Recommended)
 
 ```yaml

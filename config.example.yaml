@@ -45,6 +45,13 @@ mattermost:
   #   name: "mattermost"
   #   user: "mmuser"
   #   password_env: "MM_DB_PASSWORD"
+  #   # TLS for the database connection: "disable", "require", "verify-ca" or "verify-full".
+  #   # Left unset, a connection that stays on this machine - a unix socket, 127.0.0.1, or
+  #   # the local end of the SSH tunnel - uses "disable", and anything remote uses "require"
+  #   # so the password and the message history do not cross the network in cleartext. In
+  #   # direct mode with auto-detection, whatever Mattermost's own DataSource asks for wins
+  #   # over that default. "prefer" and "allow" are not accepted - the driver rejects them.
+  #   ssl_mode: "require"
 
   # Optional: Mattermost usernames to ignore during import (case-insensitive).
   # Useful for skipping bot/service accounts.
