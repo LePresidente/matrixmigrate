@@ -634,21 +634,6 @@ func (c *Config) EnsureDataDirs() error {
 	return nil
 }
 
-// MattermostDSN returns the PostgreSQL connection string for the manually configured
-// Mattermost database. sslmode follows ResolveDBSSLMode, so a remote database is not
-// reached in cleartext just because the connection string was assembled here.
-func (c *Config) MattermostDSN() string {
-	password := c.GetMattermostDBPassword()
-	return fmt.Sprintf(
-		"host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
-		c.Mattermost.Database.Host,
-		c.Mattermost.Database.Port,
-		c.Mattermost.Database.User,
-		password,
-		c.Mattermost.Database.Name,
-		ResolveDBSSLMode(c.Mattermost.Database.SSLMode, "", c.Mattermost.Database.Host),
-	)
-}
 
 // MatrixAPIURL returns the full Matrix API base URL
 func (c *Config) MatrixAPIURL() string {
