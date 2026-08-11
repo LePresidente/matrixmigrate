@@ -1668,6 +1668,27 @@ func retryDelay(base time.Duration, retryCount int) time.Duration {
 	return retryAfter
 }
 
+// threadRelation builds the m.relates_to content for a message inside a thread.
+// rootEventID is the thread root. latestEventID is the newest event already in that thread;
+// the nested m.in_reply_to points at it so clients without thread support still render a
+// sensible chain. is_falling_back is always true because Mattermost replies are flat against
+// the root: the nested reply exists for compatibility, never because a user picked that
+// specific message to reply to.
+func threadRelation(rootEventID, latestEventID string) map[string]interface{} {
+	fallback := latestEventID
+	if fallback == "" {
+		fallback = rootEventID
+	}
+	return map[string]interface{}{
+		"rel_type":        "m.thread",
+		"event_id":        rootEventID,
+		"is_falling_back": true,
+		"m.in_reply_to": map[string]interface{}{
+			"event_id": fallback,
+		},
+	}
+}
+
 func shouldRetryRequestErr(err error) bool {
 	if err == nil {
 		return false
