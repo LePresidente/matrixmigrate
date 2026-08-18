@@ -1570,6 +1570,13 @@ func (o *Orchestrator) ImportMessages(progress matrix.MessageImportCallback) (*I
 			result.Stats.ReactionsImported, result.Stats.ReactionsSkipped,
 			result.Stats.ReactionsFailed, result.Stats.ReactionsCustomEmoji)
 	}
+	// Withdraw the memberships the import created for itself. Owners installed in place of a
+	// locked or missing creator are kept - see LeaveHistoryMemberships.
+	if cleanup := importer.LeaveHistoryMemberships(); cleanup != nil && (cleanup.Left > 0 || cleanup.Kept > 0 || cleanup.Failed > 0) {
+		logger.Info("Membership cleanup: left=%d, kept_owners=%d, failed=%d",
+			cleanup.Left, cleanup.Kept, cleanup.Failed)
+	}
+
 	logger.Success("Message import completed successfully")
 
 	// Complete step

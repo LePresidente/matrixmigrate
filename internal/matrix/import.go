@@ -75,6 +75,19 @@ type Importer struct {
 	// mentionExistsCache caches homeserver lookups for mention candidates outside the mapping,
 	// negative results included, so each distinct name costs at most one request per run.
 	mentionExistsCache map[string]bool
+
+	// historyJoins records memberships created purely so a past author could be
+	// impersonated while their messages were replayed. LeaveHistoryMemberships undoes them.
+	historyJoins []HistoryMembership
+
+	// fallbackSenderRooms remembers rooms the AS bot has been joined to, so a channel full
+	// of posts by deleted accounts costs one join rather than one per post.
+	fallbackSenderRooms map[string]struct{}
+}
+
+// HistoryJoins returns the memberships this import created solely to replay history.
+func (i *Importer) HistoryJoins() []HistoryMembership {
+	return i.historyJoins
 }
 
 // NewImporter creates a new importer
@@ -1849,6 +1862,10 @@ func (i *Importer) ImportMessages(
 	// Gate @name rewriting on users that actually exist.
 	i.SetKnownMentionUsers(userMapping)
 
+	// Past authors who have since left their channel are not room members, and the AS cannot
+	// send as a non-member. Same reasoning as the with-files path.
+	i.historyJoins = append(i.historyJoins, i.ensureHistoryAuthorsJoined(posts, channelToRoom, userMapping)...)
+
 	// Collect all existing mappings
 	for k, v := range existingMapping {
 		result.Mapping[k] = v
@@ -1900,6 +1917,10 @@ func (i *Importer) ImportMessages(
 			// Fall back to empty sender (will use AS bot)
 			senderID = ""
 			logger.Warn("No user mapping for user %s, message will be sent as AS bot", post.UserID)
+			// The bot is a sender like any other and must be in the room to post.
+			if err := i.ensureFallbackSenderInRoom(roomID); err != nil {
+				logger.Warn("Fallback sender cannot post to room %s: %v", roomID, err)
+			}
 		}
 
 		messageContent := i.normalizeMatrixMentions(post.Message)
@@ -1943,7 +1964,10 @@ func (i *Importer) ImportMessages(
 			}
 		} else {
 			// Regular message
-			resp, sendErr := i.client.SendMessageWithTimestamp(roomID, messageContent, post.CreateAt, senderID)
+			resp, recovery, sendErr := i.sendWithMembershipRecovery(roomID, messageContent, post.CreateAt, senderID)
+			if recovery != "" {
+				logger.Info("Post %s: %s", post.ID, recovery)
+			}
 			if sendErr != nil {
 				result.Stats.MessagesFailed++
 				result.Errors = append(result.Errors, fmt.Sprintf("Failed to send message %s: %v", post.ID, sendErr))
@@ -2029,6 +2053,11 @@ func (i *Importer) ImportMessagesWithFiles(
 	// chronological order, so this needs no sorting.
 	threadLatest := make(map[string]string)
 
+	// Anyone who posted in a channel and later left it is absent from the room, and the AS
+	// cannot send as a non-member. Join them before the loop rather than discovering it one
+	// M_FORBIDDEN at a time.
+	i.historyJoins = append(i.historyJoins, i.ensureHistoryAuthorsJoined(posts, channelToRoom, userMapping)...)
+
 	// Index every post's target room up front. The reaction pass needs the room of a post that
 	// the loop below may skip as already imported, and those skips `continue` before the room
 	// is ever resolved.
@@ -2078,6 +2107,9 @@ func (i *Importer) ImportMessagesWithFiles(
 		if !userExists {
 			senderID = ""
 			logger.Warn("No user mapping for user %s, message will be sent as AS bot", post.UserID)
+			if err := i.ensureFallbackSenderInRoom(roomID); err != nil {
+				logger.Warn("Fallback sender cannot post to room %s: %v", roomID, err)
+			}
 		}
 
 		// Build message content with files
@@ -2129,7 +2161,10 @@ func (i *Importer) ImportMessagesWithFiles(
 				attachmentReplyToEventID = parentEventID
 			}
 		} else {
-			resp, sendErr := i.client.SendMessageWithTimestamp(roomID, messageContent, post.CreateAt, senderID)
+			resp, recovery, sendErr := i.sendWithMembershipRecovery(roomID, messageContent, post.CreateAt, senderID)
+			if recovery != "" {
+				logger.Info("Post %s: %s", post.ID, recovery)
+			}
 			if sendErr != nil {
 				result.Stats.MessagesFailed++
 				result.Errors = append(result.Errors, fmt.Sprintf("Failed to send message %s: %v", post.ID, sendErr))

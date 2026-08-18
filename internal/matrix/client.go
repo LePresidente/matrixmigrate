@@ -82,6 +82,8 @@ type Client struct {
 
 	// joinedRooms: room IDs the admin has already joined (Synapse admin join API requires admin in room)
 	joinedRooms   map[string]struct{}
+	// asBotUserID caches the application service's own user, the fallback sender.
+	asBotUserID string
 	joinedRoomsMu sync.Mutex
 
 	// roomInfos caches room ID -> creator and room version, looked up when writing power levels
@@ -360,6 +362,41 @@ func (c *Client) WhoAmI() (*WhoAmIResponse, error) {
 	}
 
 	return &resp, nil
+}
+
+// ASBotUserID returns the user the application service posts as when no ?user_id= is given.
+//
+// That account is the fallback sender for posts whose author has no Matrix user, and like
+// any other sender it must be a room member -- which it usually is not, since nothing else
+// in the migration puts it in rooms. Resolved once and cached.
+func (c *Client) ASBotUserID() (string, error) {
+	c.mu.Lock()
+	if c.asBotUserID != "" {
+		id := c.asBotUserID
+		c.mu.Unlock()
+		return id, nil
+	}
+	c.mu.Unlock()
+
+	if c.asToken == "" {
+		return "", fmt.Errorf("no Application Service token: there is no fallback sender to resolve")
+	}
+	body, statusCode, err := c.doRequestWithToken("GET", "/_matrix/client/v3/account/whoami", nil, c.asToken)
+	if err != nil {
+		return "", err
+	}
+	var resp WhoAmIResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return "", fmt.Errorf("failed to parse response: %w", err)
+	}
+	if statusCode != http.StatusOK {
+		return "", fmt.Errorf("API error: %s - %s", resp.Errcode, resp.Error)
+	}
+
+	c.mu.Lock()
+	c.asBotUserID = resp.UserID
+	c.mu.Unlock()
+	return resp.UserID, nil
 }
 
 // TestConnection tests the API connection
@@ -1414,6 +1451,56 @@ func (c *Client) LeaveRoom(roomID string) error {
 	return nil
 }
 
+// LeaveRoomAsUser makes userID leave roomID through the application service.
+//
+// LeaveRoom uses the admin's own token and so can only ever remove the admin. Undoing a
+// membership created for someone else needs ?user_id=, which only the AS token may use.
+func (c *Client) LeaveRoomAsUser(roomID, userID string) error {
+	logger.Debug("LeaveRoomAsUser: room=%s user=%s", roomID, userID)
+	if c.asToken == "" {
+		return fmt.Errorf("no Application Service token: leaving on behalf of %s requires ?user_id=", userID)
+	}
+	params := url.Values{}
+	params.Set("user_id", userID)
+	endpoint := fmt.Sprintf("/_matrix/client/v3/rooms/%s/leave?%s", url.PathEscape(roomID), params.Encode())
+
+	body, statusCode, err := c.doRequestWithToken("POST", endpoint, &JoinRequest{}, c.asToken)
+	if err != nil {
+		return err
+	}
+	if statusCode != http.StatusOK {
+		var resp GenericResponse
+		json.Unmarshal(body, &resp)
+		// Already gone is the desired end state, not a failure.
+		if statusCode == http.StatusForbidden && strings.Contains(resp.Error, "not in room") {
+			return nil
+		}
+		return fmt.Errorf("API error (%d): %s - %s", statusCode, resp.Errcode, resp.Error)
+	}
+	return nil
+}
+
+// AdminJoinedRooms lists the rooms the admin joined during this run in order to operate on
+// them (see ensureAdminInRoom). It is the set the migration should withdraw from afterwards.
+func (c *Client) AdminJoinedRooms() []string {
+	c.joinedRoomsMu.Lock()
+	defer c.joinedRoomsMu.Unlock()
+	rooms := make([]string, 0, len(c.joinedRooms))
+	for roomID := range c.joinedRooms {
+		rooms = append(rooms, roomID)
+	}
+	return rooms
+}
+
+// PowerLevelOf reports userID's power level in roomID.
+func (c *Client) PowerLevelOf(roomID, userID string) (int, error) {
+	content, err := c.getPowerLevels(roomID)
+	if err != nil {
+		return 0, err
+	}
+	return powerLevelForUser(content, userID), nil
+}
+
 // ensureAdminInSpaceWithPower adds the admin to a space (created as owner via AS) with the given power level
 // so that the admin can later link rooms to the space. ownerUserID is the space creator; they invite the admin (via AS).
 func (c *Client) ensureAdminInSpaceWithPower(spaceID, ownerUserID string, powerLevel int) error {
@@ -1835,6 +1922,12 @@ func (c *Client) SetASToken(token string) {
 // HasASToken returns true if an AS token is configured
 func (c *Client) HasASToken() bool {
 	return c.asToken != ""
+}
+
+// HasAdminToken reports whether an admin token is configured. The Synapse admin API is what
+// backs force-joins and room member listings, so callers that need either must check first.
+func (c *Client) HasAdminToken() bool {
+	return c.adminToken != ""
 }
 
 // getNextTxnID generates a unique transaction ID for messages
