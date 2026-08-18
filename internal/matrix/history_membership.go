@@ -260,3 +260,39 @@ func (i *Importer) LeaveHistoryMemberships() *LeaveRoomsResult {
 		result.Left, result.Kept, result.Failed)
 	return result
 }
+
+// ensureFallbackSenderInRoom joins the application service's own user to roomID.
+//
+// When a post's author has no Matrix user -- a Mattermost account deleted outright, so there
+// was nobody to create -- the import sends the message as the AS bot instead. That account is
+// subject to the same rule as any other sender: it cannot post to a room it is not in.
+// Nothing else in the migration ever joins it, so on this deployment every such message
+// failed, 766 of them.
+//
+// Rooms are remembered so a channel full of orphaned posts costs one join, not one per post.
+func (i *Importer) ensureFallbackSenderInRoom(roomID string) error {
+	if i.fallbackSenderRooms == nil {
+		i.fallbackSenderRooms = make(map[string]struct{})
+	}
+	if _, done := i.fallbackSenderRooms[roomID]; done {
+		return nil
+	}
+
+	botID, err := i.client.ASBotUserID()
+	if err != nil {
+		return err
+	}
+	if !i.client.HasAdminToken() {
+		return fmt.Errorf("no admin token: cannot join the fallback sender %s to %s", botID, roomID)
+	}
+	if err := i.client.ensureAdminInRoom(roomID); err != nil {
+		return fmt.Errorf("admin could not enter %s: %w", roomID, err)
+	}
+	if err := i.client.ForceJoinUser(roomID, botID); err != nil {
+		return fmt.Errorf("could not join fallback sender %s to %s: %w", botID, roomID, err)
+	}
+
+	i.fallbackSenderRooms[roomID] = struct{}{}
+	i.historyJoins = append(i.historyJoins, HistoryMembership{RoomID: roomID, UserID: botID})
+	return nil
+}

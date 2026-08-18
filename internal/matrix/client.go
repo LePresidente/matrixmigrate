@@ -82,6 +82,8 @@ type Client struct {
 
 	// joinedRooms: room IDs the admin has already joined (Synapse admin join API requires admin in room)
 	joinedRooms   map[string]struct{}
+	// asBotUserID caches the application service's own user, the fallback sender.
+	asBotUserID string
 	joinedRoomsMu sync.Mutex
 
 	// roomInfos caches room ID -> creator and room version, looked up when writing power levels
@@ -360,6 +362,41 @@ func (c *Client) WhoAmI() (*WhoAmIResponse, error) {
 	}
 
 	return &resp, nil
+}
+
+// ASBotUserID returns the user the application service posts as when no ?user_id= is given.
+//
+// That account is the fallback sender for posts whose author has no Matrix user, and like
+// any other sender it must be a room member -- which it usually is not, since nothing else
+// in the migration puts it in rooms. Resolved once and cached.
+func (c *Client) ASBotUserID() (string, error) {
+	c.mu.Lock()
+	if c.asBotUserID != "" {
+		id := c.asBotUserID
+		c.mu.Unlock()
+		return id, nil
+	}
+	c.mu.Unlock()
+
+	if c.asToken == "" {
+		return "", fmt.Errorf("no Application Service token: there is no fallback sender to resolve")
+	}
+	body, statusCode, err := c.doRequestWithToken("GET", "/_matrix/client/v3/account/whoami", nil, c.asToken)
+	if err != nil {
+		return "", err
+	}
+	var resp WhoAmIResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return "", fmt.Errorf("failed to parse response: %w", err)
+	}
+	if statusCode != http.StatusOK {
+		return "", fmt.Errorf("API error: %s - %s", resp.Errcode, resp.Error)
+	}
+
+	c.mu.Lock()
+	c.asBotUserID = resp.UserID
+	c.mu.Unlock()
+	return resp.UserID, nil
 }
 
 // TestConnection tests the API connection

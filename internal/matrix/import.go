@@ -79,6 +79,10 @@ type Importer struct {
 	// historyJoins records memberships created purely so a past author could be
 	// impersonated while their messages were replayed. LeaveHistoryMemberships undoes them.
 	historyJoins []HistoryMembership
+
+	// fallbackSenderRooms remembers rooms the AS bot has been joined to, so a channel full
+	// of posts by deleted accounts costs one join rather than one per post.
+	fallbackSenderRooms map[string]struct{}
 }
 
 // HistoryJoins returns the memberships this import created solely to replay history.
@@ -1913,6 +1917,10 @@ func (i *Importer) ImportMessages(
 			// Fall back to empty sender (will use AS bot)
 			senderID = ""
 			logger.Warn("No user mapping for user %s, message will be sent as AS bot", post.UserID)
+			// The bot is a sender like any other and must be in the room to post.
+			if err := i.ensureFallbackSenderInRoom(roomID); err != nil {
+				logger.Warn("Fallback sender cannot post to room %s: %v", roomID, err)
+			}
 		}
 
 		messageContent := i.normalizeMatrixMentions(post.Message)
@@ -2096,6 +2104,9 @@ func (i *Importer) ImportMessagesWithFiles(
 		if !userExists {
 			senderID = ""
 			logger.Warn("No user mapping for user %s, message will be sent as AS bot", post.UserID)
+			if err := i.ensureFallbackSenderInRoom(roomID); err != nil {
+				logger.Warn("Fallback sender cannot post to room %s: %v", roomID, err)
+			}
 		}
 
 		// Build message content with files
