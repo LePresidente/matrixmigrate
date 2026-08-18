@@ -139,3 +139,124 @@ func (i *Importer) ensureHistoryAuthorsJoined(
 	}
 	return joined
 }
+
+// RoomOwnerPowerLevel is the power level preserve_owner_and_alias gives a room's owner.
+// It is also how a forced owner is recognised after the fact: nothing else in a migrated
+// room is granted 100.
+const RoomOwnerPowerLevel = 100
+
+// LeaveRoomsResult reports what the post-import withdrawal did.
+type LeaveRoomsResult struct {
+	Left    int // memberships withdrawn
+	Kept    int // memberships deliberately preserved because the account owns the room
+	Failed  int
+	Skipped int // nothing to do (no AS token, no recorded joins)
+}
+
+// LeaveHistoryMemberships withdraws the memberships this migration created for its own
+// convenience, and only those.
+//
+// Two kinds are undone: past authors joined so their messages could be replayed, and the
+// migration's own admin account, which joins each room in order to operate on it. Matrix
+// keeps events after their sender leaves, so the archive is unaffected by either.
+//
+// The exception is ownership. Where a channel's real creator was locked or no longer exists,
+// room creation installs an admin account as the owner instead; that account holds
+// RoomOwnerPowerLevel and is the only thing standing between the room and having nobody who
+// can administer it. Those memberships are kept, whichever account they belong to.
+func (i *Importer) LeaveHistoryMemberships() *LeaveRoomsResult {
+	result := &LeaveRoomsResult{}
+
+	if !i.client.HasASToken() {
+		logger.Warn("No Application Service token: cannot withdraw memberships created for the import")
+		result.Skipped = len(i.historyJoins)
+		return result
+	}
+
+	// The admin's own memberships are withdrawn too, so resolve who that is.
+	adminID := ""
+	if me, err := i.client.WhoAmI(); err == nil && me != nil {
+		adminID = me.UserID
+	}
+
+	type membership struct{ roomID, userID string }
+	pending := make([]membership, 0, len(i.historyJoins))
+	seen := make(map[membership]struct{})
+	for _, hm := range i.historyJoins {
+		m := membership{hm.RoomID, hm.UserID}
+		if _, dup := seen[m]; dup {
+			continue
+		}
+		seen[m] = struct{}{}
+		pending = append(pending, m)
+	}
+	if adminID != "" {
+		for _, roomID := range i.client.AdminJoinedRooms() {
+			m := membership{roomID, adminID}
+			if _, dup := seen[m]; dup {
+				continue
+			}
+			seen[m] = struct{}{}
+			pending = append(pending, m)
+		}
+	}
+
+	sort.Slice(pending, func(a, b int) bool {
+		if pending[a].roomID != pending[b].roomID {
+			return pending[a].roomID < pending[b].roomID
+		}
+		return pending[a].userID < pending[b].userID
+	})
+
+	// Power levels are per room and every membership in a room asks the same question, so
+	// resolve each room once.
+	ownerCache := make(map[string]map[string]int)
+	unknownOwnership := make(map[string]bool)
+	for _, m := range pending {
+		levels, cached := ownerCache[m.roomID]
+		if !cached {
+			levels = make(map[string]int)
+			content, err := i.client.getPowerLevels(m.roomID)
+			if err != nil || content == nil {
+				// Unknown ownership: keep every membership in this room. Leaving a room that
+				// turns out to have no other administrator is not recoverable without a
+				// server admin, so an unnecessary membership is the cheaper mistake.
+				logger.Warn("Could not read power levels for room %s (%v); keeping memberships in place", m.roomID, err)
+				unknownOwnership[m.roomID] = true
+			} else {
+				for user, level := range content.Users {
+					levels[user] = level
+				}
+			}
+			ownerCache[m.roomID] = levels
+		}
+
+		if unknownOwnership[m.roomID] {
+			result.Kept++
+			continue
+		}
+
+		if levels[m.userID] >= RoomOwnerPowerLevel {
+			logger.Info("Keeping %s in room %s: holds power level %d, so it is the room's owner", m.userID, m.roomID, levels[m.userID])
+			result.Kept++
+			continue
+		}
+
+		var err error
+		if m.userID == adminID {
+			err = i.client.LeaveRoom(m.roomID)
+		} else {
+			err = i.client.LeaveRoomAsUser(m.roomID, m.userID)
+		}
+		if err != nil {
+			logger.Warn("Could not remove %s from room %s: %v", m.userID, m.roomID, err)
+			result.Failed++
+			continue
+		}
+		result.Left++
+	}
+
+	logger.Info("Post-import membership cleanup: left %d, kept %d owner membership(s), %d failed",
+		result.Left, result.Kept, result.Failed)
+	return result
+}

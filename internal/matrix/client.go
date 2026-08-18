@@ -1414,6 +1414,56 @@ func (c *Client) LeaveRoom(roomID string) error {
 	return nil
 }
 
+// LeaveRoomAsUser makes userID leave roomID through the application service.
+//
+// LeaveRoom uses the admin's own token and so can only ever remove the admin. Undoing a
+// membership created for someone else needs ?user_id=, which only the AS token may use.
+func (c *Client) LeaveRoomAsUser(roomID, userID string) error {
+	logger.Debug("LeaveRoomAsUser: room=%s user=%s", roomID, userID)
+	if c.asToken == "" {
+		return fmt.Errorf("no Application Service token: leaving on behalf of %s requires ?user_id=", userID)
+	}
+	params := url.Values{}
+	params.Set("user_id", userID)
+	endpoint := fmt.Sprintf("/_matrix/client/v3/rooms/%s/leave?%s", url.PathEscape(roomID), params.Encode())
+
+	body, statusCode, err := c.doRequestWithToken("POST", endpoint, &JoinRequest{}, c.asToken)
+	if err != nil {
+		return err
+	}
+	if statusCode != http.StatusOK {
+		var resp GenericResponse
+		json.Unmarshal(body, &resp)
+		// Already gone is the desired end state, not a failure.
+		if statusCode == http.StatusForbidden && strings.Contains(resp.Error, "not in room") {
+			return nil
+		}
+		return fmt.Errorf("API error (%d): %s - %s", statusCode, resp.Errcode, resp.Error)
+	}
+	return nil
+}
+
+// AdminJoinedRooms lists the rooms the admin joined during this run in order to operate on
+// them (see ensureAdminInRoom). It is the set the migration should withdraw from afterwards.
+func (c *Client) AdminJoinedRooms() []string {
+	c.joinedRoomsMu.Lock()
+	defer c.joinedRoomsMu.Unlock()
+	rooms := make([]string, 0, len(c.joinedRooms))
+	for roomID := range c.joinedRooms {
+		rooms = append(rooms, roomID)
+	}
+	return rooms
+}
+
+// PowerLevelOf reports userID's power level in roomID.
+func (c *Client) PowerLevelOf(roomID, userID string) (int, error) {
+	content, err := c.getPowerLevels(roomID)
+	if err != nil {
+		return 0, err
+	}
+	return powerLevelForUser(content, userID), nil
+}
+
 // ensureAdminInSpaceWithPower adds the admin to a space (created as owner via AS) with the given power level
 // so that the admin can later link rooms to the space. ownerUserID is the space creator; they invite the admin (via AS).
 func (c *Client) ensureAdminInSpaceWithPower(spaceID, ownerUserID string, powerLevel int) error {
