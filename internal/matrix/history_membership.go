@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
+	"strings"
 
 	"github.com/aligundogdu/matrixmigrate/internal/logger"
 	"github.com/aligundogdu/matrixmigrate/internal/mattermost"
@@ -295,4 +296,55 @@ func (i *Importer) ensureFallbackSenderInRoom(roomID string) error {
 	i.fallbackSenderRooms[roomID] = struct{}{}
 	i.historyJoins = append(i.historyJoins, HistoryMembership{RoomID: roomID, UserID: botID})
 	return nil
+}
+
+// isNotInRoomErr reports whether err is the homeserver refusing a send because the sender is
+// not a member of the room. Matched on M_FORBIDDEN plus the "not in room" phrasing, because
+// M_FORBIDDEN alone also covers cases joining would not fix.
+func isNotInRoomErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "M_FORBIDDEN") && strings.Contains(msg, "not in room")
+}
+
+// sendWithMembershipRecovery sends a message and, if the homeserver refuses it because the
+// sender is not in the room, repairs the membership and tries again.
+//
+// The membership pre-pass covers the authors known from the export, but it cannot cover
+// everything: a room's membership can change under a run that lasts days, and a post can name
+// an author the pre-pass never saw. This is the safety net for those, so a recoverable
+// refusal costs one join instead of one lost message.
+//
+// The returned note describes what recovery was needed, empty when the first attempt worked.
+func (i *Importer) sendWithMembershipRecovery(roomID, content string, timestamp int64, senderID string) (*SendMessageResponse, string, error) {
+	resp, err := i.client.SendMessageWithTimestamp(roomID, content, timestamp, senderID)
+	if err == nil || !isNotInRoomErr(err) {
+		return resp, "", err
+	}
+
+	// The sender is known but absent: join them, exactly as the pre-pass would have.
+	if senderID != "" && i.client.HasAdminToken() {
+		if jerr := i.client.ensureAdminInRoom(roomID); jerr == nil {
+			if jerr = i.client.ForceJoinUser(roomID, senderID); jerr == nil {
+				i.historyJoins = append(i.historyJoins, HistoryMembership{RoomID: roomID, UserID: senderID})
+				if resp, err = i.client.SendMessageWithTimestamp(roomID, content, timestamp, senderID); err == nil {
+					return resp, "recovered: joined sender to room", nil
+				}
+			}
+		}
+	}
+
+	// Still refused. Losing the message outright is worse than losing its authorship, so try
+	// the fallback sender -- but only after making sure it is itself in the room.
+	if senderID != "" {
+		if ferr := i.ensureFallbackSenderInRoom(roomID); ferr == nil {
+			if resp, berr := i.client.SendMessageWithTimestamp(roomID, content, timestamp, ""); berr == nil {
+				return resp, "recovered: sent as fallback sender, original author could not be joined", nil
+			}
+		}
+	}
+
+	return nil, "", err
 }

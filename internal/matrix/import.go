@@ -1964,7 +1964,10 @@ func (i *Importer) ImportMessages(
 			}
 		} else {
 			// Regular message
-			resp, sendErr := i.client.SendMessageWithTimestamp(roomID, messageContent, post.CreateAt, senderID)
+			resp, recovery, sendErr := i.sendWithMembershipRecovery(roomID, messageContent, post.CreateAt, senderID)
+			if recovery != "" {
+				logger.Info("Post %s: %s", post.ID, recovery)
+			}
 			if sendErr != nil {
 				result.Stats.MessagesFailed++
 				result.Errors = append(result.Errors, fmt.Sprintf("Failed to send message %s: %v", post.ID, sendErr))
@@ -2158,7 +2161,10 @@ func (i *Importer) ImportMessagesWithFiles(
 				attachmentReplyToEventID = parentEventID
 			}
 		} else {
-			resp, sendErr := i.client.SendMessageWithTimestamp(roomID, messageContent, post.CreateAt, senderID)
+			resp, recovery, sendErr := i.sendWithMembershipRecovery(roomID, messageContent, post.CreateAt, senderID)
+			if recovery != "" {
+				logger.Info("Post %s: %s", post.ID, recovery)
+			}
 			if sendErr != nil {
 				result.Stats.MessagesFailed++
 				result.Errors = append(result.Errors, fmt.Sprintf("Failed to send message %s: %v", post.ID, sendErr))
