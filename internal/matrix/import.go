@@ -75,6 +75,15 @@ type Importer struct {
 	// mentionExistsCache caches homeserver lookups for mention candidates outside the mapping,
 	// negative results included, so each distinct name costs at most one request per run.
 	mentionExistsCache map[string]bool
+
+	// historyJoins records memberships created purely so a past author could be
+	// impersonated while their messages were replayed. LeaveHistoryMemberships undoes them.
+	historyJoins []HistoryMembership
+}
+
+// HistoryJoins returns the memberships this import created solely to replay history.
+func (i *Importer) HistoryJoins() []HistoryMembership {
+	return i.historyJoins
 }
 
 // NewImporter creates a new importer
@@ -1849,6 +1858,10 @@ func (i *Importer) ImportMessages(
 	// Gate @name rewriting on users that actually exist.
 	i.SetKnownMentionUsers(userMapping)
 
+	// Past authors who have since left their channel are not room members, and the AS cannot
+	// send as a non-member. Same reasoning as the with-files path.
+	i.historyJoins = append(i.historyJoins, i.ensureHistoryAuthorsJoined(posts, channelToRoom, userMapping)...)
+
 	// Collect all existing mappings
 	for k, v := range existingMapping {
 		result.Mapping[k] = v
@@ -2028,6 +2041,11 @@ func (i *Importer) ImportMessagesWithFiles(
 	// points at the previous message rather than always at the root. Posts arrive in
 	// chronological order, so this needs no sorting.
 	threadLatest := make(map[string]string)
+
+	// Anyone who posted in a channel and later left it is absent from the room, and the AS
+	// cannot send as a non-member. Join them before the loop rather than discovering it one
+	// M_FORBIDDEN at a time.
+	i.historyJoins = append(i.historyJoins, i.ensureHistoryAuthorsJoined(posts, channelToRoom, userMapping)...)
 
 	// Index every post's target room up front. The reaction pass needs the room of a post that
 	// the loop below may skip as already imported, and those skips `continue` before the room

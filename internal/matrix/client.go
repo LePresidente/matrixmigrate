@@ -1837,6 +1837,12 @@ func (c *Client) HasASToken() bool {
 	return c.asToken != ""
 }
 
+// HasAdminToken reports whether an admin token is configured. The Synapse admin API is what
+// backs force-joins and room member listings, so callers that need either must check first.
+func (c *Client) HasAdminToken() bool {
+	return c.adminToken != ""
+}
+
 // getNextTxnID generates a unique transaction ID for messages
 func (c *Client) getNextTxnID() string {
 	c.mu.Lock()
