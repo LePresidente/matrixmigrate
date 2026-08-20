@@ -120,7 +120,7 @@ func (i *Importer) ensureHistoryAuthorsJoined(
 		}
 		sort.Strings(missing)
 
-		if err := i.client.ensureAdminInRoom(roomID); err != nil {
+		if err := i.ensureAdminCanActIn(roomID, current); err != nil {
 			logger.Warn("Could not put the admin in room %s (%v); %d past author(s) will fail to send", roomID, err, len(missing))
 			failed += len(missing)
 			continue
@@ -139,6 +139,70 @@ func (i *Importer) ensureHistoryAuthorsJoined(
 		logger.Info("Past-author membership: joined %d (user,room) pair(s), %d could not be joined", len(joined), failed)
 	}
 	return joined
+}
+
+// maxHistoryInviteCandidates caps how many existing members are asked to invite the admin.
+// The first willing one ends the loop; the cap only bounds the cost when none can.
+const maxHistoryInviteCandidates = 12
+
+// ensureAdminCanActIn puts the admin in a room so force-joins are possible.
+//
+// The plain join works for public rooms. Invite-only and space-restricted rooms refuse it:
+// Synapse answers M_FORBIDDEN, and since force-joining requires the admin to be in the room
+// already, the whole repair stalls. On this deployment that was not an edge case - it was
+// every room that mattered, 72 of them, blocking all 134 past-author joins.
+//
+// The recovery is the one ApplyChannelMemberships already uses: have somebody who is in the
+// room invite the admin, through the application service. Existing members are the natural
+// candidates, and unlike room creation this code has the member list to hand.
+func (i *Importer) ensureAdminCanActIn(roomID string, currentMembers []string) error {
+	if err := i.client.ensureAdminInRoom(roomID); err == nil {
+		return err
+	} else if !isRoomClosedErr(err) {
+		return err
+	}
+
+	if !i.client.HasASToken() {
+		return fmt.Errorf("room %s is invite-only and there is no AS token to arrange an invite", roomID)
+	}
+
+	me, err := i.client.WhoAmI()
+	if err != nil || me == nil {
+		return fmt.Errorf("whoami: %w", err)
+	}
+
+	inviters := make([]string, 0, maxHistoryInviteCandidates)
+	for _, member := range currentMembers {
+		if member == "" || member == me.UserID {
+			continue
+		}
+		inviters = append(inviters, member)
+		if len(inviters) >= maxHistoryInviteCandidates {
+			break
+		}
+	}
+	if len(inviters) == 0 {
+		return fmt.Errorf("room %s is invite-only and has no other member who could invite the admin", roomID)
+	}
+
+	// ensureAdminInRoomWithPower treats the first argument as the owner and the rest as
+	// fallback inviters, trying each until one succeeds.
+	return i.client.ensureAdminInRoomWithPower(roomID, inviters[0], RoomOwnerPowerLevel, inviters[1:]...)
+}
+
+// isRoomClosedErr reports whether err is a room refusing an uninvited join, as opposed to a
+// failure that arranging an invite would not fix.
+func isRoomClosedErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "M_FORBIDDEN") {
+		return false
+	}
+	return strings.Contains(msg, "not invited") ||
+		strings.Contains(msg, "required rooms/spaces") ||
+		strings.Contains(msg, "invite-only")
 }
 
 // RoomOwnerPowerLevel is the power level preserve_owner_and_alias gives a room's owner.
@@ -286,7 +350,11 @@ func (i *Importer) ensureFallbackSenderInRoom(roomID string) error {
 	if !i.client.HasAdminToken() {
 		return fmt.Errorf("no admin token: cannot join the fallback sender %s to %s", botID, roomID)
 	}
-	if err := i.client.ensureAdminInRoom(roomID); err != nil {
+	members, merr := i.client.roomMemberIDs(roomID)
+	if merr != nil {
+		logger.Debug("ensureFallbackSenderInRoom: member list for %s unavailable (%v)", roomID, merr)
+	}
+	if err := i.ensureAdminCanActIn(roomID, members); err != nil {
 		return fmt.Errorf("admin could not enter %s: %w", roomID, err)
 	}
 	if err := i.client.ForceJoinUser(roomID, botID); err != nil {
@@ -326,7 +394,8 @@ func (i *Importer) sendWithMembershipRecovery(roomID, content string, timestamp 
 
 	// The sender is known but absent: join them, exactly as the pre-pass would have.
 	if senderID != "" && i.client.HasAdminToken() {
-		if jerr := i.client.ensureAdminInRoom(roomID); jerr == nil {
+		members, _ := i.client.roomMemberIDs(roomID)
+		if jerr := i.ensureAdminCanActIn(roomID, members); jerr == nil {
 			if jerr = i.client.ForceJoinUser(roomID, senderID); jerr == nil {
 				i.historyJoins = append(i.historyJoins, HistoryMembership{RoomID: roomID, UserID: senderID})
 				if resp, err = i.client.SendMessageWithTimestamp(roomID, content, timestamp, senderID); err == nil {
