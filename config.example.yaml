@@ -187,6 +187,22 @@ matrix:
     # If this user does not exist, the admin account (auth.username) is used.
     # fallback_room_creator: "admin"
 
+    # How a Mattermost account with delete_at > 0 is represented in Matrix. Either way the
+    # account is still created, because the history needs it to attribute messages to, and
+    # either way its messages stay in the room - neither mode redacts anything.
+    #   "deactivated" (default) - Synapse's own account closure: no login, and the account is
+    #                             removed from every room, which is what Synapse does to any
+    #                             account being deactivated. The migration follows through:
+    #                             deleted users are not added to rooms during membership
+    #                             import, and 'import leave-rooms' removes any membership an
+    #                             earlier run left behind.
+    #   "locked"                - Synapse's reversible lock: no login, but room memberships are
+    #                             kept, so the account still appears in member lists as it did
+    #                             in Mattermost. Needs a Synapse new enough to accept "locked"
+    #                             on the admin user API; older servers reject it and the
+    #                             account is left unlocked.
+    # deleted_user_mode: "deactivated"
+
     # How newly created Matrix users get a password.
     user_password:
       # "auto" (default) - no password when matrix.mas.enabled is true (accounts are

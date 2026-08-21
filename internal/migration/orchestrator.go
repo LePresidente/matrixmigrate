@@ -137,8 +137,25 @@ type OperationResult struct {
 	RoomsLeaveSkip   int
 	RoomsLeaveFailed int
 
+	// Leave-rooms removal sweeps: deactivated accounts, then the migration's own AS bot
+	DeactivatedAccounts    int
+	DeactivatedRoomsLeft   int
+	DeactivatedRoomsKept   int
+	DeactivatedRoomsFailed int
+	BotRoomsLeft           int
+	BotRoomsKept           int
+	BotRoomsFailed         int
+
 	// Output file
 	OutputFile string
+}
+
+// newImporter builds an Importer already carrying the settings every step shares, so a new
+// step cannot quietly get the defaults instead of the configuration.
+func (o *Orchestrator) newImporter() *matrix.Importer {
+	importer := matrix.NewImporter(o.mxClient)
+	importer.SetDeletedUserMode(o.config.GetDeletedUserMode())
+	return importer
 }
 
 // ConnectMattermost establishes connection to Mattermost
@@ -633,7 +650,7 @@ func (o *Orchestrator) ImportAssets(progress ProgressCallback) (*OperationResult
 	}
 
 	// Create importer
-	importer := matrix.NewImporter(o.mxClient)
+	importer := o.newImporter()
 
 	// Resolve how new users get a password ("auto" -> none when MAS handles authentication).
 	passwordMode := matrix.PasswordModeRandom
@@ -925,7 +942,7 @@ func (o *Orchestrator) ImportMemberships(progress ProgressCallback) (*OperationR
 	}
 
 	// Create importer
-	importer := matrix.NewImporter(o.mxClient)
+	importer := o.newImporter()
 
 	// Import callback
 	var importProgress matrix.ImportProgressCallback
@@ -962,7 +979,7 @@ func (o *Orchestrator) ImportMemberships(progress ProgressCallback) (*OperationR
 	if progress != nil {
 		progress("team_memberships", 0, len(memberships.TeamMembers), "")
 	}
-	teamStats, spacesToLeaveAfterMembershipImport, err := importer.ApplyTeamMemberships(memberships.TeamMembers, mapping.Users, mapping.Teams, defaultRoomOwnerID, importProgress)
+	teamStats, spacesToLeaveAfterMembershipImport, err := importer.ApplyTeamMemberships(memberships.TeamMembers, users, mapping.Users, mapping.Teams, defaultRoomOwnerID, importProgress)
 	if err != nil {
 		o.state.FailStep(StepImportMemberships, err)
 		o.SaveState()
@@ -1063,7 +1080,7 @@ func (o *Orchestrator) LeaveRooms(progress ProgressCallback) (*OperationResult, 
 	}
 	logger.Info("Leaving %d rooms and %d spaces", len(mapping.Channels), len(mapping.Teams))
 
-	importer := matrix.NewImporter(o.mxClient)
+	importer := o.newImporter()
 
 	var importProgress matrix.ImportProgressCallback
 	if progress != nil {
@@ -1072,6 +1089,29 @@ func (o *Orchestrator) LeaveRooms(progress ProgressCallback) (*OperationResult, 
 			o.state.UpdateStepProgress(StepLeaveRooms, current, total)
 		}
 	}
+
+	// Both sweeps run before the admin leaves, not after: removing somebody from an
+	// invite-only room can require putting the admin into it first, which would undo the
+	// leave that had just been done.
+
+	// Deactivated accounts, whose memberships an earlier run may have created and which
+	// Synapse will not clean up on its own once the account is already deactivated.
+	if users := o.loadExportedUsers(); len(users) > 0 {
+		removal := importer.RemoveDeletedUsersFromRooms(users, mapping.Users, importProgress)
+		result.DeactivatedAccounts = removal.Accounts
+		result.DeactivatedRoomsLeft = removal.Left
+		result.DeactivatedRoomsKept = removal.Kept
+		result.DeactivatedRoomsFailed = removal.Failed
+	} else {
+		logger.Warn("No exported assets found: cannot tell which accounts are deactivated, skipping their room removal")
+	}
+
+	// The migration's own application service bot, which joins rooms only so it can post on
+	// behalf of authors who no longer have an account.
+	botRemoval := importer.RemoveASBotFromRooms(importProgress)
+	result.BotRoomsLeft = botRemoval.Left
+	result.BotRoomsKept = botRemoval.Kept
+	result.BotRoomsFailed = botRemoval.Failed
 
 	stats, err := importer.LeaveMigratedRooms(roomIDs, importProgress)
 	if err != nil {
@@ -1088,6 +1128,10 @@ func (o *Orchestrator) LeaveRooms(progress ProgressCallback) (*OperationResult, 
 	logger.Info("=== LeaveRooms Completed ===")
 	logger.Info("Total: left=%d, already-out=%d, failed=%d",
 		result.RoomsLeft, result.RoomsLeaveSkip, result.RoomsLeaveFailed)
+	logger.Info("Deactivated accounts: checked=%d, memberships_removed=%d, kept_as_owner=%d, failed=%d",
+		result.DeactivatedAccounts, result.DeactivatedRoomsLeft, result.DeactivatedRoomsKept, result.DeactivatedRoomsFailed)
+	logger.Info("Migration bot: rooms_left=%d, kept_as_owner=%d, failed=%d",
+		result.BotRoomsLeft, result.BotRoomsKept, result.BotRoomsFailed)
 	if result.RoomsLeaveFailed > 0 {
 		logger.Warn("The migration admin is still in %d room(s); re-run 'import leave-rooms' or remove it manually", result.RoomsLeaveFailed)
 	} else {
@@ -1096,6 +1140,22 @@ func (o *Orchestrator) LeaveRooms(progress ProgressCallback) (*OperationResult, 
 
 	o.state.CompleteStep(StepLeaveRooms, "")
 	return result, o.SaveState()
+}
+
+// loadExportedUsers reads the user list from the newest asset export, or returns nil when
+// there is none. Deletion is a Mattermost fact, so the export is the only record of which
+// migrated accounts are supposed to be closed.
+func (o *Orchestrator) loadExportedUsers() []mattermost.User {
+	assetFile := o.state.GetStepOutputFile(StepExportAssets)
+	if assetFile == "" {
+		return nil
+	}
+	var assets mattermost.Assets
+	if err := archive.LoadGzipJSON(assetFile, &assets); err != nil {
+		logger.Warn("Could not read exported assets from %s: %v", assetFile, err)
+		return nil
+	}
+	return assets.Users
 }
 
 // EnableEmailNotifications registers an email pusher for every migrated user with an address,
@@ -1155,7 +1215,7 @@ func (o *Orchestrator) EnableEmailNotifications(progress ProgressCallback) (*Ope
 
 	o.mxClient.SetASToken(o.config.GetASToken())
 
-	importer := matrix.NewImporter(o.mxClient)
+	importer := o.newImporter()
 
 	var importProgress matrix.ImportProgressCallback
 	if progress != nil {
@@ -1433,7 +1493,7 @@ func (o *Orchestrator) ImportMessages(progress matrix.MessageImportCallback) (*I
 	}
 
 	// Create importer
-	importer := matrix.NewImporter(o.mxClient)
+	importer := o.newImporter()
 
 	// Convert existing mapping to simple map
 	existingMapping := make(map[string]string)

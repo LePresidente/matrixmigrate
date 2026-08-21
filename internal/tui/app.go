@@ -945,7 +945,7 @@ func (m *Model) runLeaveRooms() tea.Cmd {
 			return operationCompleteMsg{err: err}
 		}
 
-		sendProgress("Leaving migrated rooms and spaces...", 0, 0, "")
+		sendProgress("Removing migration accounts from rooms...", 0, 0, "")
 
 		progress := func(stage string, current, total int, item string) {
 			sendProgress(stage, current, total, item)
@@ -956,10 +956,10 @@ func (m *Model) runLeaveRooms() tea.Cmd {
 			return operationCompleteMsg{err: err}
 		}
 
-		msg := "Left all migrated rooms and spaces!"
-		if result.RoomsLeaveFailed > 0 {
-			msg = fmt.Sprintf("Left %d room(s), but %d could not be left - re-run this step or check the log.",
-				result.RoomsLeft, result.RoomsLeaveFailed)
+		msg := fmt.Sprintf("Cleanup done: admin left %d room(s), %d deactivated membership(s) and %d bot membership(s) removed.",
+			result.RoomsLeft, result.DeactivatedRoomsLeft, result.BotRoomsLeft)
+		if failed := result.RoomsLeaveFailed + result.DeactivatedRoomsFailed + result.BotRoomsFailed; failed > 0 {
+			msg = fmt.Sprintf("%s %d removal(s) failed - re-run this step or check the log.", msg, failed)
 		}
 		return operationCompleteMsg{message: msg, result: result}
 	}
