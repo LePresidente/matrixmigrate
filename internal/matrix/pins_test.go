@@ -58,14 +58,15 @@ func TestRequiredPinPowerLevelFallsBackToStateDefaultThenFifty(t *testing.T) {
 	}
 }
 
-func TestPickPinCapableUserPicksTheStrongestLocalUser(t *testing.T) {
+func TestPinCapableUsersRanksTheStrongestLocalUserFirst(t *testing.T) {
 	pl := &PowerLevelsContent{Users: map[string]int{
 		"@alice:example.com":   50,
 		"@bob_dev:example.com": 100,
 		"@carol:example.com":   0,
 	}}
-	if got := pickPinCapableUser(pl, "example.com", 50, ""); got != "@bob_dev:example.com" {
-		t.Fatalf("pickPinCapableUser = %q, want @bob_dev:example.com", got)
+	got := pinCapableUsers(pl, "example.com", 50, "")
+	if want := []string{"@bob_dev:example.com", "@alice:example.com"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("pinCapableUsers = %v, want %v (carol is below the bar)", got, want)
 	}
 }
 
@@ -75,26 +76,26 @@ func TestPickPinCapableUserIgnoresRemoteUsers(t *testing.T) {
 		"@remote:other.example": 100,
 		"@alice:example.com":    50,
 	}}
-	if got := pickPinCapableUser(pl, "example.com", 50, ""); got != "@alice:example.com" {
-		t.Fatalf("pickPinCapableUser = %q, want @alice:example.com", got)
+	if got := firstPinCandidate(pl, "example.com", 50, ""); got != "@alice:example.com" {
+		t.Fatalf("first pin candidate = %q, want @alice:example.com", got)
 	}
 }
 
 func TestPickPinCapableUserReturnsEmptyWhenNobodyQualifies(t *testing.T) {
 	pl := &PowerLevelsContent{Users: map[string]int{"@alice:example.com": 25}}
-	if got := pickPinCapableUser(pl, "example.com", 50, ""); got != "" {
-		t.Fatalf("pickPinCapableUser = %q, want empty", got)
+	if got := firstPinCandidate(pl, "example.com", 50, ""); got != "" {
+		t.Fatalf("first pin candidate = %q, want empty", got)
 	}
 }
 
-func TestPickPinCapableUserIsDeterministicOnTies(t *testing.T) {
+func TestPinCapableUsersAreDeterministicOnTies(t *testing.T) {
 	pl := &PowerLevelsContent{Users: map[string]int{
 		"@bob_dev:example.com": 100,
 		"@alice:example.com":   100,
 	}}
 	for i := 0; i < 20; i++ {
-		if got := pickPinCapableUser(pl, "example.com", 50, ""); got != "@alice:example.com" {
-			t.Fatalf("pickPinCapableUser = %q, want @alice:example.com on every call", got)
+		if got := firstPinCandidate(pl, "example.com", 50, ""); got != "@alice:example.com" {
+			t.Fatalf("first pin candidate = %q, want @alice:example.com on every call", got)
 		}
 	}
 }
@@ -160,21 +161,21 @@ func TestPickPinCapableUserFallsBackToTheCreator(t *testing.T) {
 	// Room version 12 gives the creator implicit infinite power and forbids listing them in
 	// content.users, so a room that can be pinned in still shows an empty users map.
 	pl := &PowerLevelsContent{StateDefault: 50, Users: map[string]int{}}
-	if got := pickPinCapableUser(pl, "example.com", 50, "@alice:example.com"); got != "@alice:example.com" {
-		t.Fatalf("pickPinCapableUser = %q, want the creator @alice:example.com", got)
+	if got := firstPinCandidate(pl, "example.com", 50, "@alice:example.com"); got != "@alice:example.com" {
+		t.Fatalf("first pin candidate = %q, want the creator @alice:example.com", got)
 	}
 }
 
 func TestPickPinCapableUserPrefersAnExplicitlyPoweredMemberOverTheCreator(t *testing.T) {
 	pl := &PowerLevelsContent{Users: map[string]int{"@bob_dev:example.com": 100}}
-	if got := pickPinCapableUser(pl, "example.com", 50, "@alice:example.com"); got != "@bob_dev:example.com" {
-		t.Fatalf("pickPinCapableUser = %q, want @bob_dev:example.com", got)
+	if got := firstPinCandidate(pl, "example.com", 50, "@alice:example.com"); got != "@bob_dev:example.com" {
+		t.Fatalf("first pin candidate = %q, want @bob_dev:example.com", got)
 	}
 }
 
 func TestPickPinCapableUserIgnoresARemoteCreator(t *testing.T) {
-	if got := pickPinCapableUser(&PowerLevelsContent{}, "example.com", 50, "@alice:other.example"); got != "" {
-		t.Fatalf("pickPinCapableUser = %q, want empty for a creator on another homeserver", got)
+	if got := firstPinCandidate(&PowerLevelsContent{}, "example.com", 50, "@alice:other.example"); got != "" {
+		t.Fatalf("first pin candidate = %q, want empty for a creator on another homeserver", got)
 	}
 }
 
@@ -217,5 +218,61 @@ func TestCreatorFromStateUsesTheCreateEventSender(t *testing.T) {
 	}
 	if got := creatorFromState(state); got != "@alice:example.com" {
 		t.Fatalf("creatorFromState = %q, want @alice:example.com", got)
+	}
+}
+
+// firstPinCandidate is the strongest candidate pinCapableUsers offers, or "" when it offers
+// none. The production caller walks the whole list; these tests care about the head of it.
+func firstPinCandidate(pl *PowerLevelsContent, homeserver string, required int, creator string) string {
+	users := pinCapableUsers(pl, homeserver, required, creator)
+	if len(users) == 0 {
+		return ""
+	}
+	return users[0]
+}
+
+func TestPinCapableUsersKeepsTheCreatorAsALastResort(t *testing.T) {
+	// The bot outranks everyone on paper; the creator is the one who is still in the room.
+	pl := &PowerLevelsContent{Users: map[string]int{
+		"@bot:example.com":   100,
+		"@alice:example.com": 50,
+	}}
+	got := pinCapableUsers(pl, "example.com", 50, "@carol:example.com")
+	want := []string{"@bot:example.com", "@alice:example.com", "@carol:example.com"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("pinCapableUsers = %v, want %v", got, want)
+	}
+}
+
+func TestPinCapableUsersDoesNotRepeatACreatorAlreadyListed(t *testing.T) {
+	pl := &PowerLevelsContent{Users: map[string]int{"@alice:example.com": 100}}
+	got := pinCapableUsers(pl, "example.com", 50, "@alice:example.com")
+	if want := []string{"@alice:example.com"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("pinCapableUsers = %v, want %v", got, want)
+	}
+}
+
+func TestOnlyJoinedDropsCandidatesWhoHaveLeft(t *testing.T) {
+	// Power levels keep an entry for someone who has left, and the migration bot is usually
+	// the highest-powered name in a migrated room long after leave-rooms withdrew it.
+	joined := map[string]struct{}{"@alice:example.com": {}, "@carol:example.com": {}}
+	got := onlyJoined([]string{"@bot:example.com", "@alice:example.com", "@carol:example.com"}, joined)
+	if want := []string{"@alice:example.com", "@carol:example.com"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("onlyJoined = %v, want %v", got, want)
+	}
+}
+
+func TestJoinedFromStateReadsMembership(t *testing.T) {
+	state := []adminStateEvent{
+		{Type: EventTypeRoomMember, StateKey: "@alice:example.com", Content: []byte(`{"membership":"join"}`)},
+		{Type: EventTypeRoomMember, StateKey: "@bot:example.com", Content: []byte(`{"membership":"leave"}`)},
+		{Type: EventTypeRoomMember, StateKey: "@bob_dev:example.com", Content: []byte(`{"membership":"invite"}`)},
+	}
+	joined := joinedFromState(state)
+	if _, ok := joined["@alice:example.com"]; !ok {
+		t.Fatal("a joined member should be in the set")
+	}
+	if len(joined) != 1 {
+		t.Fatalf("joinedFromState = %v, want only alice", joined)
 	}
 }
