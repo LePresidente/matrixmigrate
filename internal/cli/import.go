@@ -332,6 +332,9 @@ func runImportMessages(cmd *cobra.Command, args []string) error {
 		result.FilesLinked, result.FilesUploaded, result.FilesSkipped, result.FilesTooLarge))
 	printInfo(fmt.Sprintf("  Reactions: imported=%d, skipped=%d, failed=%d, custom_emoji=%d",
 		result.ReactionsImported, result.ReactionsSkipped, result.ReactionsFailed, result.ReactionsCustomEmoji))
+	printInfo(fmt.Sprintf("  Pinned: rooms_updated=%d unchanged=%d events_added=%d skipped=%d failed=%d",
+		result.PinnedRoomsUpdated, result.PinnedRoomsUnchanged, result.PinnedEventsAdded,
+		result.PinsSkipped, result.PinsFailed))
 
 	if result.MappingFile != "" {
 		printSuccess(i18n.T("messages.mapping_saved", result.MappingFile))

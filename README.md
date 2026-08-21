@@ -194,6 +194,7 @@ Under `matrix.import` in `config.yaml` you can set:
 | **`public_room_join_rules`** | **`space_members`** | Who can join public (Mattermost) channels in Matrix. **`space_members`**: only members of the parent space/team can join (restricted join rule). **`public`**: anyone can join (default Matrix join rule). |
 | `import_direct_messages` | `false` | Export and import Mattermost **direct message** channels (D type) as Matrix DMs. Rooms appear under **People** for both users. See [Direct messages import](#direct-messages-import) below. |
 | `import_reactions` | `true` | Import emoji reactions as Matrix `m.reaction` annotations, after the messages they belong to. See [Reactions import](#reactions-import) below. |
+| `import_pinned_messages` | `true` | Pin in Matrix the posts that were pinned in Mattermost, once their messages have been imported. See [Pinned messages import](#pinned-messages-import) below. |
 | `space_visibility` | `invite_only` | Visibility of Matrix spaces created from Mattermost teams. **`invite_only`**: spaces are private (recommended; matches Mattermost team behaviour). **`public`**: spaces are publicly joinable. **`from_mattermost`**: derive per team from its type (`O` → public, `I` → invite-only). |
 | `fallback_room_creator` | — | Matrix username (**localpart only**, e.g. `admin` for `@admin:domain`) used as room creator when the Mattermost channel has an empty `creator_id`, or when the real creator is a locked/deactivated account. If the user does not exist, the admin account from `auth.username` is used instead. Only meaningful with `preserve_owner_and_alias: true`. |
 | `deleted_user_mode` | `deactivated` | How a Mattermost account with `delete_at > 0` is represented in Matrix. The account is created either way — the history needs it to attribute messages to — and its messages are never redacted. **`deactivated`**: Synapse's own account closure. No login, and the account is removed from every room, which is what Synapse does to any account being deactivated; the migration follows through by not adding deleted users to rooms during membership import and removing leftover memberships in `import leave-rooms`. **`locked`**: Synapse's reversible lock. No login, but room memberships are kept, so the account still appears in member lists as it did in Mattermost. Requires a Synapse new enough to accept `locked` on the admin user API. |
@@ -344,6 +345,30 @@ ID to point at. They are not a separate step.
 - **Re-runs are safe**: sent reactions are recorded in `message-mapping-<timestamp>.json` under
   `reactions`. Matrix does **not** deduplicate annotations server-side, so this record is the
   only thing preventing a second run from stacking a duplicate of every reaction.
+
+#### Pinned messages import
+
+Pins ride along with `import messages` as a third pass, after messages and reactions, because
+the Matrix state event names event IDs and every message it points at must already exist.
+
+- **Export**: `export messages` reads `posts.ispinned`. An installation without that column
+  (Mattermost before 3.6) exports normally, with every post unpinned. **An export taken with an
+  older version of this tool has no pin flags in it** — re-run `export messages` to pick them up.
+- **Model**: Mattermost pins per post; Matrix keeps one `m.room.pinned_events` state event per
+  room. A room is therefore one read and one write however many posts it has pinned.
+- **Order**: oldest pinned post first, by post creation time.
+- **Existing Matrix pins are kept.** The migrated list is merged into whatever the room already
+  has pinned, so a pin somebody made on the Matrix side survives the next run. Nothing is
+  written when the room already carries every migrated pin, which makes a re-run free.
+- **Requirements**: the admin needs power level 50 in the room, which it has in rooms it
+  created. With `preserve_owner_and_alias` the room belongs to a migrated user instead, and the
+  write falls back to the **Application Service** acting as a local member who has the power.
+  Without an AS token those rooms are reported as failed and the rest of the import continues.
+- **Not migrated**: who pinned a post (Mattermost does not record it), and unpinning — a post
+  unpinned in Mattermost after a run stays pinned in Matrix.
+- **Skipped pins** are counted by reason in the log: `message not imported` for a post that
+  never reached Matrix, `no room mapping` for a channel that was not migrated. Failures land in
+  the message error log under the `pin_error` category.
 
 ## Usage
 

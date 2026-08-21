@@ -1002,10 +1002,13 @@ func (m *Model) runImportMessages() tea.Cmd {
 		sendProgress("Importing messages...", 0, 0, "")
 
 		progress := func(current, total int, channelName, status string) {
-			// The reaction pass shares this callback but counts its own items.
+			// The reaction and pin passes share this callback but count their own items.
 			label := "Messages"
-			if channelName == matrix.ReactionProgressStage {
+			switch channelName {
+			case matrix.ReactionProgressStage:
 				label = "Reactions"
+			case matrix.PinProgressStage:
+				label = "Pinned messages"
 			}
 			sendProgress(fmt.Sprintf("%s: %s", label, status), current, total, channelName)
 		}
@@ -1015,10 +1018,11 @@ func (m *Model) runImportMessages() tea.Cmd {
 			return operationCompleteMsg{err: err}
 		}
 
-		msg := fmt.Sprintf("Messages imported: %d imported, %d skipped, %d failed, files linked=%d uploaded=%d skipped=%d too_large=%d, reactions imported=%d skipped=%d failed=%d",
+		msg := fmt.Sprintf("Messages imported: %d imported, %d skipped, %d failed, files linked=%d uploaded=%d skipped=%d too_large=%d, reactions imported=%d skipped=%d failed=%d, pinned rooms_updated=%d events_added=%d failed=%d",
 			result.MessagesImported, result.MessagesSkipped, result.MessagesFailed,
 			result.FilesLinked, result.FilesUploaded, result.FilesSkipped, result.FilesTooLarge,
-			result.ReactionsImported, result.ReactionsSkipped, result.ReactionsFailed)
+			result.ReactionsImported, result.ReactionsSkipped, result.ReactionsFailed,
+			result.PinnedRoomsUpdated, result.PinnedEventsAdded, result.PinsFailed)
 		return operationCompleteMsg{message: msg}
 	}
 }
