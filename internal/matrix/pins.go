@@ -27,7 +27,17 @@ type PinnedEventsContent struct {
 
 // GetPinnedEvents returns the room's current pinned event IDs. A room that has never had a
 // pin has no such state event, which is not an error: it returns an empty list.
+//
+// It joins the admin to the room first, the same guarantee setPinnedEvents makes before its
+// PUT: Synapse answers a GET from a user who is not in the room with 403 M_FORBIDDEN, not 404,
+// so without this the room would look pin-free and importPins would write back a list that
+// drops every pin made on the Matrix side. ensureAdminInRoom is cached per room, so this costs
+// nothing once the admin is already joined.
 func (c *Client) GetPinnedEvents(roomID string) ([]string, error) {
+	if err := c.ensureAdminInRoom(roomID); err != nil {
+		return nil, fmt.Errorf("admin join room: %w", err)
+	}
+
 	endpoint := fmt.Sprintf("/_matrix/client/v3/rooms/%s/state/%s",
 		url.PathEscape(roomID), EventTypePinnedEvents)
 

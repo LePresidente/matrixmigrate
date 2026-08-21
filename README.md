@@ -356,7 +356,9 @@ the Matrix state event names event IDs and every message it points at must alrea
   older version of this tool has no pin flags in it** — re-run `export messages` to pick them up.
 - **Model**: Mattermost pins per post; Matrix keeps one `m.room.pinned_events` state event per
   room. A room is therefore one read and one write however many posts it has pinned.
-- **Order**: oldest pinned post first, by post creation time.
+- **Order**: on a room's first pin write, oldest pinned post first, by post creation time
+  (post ID breaks a tie so a re-run is stable). On a later run, existing pins keep their
+  place and newly resolved pins — even an older post — are appended after them.
 - **Existing Matrix pins are kept.** The migrated list is merged into whatever the room already
   has pinned, so a pin somebody made on the Matrix side survives the next run. Nothing is
   written when the room already carries every migrated pin, which makes a re-run free.
