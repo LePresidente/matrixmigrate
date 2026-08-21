@@ -251,6 +251,11 @@ type Post struct {
 	Type      string `json:"type" db:"type"`           // "" for normal, "system_*" for system messages
 	Props     string `json:"props" db:"props"`         // JSON string with additional properties
 	FileIDs   string `json:"file_ids" db:"fileids"`    // JSON array of file IDs
+
+	// IsPinned mirrors posts.ispinned. Mattermost pins a post by flipping this flag; Matrix
+	// records the same thing as one m.room.pinned_events state event per room, so the import
+	// turns a per-post flag into per-room state.
+	IsPinned bool `json:"is_pinned" db:"ispinned"`
 }
 
 // Reaction represents a Mattermost emoji reaction on a post.
