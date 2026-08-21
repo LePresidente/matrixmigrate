@@ -1584,6 +1584,7 @@ func (o *Orchestrator) ImportMessages(progress matrix.MessageImportCallback) (*I
 		filesByPost,           // post ID -> files
 		fileConfig,            // file migration settings
 		reactionImport,        // reactions, or nil to skip them
+		nil,                   // pins: wired in a later task
 		progress,
 	)
 	if err != nil {

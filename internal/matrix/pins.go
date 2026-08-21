@@ -5,9 +5,11 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 
 	"github.com/aligundogdu/matrixmigrate/internal/logger"
+	"github.com/aligundogdu/matrixmigrate/internal/mattermost"
 )
 
 // EventTypePinnedEvents is the room state event holding a room's pinned message list.
@@ -207,4 +209,132 @@ func unionPinned(current, migrated []string) ([]string, bool) {
 	}
 
 	return merged, changed
+}
+
+// PinProgressStage is passed in the channel slot of MessageImportCallback while the pin pass
+// runs, so a front end can label the progress instead of reporting rooms as messages.
+const PinProgressStage = "pins"
+
+// PinImport turns the pin pass on; a nil value turns it off. It carries no data of its own —
+// the pin flag rides on the posts the importer was already handed — and exists so the call
+// site reads like the reaction one rather than taking a bare boolean.
+type PinImport struct{}
+
+// PinSkip records a pinned post that could not be carried across, and why.
+type PinSkip struct {
+	PostID string
+	Reason string
+}
+
+// pinnedByRoom turns the pinned posts of an export into the ordered event-ID list each room
+// should carry. Order is post creation time ascending, with the post ID breaking ties so a
+// re-run produces the same list and the room's state does not churn.
+//
+// A deleted post is not reported as a skip: it was never meant to reach Matrix.
+func pinnedByRoom(posts []mattermost.Post, eventByPost, roomByPost map[string]string) (map[string][]string, []PinSkip) {
+	pinned := make([]mattermost.Post, 0)
+	for _, p := range posts {
+		if p.IsPinned && !p.IsDeleted() {
+			pinned = append(pinned, p)
+		}
+	}
+	sort.SliceStable(pinned, func(a, b int) bool {
+		if pinned[a].CreateAt != pinned[b].CreateAt {
+			return pinned[a].CreateAt < pinned[b].CreateAt
+		}
+		return pinned[a].ID < pinned[b].ID
+	})
+
+	byRoom := make(map[string][]string)
+	var skips []PinSkip
+	for _, p := range pinned {
+		roomID := roomByPost[p.ID]
+		eventID := eventByPost[p.ID]
+		switch {
+		case roomID == "":
+			skips = append(skips, PinSkip{PostID: p.ID, Reason: "no room mapping"})
+		case eventID == "":
+			skips = append(skips, PinSkip{PostID: p.ID, Reason: "message not imported"})
+		default:
+			byRoom[roomID] = append(byRoom[roomID], eventID)
+		}
+	}
+	return byRoom, skips
+}
+
+// importPins writes each room's pinned message list, once the messages themselves have event
+// IDs. It runs after the reaction pass for the same reason that pass runs last: a pin can only
+// point at an event that already exists.
+//
+// A room is the unit of work here, not a post: Matrix holds the whole pin list in one state
+// event, so a room with forty pinned posts costs one read and one write.
+func (i *Importer) importPins(
+	result *ImportMessagesResult,
+	posts []mattermost.Post,
+	roomByPost map[string]string,
+	progress MessageImportCallback,
+) {
+	byRoom, skips := pinnedByRoom(posts, result.Mapping, roomByPost)
+
+	tally := &skipTally{}
+	for _, skip := range skips {
+		tally.add(skip.Reason)
+	}
+	result.Stats.PinsSkipped += len(skips)
+
+	rooms := make([]string, 0, len(byRoom))
+	for roomID := range byRoom {
+		rooms = append(rooms, roomID)
+	}
+	sort.Strings(rooms)
+
+	total := len(rooms)
+	logger.Info("Starting pinned message import: %d room(s) with pins, %d pinned post(s) unusable", total, len(skips))
+
+	for idx, roomID := range rooms {
+		current, err := i.client.GetPinnedEvents(roomID)
+		if err != nil {
+			result.Stats.PinsFailed++
+			result.Errors = append(result.Errors,
+				fmt.Sprintf("Failed to read pinned messages of room %s: %v", roomID, err))
+			if progress != nil {
+				progress(idx+1, total, PinProgressStage, "failed")
+			}
+			continue
+		}
+
+		merged, changed := unionPinned(current, byRoom[roomID])
+		if !changed {
+			result.Stats.PinnedRoomsUnchanged++
+			if progress != nil {
+				progress(idx+1, total, PinProgressStage, "skipped")
+			}
+			continue
+		}
+
+		if err := i.client.PinEvents(roomID, merged); err != nil {
+			result.Stats.PinsFailed++
+			result.Errors = append(result.Errors,
+				fmt.Sprintf("Failed to pin messages in room %s: %v", roomID, err))
+			if progress != nil {
+				progress(idx+1, total, PinProgressStage, "failed")
+			}
+			continue
+		}
+
+		result.Stats.PinnedRoomsUpdated++
+		if added := len(merged) - len(current); added > 0 {
+			result.Stats.PinnedEventsAdded += added
+		}
+		if progress != nil {
+			progress(idx+1, total, PinProgressStage, "imported")
+		}
+	}
+
+	logger.Info("Pinned message import completed: rooms_updated=%d, rooms_unchanged=%d, events_added=%d, skipped=%d, failed=%d",
+		result.Stats.PinnedRoomsUpdated, result.Stats.PinnedRoomsUnchanged,
+		result.Stats.PinnedEventsAdded, result.Stats.PinsSkipped, result.Stats.PinsFailed)
+	if summary := tally.String(); summary != "" {
+		logger.Info("Pinned posts skipped by reason: %s", summary)
+	}
 }

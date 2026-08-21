@@ -1784,6 +1784,12 @@ type MessageImportStats struct {
 	ReactionsSkipped     int `json:"reactions_skipped"`      // Already imported, or no reachable target
 	ReactionsFailed      int `json:"reactions_failed"`       // Send failed for an unexpected reason
 	ReactionsCustomEmoji int `json:"reactions_custom_emoji"` // Imported as literal :name: text
+
+	PinnedRoomsUpdated   int `json:"pinned_rooms_updated"`   // Rooms whose pin list was rewritten
+	PinnedRoomsUnchanged int `json:"pinned_rooms_unchanged"` // Already carried every migrated pin
+	PinnedEventsAdded    int `json:"pinned_events_added"`    // Pins added across all rooms
+	PinsSkipped          int `json:"pins_skipped"`           // Pinned posts with no room or no event
+	PinsFailed           int `json:"pins_failed"`            // Rooms whose pin state could not be written
 }
 
 // FileConfig holds file migration settings
@@ -2126,6 +2132,7 @@ func (i *Importer) ImportMessagesWithFiles(
 	filesByPost map[string][]mattermost.FileInfo,
 	fileConfig *FileConfig,
 	reactionImport *ReactionImport,
+	pinImport *PinImport,
 	progress MessageImportCallback,
 ) (*ImportMessagesResult, error) {
 	result := &ImportMessagesResult{
@@ -2320,6 +2327,12 @@ func (i *Importer) ImportMessagesWithFiles(
 	if reactionImport != nil && len(reactionImport.Reactions) > 0 {
 		i.importReactions(result, reactionImport.Reactions, roomByPost, userMapping,
 			reactionImport.AlreadyImported, progress)
+	}
+
+	// Pins come after reactions: the state event names event IDs, so every message it points
+	// at must already have been sent.
+	if pinImport != nil {
+		i.importPins(result, posts, roomByPost, progress)
 	}
 
 	logger.Info("Message import completed: imported=%d, skipped=%d, failed=%d, replies=%d, files_uploaded=%d, files_linked=%d",

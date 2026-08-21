@@ -3,6 +3,8 @@ package matrix
 import (
 	"reflect"
 	"testing"
+
+	"github.com/aligundogdu/matrixmigrate/internal/mattermost"
 )
 
 func TestUnionPinnedAppendsNewIDsAfterExistingOnes(t *testing.T) {
@@ -94,5 +96,62 @@ func TestPickPinCapableUserIsDeterministicOnTies(t *testing.T) {
 		if got := pickPinCapableUser(pl, "example.com", 50); got != "@alice:example.com" {
 			t.Fatalf("pickPinCapableUser = %q, want @alice:example.com on every call", got)
 		}
+	}
+}
+
+func TestPinnedByRoomOrdersByCreationTime(t *testing.T) {
+	posts := []mattermost.Post{
+		{ID: "p2", ChannelID: "c1", CreateAt: 200, IsPinned: true},
+		{ID: "p1", ChannelID: "c1", CreateAt: 100, IsPinned: true},
+		{ID: "p3", ChannelID: "c1", CreateAt: 300},
+	}
+	events := map[string]string{"p1": "$e1", "p2": "$e2", "p3": "$e3"}
+	rooms := map[string]string{"p1": "!room:example.com", "p2": "!room:example.com", "p3": "!room:example.com"}
+
+	byRoom, skips := pinnedByRoom(posts, events, rooms)
+	if len(skips) != 0 {
+		t.Fatalf("no post should be skipped, got %v", skips)
+	}
+	if want := []string{"$e1", "$e2"}; !reflect.DeepEqual(byRoom["!room:example.com"], want) {
+		t.Fatalf("pins = %v, want %v (oldest first, unpinned post excluded)", byRoom["!room:example.com"], want)
+	}
+}
+
+func TestPinnedByRoomBreaksTiesOnPostID(t *testing.T) {
+	posts := []mattermost.Post{
+		{ID: "pb", ChannelID: "c1", CreateAt: 100, IsPinned: true},
+		{ID: "pa", ChannelID: "c1", CreateAt: 100, IsPinned: true},
+	}
+	events := map[string]string{"pa": "$ea", "pb": "$eb"}
+	rooms := map[string]string{"pa": "!room:example.com", "pb": "!room:example.com"}
+
+	byRoom, _ := pinnedByRoom(posts, events, rooms)
+	if want := []string{"$ea", "$eb"}; !reflect.DeepEqual(byRoom["!room:example.com"], want) {
+		t.Fatalf("pins = %v, want %v (post ID breaks the tie)", byRoom["!room:example.com"], want)
+	}
+}
+
+func TestPinnedByRoomSkipsUnmappedPostsWithAReason(t *testing.T) {
+	posts := []mattermost.Post{
+		{ID: "p1", ChannelID: "c1", CreateAt: 100, IsPinned: true}, // never imported
+		{ID: "p2", ChannelID: "c2", CreateAt: 200, IsPinned: true}, // channel not migrated
+		{ID: "p3", ChannelID: "c1", CreateAt: 300, IsPinned: true, DeleteAt: 400},
+	}
+	events := map[string]string{"p2": "$e2", "p3": "$e3"}
+	rooms := map[string]string{"p1": "!room:example.com", "p3": "!room:example.com"}
+
+	byRoom, skips := pinnedByRoom(posts, events, rooms)
+	if len(byRoom) != 0 {
+		t.Fatalf("nothing should be pinnable, got %v", byRoom)
+	}
+	if len(skips) != 2 {
+		t.Fatalf("want 2 skips (deleted posts are not reported), got %v", skips)
+	}
+	reasons := map[string]string{skips[0].PostID: skips[0].Reason, skips[1].PostID: skips[1].Reason}
+	if reasons["p1"] != "message not imported" {
+		t.Fatalf("p1 reason = %q", reasons["p1"])
+	}
+	if reasons["p2"] != "no room mapping" {
+		t.Fatalf("p2 reason = %q", reasons["p2"])
 	}
 }
