@@ -43,6 +43,8 @@ func CategorizeMessageErrors(errs []string) map[string]int {
 			counts["send_error"]++
 		case strings.Contains(e, "Failed to send reaction"):
 			counts["reaction_error"]++
+		case strings.Contains(e, "Failed to pin messages"), strings.Contains(e, "Failed to read pinned messages"):
+			counts["pin_error"]++
 		case strings.Contains(e, "Parent post"):
 			counts["parent_missing"]++
 		default:

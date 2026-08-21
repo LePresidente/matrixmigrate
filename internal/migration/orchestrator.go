@@ -1380,6 +1380,12 @@ type ImportMessagesResult struct {
 	ReactionsFailed      int
 	ReactionsCustomEmoji int
 
+	PinnedRoomsUpdated   int
+	PinnedRoomsUnchanged int
+	PinnedEventsAdded    int
+	PinsSkipped          int
+	PinsFailed           int
+
 	MappingFile string
 }
 
@@ -1575,6 +1581,29 @@ func (o *Orchestrator) ImportMessages(progress matrix.MessageImportCallback) (*I
 		})
 	}
 
+	// Pins ride along with the message import too: the state event names event IDs, which only
+	// exist once the messages have been sent.
+	var pinImport *matrix.PinImport
+	switch {
+	case !o.config.Matrix.Import.ImportPinnedMessages:
+		logger.Info("Pinned message import disabled (matrix.import.import_pinned_messages: false)")
+	default:
+		pinnedPosts := 0
+		for idx := range messages.Posts {
+			if messages.Posts[idx].IsPinned {
+				pinnedPosts++
+			}
+		}
+		if pinnedPosts == 0 {
+			// An export taken before pins were supported has the flag false on every post, and
+			// looks exactly like an instance where nobody ever pinned anything. Say so.
+			logger.Info("No pinned posts in the message export - re-run 'export messages' if the instance has any")
+		} else {
+			pinImport = &matrix.PinImport{}
+			logger.Info("Pinned message import enabled: %d pinned post(s) in export", pinnedPosts)
+		}
+	}
+
 	// Import messages with files
 	result, err := importer.ImportMessagesWithFiles(
 		messages.Posts,
@@ -1584,7 +1613,7 @@ func (o *Orchestrator) ImportMessages(progress matrix.MessageImportCallback) (*I
 		filesByPost,           // post ID -> files
 		fileConfig,            // file migration settings
 		reactionImport,        // reactions, or nil to skip them
-		nil,                   // pins: wired in a later task
+		pinImport,             // pinned messages, or nil to skip them
 		progress,
 	)
 	if err != nil {
@@ -1601,8 +1630,8 @@ func (o *Orchestrator) ImportMessages(progress matrix.MessageImportCallback) (*I
 		} else {
 			c := CategorizeMessageErrors(result.Errors)
 			logger.Warn("Message import had %d errors; details written to %s", len(result.Errors), path)
-			logger.Warn("Message error categories: no_room=%d send_error=%d reply_error=%d reaction_error=%d parent_missing=%d other=%d",
-				c["no_room"], c["send_error"], c["reply_error"], c["reaction_error"], c["parent_missing"], c["other"])
+			logger.Warn("Message error categories: no_room=%d send_error=%d reply_error=%d reaction_error=%d pin_error=%d parent_missing=%d other=%d",
+				c["no_room"], c["send_error"], c["reply_error"], c["reaction_error"], c["pin_error"], c["parent_missing"], c["other"])
 		}
 	}
 
@@ -1661,6 +1690,12 @@ func (o *Orchestrator) ImportMessages(progress matrix.MessageImportCallback) (*I
 		ReactionsSkipped:     result.Stats.ReactionsSkipped,
 		ReactionsFailed:      result.Stats.ReactionsFailed,
 		ReactionsCustomEmoji: result.Stats.ReactionsCustomEmoji,
+
+		PinnedRoomsUpdated:   result.Stats.PinnedRoomsUpdated,
+		PinnedRoomsUnchanged: result.Stats.PinnedRoomsUnchanged,
+		PinnedEventsAdded:    result.Stats.PinnedEventsAdded,
+		PinsSkipped:          result.Stats.PinsSkipped,
+		PinsFailed:           result.Stats.PinsFailed,
 
 		MappingFile: mappingFile,
 	}, nil
