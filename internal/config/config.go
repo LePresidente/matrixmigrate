@@ -94,6 +94,11 @@ type ImportConfig struct {
 	// rate-limited API call, so a busy instance can spend a noticeable part of the message
 	// import on them; set false to trade the reactions for the time.
 	ImportReactions bool `mapstructure:"import_reactions"`
+	// ImportPinnedMessages: when true (the default), posts pinned in Mattermost are pinned in
+	// Matrix as well, by writing one m.room.pinned_events state event per room after the
+	// messages have been imported. Costs a couple of API calls per room with pins, not per
+	// message; set false to skip the pass entirely.
+	ImportPinnedMessages bool `mapstructure:"import_pinned_messages"`
 	// UserPassword: how passwords are assigned to newly created Matrix users.
 	UserPassword UserPasswordConfig `mapstructure:"user_password"`
 	// DeletedUserMode: how a Mattermost account with delete_at > 0 is represented in Matrix.
@@ -335,6 +340,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("matrix.import.public_room_join_rules", "space_members")
 	v.SetDefault("matrix.import.space_visibility", "invite_only")
 	v.SetDefault("matrix.import.import_reactions", true)
+	v.SetDefault("matrix.import.import_pinned_messages", true)
 	v.SetDefault("matrix.import.user_password.mode", UserPasswordModeAuto)
 	v.SetDefault("matrix.import.user_password.length", 24)
 	v.SetDefault("matrix.import.user_password.write_file", true)

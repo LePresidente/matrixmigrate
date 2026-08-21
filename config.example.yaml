@@ -171,6 +171,11 @@ matrix:
     # trade the reactions for a shorter message import. Custom Mattermost emoji have no Matrix
     # equivalent and arrive as literal ":name:" text.
     # import_reactions: true
+    # When true (the default), posts pinned in Mattermost are pinned in Matrix too: after the
+    # messages are imported, each room's pinned posts are written as one m.room.pinned_events
+    # state event. Existing Matrix pins are kept and the migrated ones appended, so a re-run
+    # never removes a pin somebody made on the Matrix side.
+    # import_pinned_messages: true
     # When true, users are added to rooms/spaces via Synapse admin API (joined directly, no invite to accept).
     # Use for migrations where users are already members. Default: false (invite; users must accept).
     # force_join: false
