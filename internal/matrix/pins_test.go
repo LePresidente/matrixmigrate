@@ -64,7 +64,7 @@ func TestPickPinCapableUserPicksTheStrongestLocalUser(t *testing.T) {
 		"@bob_dev:example.com": 100,
 		"@carol:example.com":   0,
 	}}
-	if got := pickPinCapableUser(pl, "example.com", 50); got != "@bob_dev:example.com" {
+	if got := pickPinCapableUser(pl, "example.com", 50, ""); got != "@bob_dev:example.com" {
 		t.Fatalf("pickPinCapableUser = %q, want @bob_dev:example.com", got)
 	}
 }
@@ -75,14 +75,14 @@ func TestPickPinCapableUserIgnoresRemoteUsers(t *testing.T) {
 		"@remote:other.example": 100,
 		"@alice:example.com":    50,
 	}}
-	if got := pickPinCapableUser(pl, "example.com", 50); got != "@alice:example.com" {
+	if got := pickPinCapableUser(pl, "example.com", 50, ""); got != "@alice:example.com" {
 		t.Fatalf("pickPinCapableUser = %q, want @alice:example.com", got)
 	}
 }
 
 func TestPickPinCapableUserReturnsEmptyWhenNobodyQualifies(t *testing.T) {
 	pl := &PowerLevelsContent{Users: map[string]int{"@alice:example.com": 25}}
-	if got := pickPinCapableUser(pl, "example.com", 50); got != "" {
+	if got := pickPinCapableUser(pl, "example.com", 50, ""); got != "" {
 		t.Fatalf("pickPinCapableUser = %q, want empty", got)
 	}
 }
@@ -93,7 +93,7 @@ func TestPickPinCapableUserIsDeterministicOnTies(t *testing.T) {
 		"@alice:example.com":   100,
 	}}
 	for i := 0; i < 20; i++ {
-		if got := pickPinCapableUser(pl, "example.com", 50); got != "@alice:example.com" {
+		if got := pickPinCapableUser(pl, "example.com", 50, ""); got != "@alice:example.com" {
 			t.Fatalf("pickPinCapableUser = %q, want @alice:example.com on every call", got)
 		}
 	}
@@ -153,5 +153,69 @@ func TestPinnedByRoomSkipsUnmappedPostsWithAReason(t *testing.T) {
 	}
 	if reasons["p2"] != "no room mapping" {
 		t.Fatalf("p2 reason = %q", reasons["p2"])
+	}
+}
+
+func TestPickPinCapableUserFallsBackToTheCreator(t *testing.T) {
+	// Room version 12 gives the creator implicit infinite power and forbids listing them in
+	// content.users, so a room that can be pinned in still shows an empty users map.
+	pl := &PowerLevelsContent{StateDefault: 50, Users: map[string]int{}}
+	if got := pickPinCapableUser(pl, "example.com", 50, "@alice:example.com"); got != "@alice:example.com" {
+		t.Fatalf("pickPinCapableUser = %q, want the creator @alice:example.com", got)
+	}
+}
+
+func TestPickPinCapableUserPrefersAnExplicitlyPoweredMemberOverTheCreator(t *testing.T) {
+	pl := &PowerLevelsContent{Users: map[string]int{"@bob_dev:example.com": 100}}
+	if got := pickPinCapableUser(pl, "example.com", 50, "@alice:example.com"); got != "@bob_dev:example.com" {
+		t.Fatalf("pickPinCapableUser = %q, want @bob_dev:example.com", got)
+	}
+}
+
+func TestPickPinCapableUserIgnoresARemoteCreator(t *testing.T) {
+	if got := pickPinCapableUser(&PowerLevelsContent{}, "example.com", 50, "@alice:other.example"); got != "" {
+		t.Fatalf("pickPinCapableUser = %q, want empty for a creator on another homeserver", got)
+	}
+}
+
+func TestPinnedFromStateReadsTheAdminAPIDump(t *testing.T) {
+	state := []adminStateEvent{
+		{Type: "m.room.create", Content: []byte(`{"room_version":"12"}`)},
+		{Type: EventTypePinnedEvents, Content: []byte(`{"pinned":["$a","$b"]}`)},
+	}
+	if want := []string{"$a", "$b"}; !reflect.DeepEqual(pinnedFromState(state), want) {
+		t.Fatalf("pinnedFromState = %v, want %v", pinnedFromState(state), want)
+	}
+}
+
+func TestPinnedFromStateReturnsNothingForAnUnpinnedRoom(t *testing.T) {
+	// No m.room.pinned_events means nobody has ever pinned here - an empty list, not a failure.
+	state := []adminStateEvent{{Type: "m.room.create", Content: []byte(`{"room_version":"12"}`)}}
+	if got := pinnedFromState(state); len(got) != 0 {
+		t.Fatalf("pinnedFromState = %v, want empty", got)
+	}
+}
+
+func TestPowerLevelsFromStateReadsTheAdminAPIDump(t *testing.T) {
+	state := []adminStateEvent{
+		{Type: EventTypePowerLevels, Content: []byte(`{"state_default":50,"users":{"@alice:example.com":100}}`)},
+	}
+	pl := powerLevelsFromState(state)
+	if pl == nil {
+		t.Fatal("powerLevelsFromState returned nil for a room that has power levels")
+	}
+	if pl.StateDefault != 50 || pl.Users["@alice:example.com"] != 100 {
+		t.Fatalf("powerLevelsFromState = %+v, want state_default 50 and alice at 100", pl)
+	}
+}
+
+func TestCreatorFromStateUsesTheCreateEventSender(t *testing.T) {
+	// From room version 12 the create event content carries no creator field, so the sender is
+	// the only place the creator is recorded.
+	state := []adminStateEvent{
+		{Type: EventTypeRoomCreate, Sender: "@alice:example.com", Content: []byte(`{"room_version":"12"}`)},
+	}
+	if got := creatorFromState(state); got != "@alice:example.com" {
+		t.Fatalf("creatorFromState = %q, want @alice:example.com", got)
 	}
 }

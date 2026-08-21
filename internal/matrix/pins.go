@@ -33,9 +33,16 @@ type PinnedEventsContent struct {
 // so without this the room would look pin-free and importPins would write back a list that
 // drops every pin made on the Matrix side. ensureAdminInRoom is cached per room, so this costs
 // nothing once the admin is already joined.
+//
+// The admin cannot always get in. `import leave-rooms` withdraws it from every migrated room
+// at the end of a run, and an invite-only room will not take it back, so on a replay most
+// rooms refuse both the join and the read. The Synapse admin API reads room state without
+// membership, and that is the fallback: refusing to read would make the room look pin-free,
+// which is the one answer that loses data.
 func (c *Client) GetPinnedEvents(roomID string) ([]string, error) {
 	if err := c.ensureAdminInRoom(roomID); err != nil {
-		return nil, fmt.Errorf("admin join room: %w", err)
+		logger.Debug("GetPinnedEvents: admin cannot join room=%s (%v); reading state through the admin API", roomID, err)
+		return c.pinnedEventsViaAdminAPI(roomID, err)
 	}
 
 	endpoint := fmt.Sprintf("/_matrix/client/v3/rooms/%s/state/%s",
@@ -47,6 +54,11 @@ func (c *Client) GetPinnedEvents(roomID string) ([]string, error) {
 	}
 	if statusCode == http.StatusNotFound {
 		return nil, nil
+	}
+	if statusCode == http.StatusForbidden {
+		cause := fmt.Errorf("API error (%d): %s", statusCode, strings.TrimSpace(string(body)))
+		logger.Debug("GetPinnedEvents: admin refused for room=%s; reading state through the admin API", roomID)
+		return c.pinnedEventsViaAdminAPI(roomID, cause)
 	}
 	if statusCode != http.StatusOK {
 		var resp GenericResponse
@@ -82,19 +94,131 @@ func (c *Client) PinEvents(roomID string, eventIDs []string) error {
 		return fmt.Errorf("admin lacks power to pin in %s and no Application Service token is configured: %w", roomID, err)
 	}
 
-	pl, plErr := c.getPowerLevels(roomID)
-	if plErr != nil {
-		return fmt.Errorf("admin lacks power to pin in %s and its power levels are unreadable (%v): %w", roomID, plErr, err)
+	pl, creator := c.pinAuthority(roomID)
+	if pl == nil {
+		return fmt.Errorf("admin lacks power to pin in %s and its power levels are unreadable: %w", roomID, err)
 	}
 
 	required := requiredPinPowerLevel(pl)
-	sender := pickPinCapableUser(pl, c.homeserver, required)
+	sender := pickPinCapableUser(pl, c.homeserver, required, creator)
 	if sender == "" {
 		return fmt.Errorf("admin lacks power to pin in %s and no local member has power level %d: %w", roomID, required, err)
 	}
 
 	logger.Debug("PinEvents: pinning in room=%s as %s (needs power %d)", roomID, sender, required)
 	return c.setPinnedEventsAsUser(roomID, eventIDs, sender)
+}
+
+// adminStateEvent is one entry of the Synapse admin API's room state dump.
+type adminStateEvent struct {
+	Type     string          `json:"type"`
+	StateKey string          `json:"state_key"`
+	Sender   string          `json:"sender"`
+	Content  json.RawMessage `json:"content"`
+}
+
+// adminRoomState reads a room's full state through the Synapse admin API, which does not
+// require the caller to be a member of the room.
+func (c *Client) adminRoomState(roomID string) ([]adminStateEvent, error) {
+	endpoint := "/_synapse/admin/v1/rooms/" + url.PathEscape(roomID) + "/state"
+	body, statusCode, err := c.doRequest("GET", endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	if statusCode != http.StatusOK {
+		var resp GenericResponse
+		json.Unmarshal(body, &resp)
+		return nil, fmt.Errorf("admin API error (%d): %s - %s", statusCode, resp.Errcode, resp.Error)
+	}
+
+	var parsed struct {
+		State []adminStateEvent `json:"state"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return nil, fmt.Errorf("failed to parse admin room state of %s: %w", roomID, err)
+	}
+	return parsed.State, nil
+}
+
+// pinnedEventsViaAdminAPI answers GetPinnedEvents from the admin API after the client read was
+// refused. cause is the refusal, carried into the error so a failure names both attempts.
+func (c *Client) pinnedEventsViaAdminAPI(roomID string, cause error) ([]string, error) {
+	state, err := c.adminRoomState(roomID)
+	if err != nil {
+		return nil, fmt.Errorf("admin cannot read room %s (%v) and the admin API refused too: %w", roomID, cause, err)
+	}
+	return pinnedFromState(state), nil
+}
+
+// pinAuthority reports what decides who may pin in a room: its power levels, and its creator,
+// who from room version 12 holds implicit power without appearing in content.users.
+//
+// Power levels are read as the admin where that works and from the admin API where it does
+// not, for the same reason GetPinnedEvents has that fallback: after `import leave-rooms` the
+// admin is not in the room and its own read comes back forbidden.
+func (c *Client) pinAuthority(roomID string) (*PowerLevelsContent, string) {
+	creator := c.lookupRoomInfo(roomID).creator
+
+	pl, err := c.getPowerLevels(roomID)
+	if err == nil {
+		return pl, creator
+	}
+	logger.Debug("pinAuthority: power levels of room=%s unreadable as admin (%v); trying the admin API", roomID, err)
+
+	state, stateErr := c.adminRoomState(roomID)
+	if stateErr != nil {
+		logger.Debug("pinAuthority: admin API refused room=%s too: %v", roomID, stateErr)
+		return nil, creator
+	}
+	if creator == "" {
+		creator = creatorFromState(state)
+	}
+	return powerLevelsFromState(state), creator
+}
+
+// pinnedFromState picks the pinned event IDs out of an admin API state dump. A room with no
+// m.room.pinned_events has never been pinned to, which is an empty list rather than an error.
+func pinnedFromState(state []adminStateEvent) []string {
+	for _, event := range state {
+		if event.Type != EventTypePinnedEvents || event.StateKey != "" {
+			continue
+		}
+		var content PinnedEventsContent
+		if json.Unmarshal(event.Content, &content) != nil {
+			return nil
+		}
+		return content.Pinned
+	}
+	return nil
+}
+
+// powerLevelsFromState picks the power levels out of an admin API state dump. A room without
+// them is not a room this code can reason about, so it returns nil and the caller reports the
+// room as failed rather than guessing.
+func powerLevelsFromState(state []adminStateEvent) *PowerLevelsContent {
+	for _, event := range state {
+		if event.Type != EventTypePowerLevels || event.StateKey != "" {
+			continue
+		}
+		var content PowerLevelsContent
+		if json.Unmarshal(event.Content, &content) != nil {
+			return nil
+		}
+		return &content
+	}
+	return nil
+}
+
+// creatorFromState reports who created the room, for the case where the admin API's room
+// summary did not say. From room version 12 the create event carries no creator field, so the
+// sender of that event is the answer in every version.
+func creatorFromState(state []adminStateEvent) string {
+	for _, event := range state {
+		if event.Type == EventTypeRoomCreate && event.StateKey == "" {
+			return event.Sender
+		}
+	}
+	return ""
 }
 
 // setPinnedEvents writes the pin list as the admin user.
@@ -166,22 +290,33 @@ func requiredPinPowerLevel(pl *PowerLevelsContent) int {
 // Only local users are considered: the Application Service can only act as users on its own
 // homeserver. Ties break on the user ID so a re-run picks the same sender and the room's state
 // does not churn between senders.
-func pickPinCapableUser(pl *PowerLevelsContent, homeserver string, required int) string {
-	if pl == nil {
-		return ""
-	}
+//
+// The creator is the last resort rather than the first choice. From room version 12 a creator
+// holds implicit infinite power and is forbidden from appearing in content.users, so such a
+// room can present an empty users map and still have exactly one member who may pin — but in
+// older rooms the creator is an ordinary entry, and an explicitly powered member is the more
+// faithful sender when one exists.
+func pickPinCapableUser(pl *PowerLevelsContent, homeserver string, required int, creator string) string {
 	suffix := ":" + homeserver
 
 	best, bestLevel := "", -1
-	for user, level := range pl.Users {
-		if level < required || !strings.HasSuffix(user, suffix) {
-			continue
-		}
-		if level > bestLevel || (level == bestLevel && user < best) {
-			best, bestLevel = user, level
+	if pl != nil {
+		for user, level := range pl.Users {
+			if level < required || !strings.HasSuffix(user, suffix) {
+				continue
+			}
+			if level > bestLevel || (level == bestLevel && user < best) {
+				best, bestLevel = user, level
+			}
 		}
 	}
-	return best
+	if best != "" {
+		return best
+	}
+	if creator != "" && strings.HasSuffix(creator, suffix) {
+		return creator
+	}
+	return ""
 }
 
 // unionPinned merges the migrated pin list into what the room already has pinned.

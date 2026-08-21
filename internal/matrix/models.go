@@ -204,6 +204,8 @@ const (
 	EventTypeRoomName    = "m.room.name"
 	EventTypeRoomTopic   = "m.room.topic"
 	EventTypeJoinRules   = "m.room.join_rules"
+	EventTypeRoomCreate  = "m.room.create"
+	EventTypePowerLevels = "m.room.power_levels"
 )
 
 
