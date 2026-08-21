@@ -65,14 +65,27 @@ Requires: appservice.enabled=true and MATRIX_AS_TOKEN env var`,
 var importLeaveRoomsCmd = &cobra.Command{
 	Use:     "leave-rooms",
 	Aliases: []string{"leave_rooms"},
-	Short:   "Leave all migrated rooms and spaces",
-	Long: `Make the migration admin user leave every room and space created during migration.
+	Short:   "Remove the migration's own accounts from all migrated rooms",
+	Long: `Take every account the migration put into rooms for its own convenience back out again.
 
-The import steps already leave rooms as they go, but a failed leave is only logged
-as a warning, which leaves the admin account inside private rooms and other users'
-direct messages. Run this after the migration to clear those leftovers.
+Three sweeps, in this order:
 
-Safe to re-run: a room the admin is not in counts as already left.`,
+  1. Deactivated users. Synapse removes an account from every room when it is
+     deactivated, so a deactivated account sitting in a member list is a leftover from
+     an earlier run. Only runs under deleted_user_mode: deactivated - under "locked"
+     those memberships are meant to stay.
+  2. The application service bot. It joins rooms only so it can post on behalf of
+     authors whose Mattermost account no longer exists.
+  3. The migration admin. The import steps already leave rooms as they go, but a failed
+     leave is only logged as a warning, which leaves the admin inside private rooms and
+     other users' direct messages.
+
+An account that holds power level 100 in a room is left in place: it is the room's owner,
+and a room with no administrator cannot be repaired without a server admin.
+
+Messages are unaffected. Matrix keeps events after their sender leaves the room.
+
+Safe to re-run: an account already out of a room counts as already removed.`,
 	RunE: runImportLeaveRooms,
 }
 
@@ -372,7 +385,11 @@ func runImportLeaveRooms(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	printInfo(fmt.Sprintf("  Rooms: left=%d, already-out=%d, failed=%d",
+	printInfo(fmt.Sprintf("  Deactivated users: checked=%d, removed=%d, kept-as-owner=%d, failed=%d",
+		result.DeactivatedAccounts, result.DeactivatedRoomsLeft, result.DeactivatedRoomsKept, result.DeactivatedRoomsFailed))
+	printInfo(fmt.Sprintf("  Migration bot: rooms-left=%d, kept-as-owner=%d, failed=%d",
+		result.BotRoomsLeft, result.BotRoomsKept, result.BotRoomsFailed))
+	printInfo(fmt.Sprintf("  Admin rooms: left=%d, already-out=%d, failed=%d",
 		result.RoomsLeft, result.RoomsLeaveSkip, result.RoomsLeaveFailed))
 	printSuccess(i18n.T("messages.step_completed", "leave_rooms"))
 

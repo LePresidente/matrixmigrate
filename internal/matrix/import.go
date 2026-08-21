@@ -83,7 +83,20 @@ type Importer struct {
 	// fallbackSenderRooms remembers rooms the AS bot has been joined to, so a channel full
 	// of posts by deleted accounts costs one join rather than one per post.
 	fallbackSenderRooms map[string]struct{}
+
+	// deletedUserMode decides what a Mattermost account with delete_at > 0 becomes in Matrix:
+	// DeletedUserModeDeactivated (the default) or DeletedUserModeLocked. It also decides
+	// whether those accounts are given room memberships at all - see ApplyChannelMemberships.
+	deletedUserMode string
 }
+
+// Modes for Importer.deletedUserMode. They mirror the matrix.import.deleted_user_mode config
+// values; the config package owns the user-facing names, these are the package-local copies
+// so internal/matrix does not have to import internal/config.
+const (
+	DeletedUserModeDeactivated = "deactivated"
+	DeletedUserModeLocked      = "locked"
+)
 
 // HistoryJoins returns the memberships this import created solely to replay history.
 func (i *Importer) HistoryJoins() []HistoryMembership {
@@ -92,7 +105,23 @@ func (i *Importer) HistoryJoins() []HistoryMembership {
 
 // NewImporter creates a new importer
 func NewImporter(client *Client) *Importer {
-	return &Importer{client: client, passwordPolicy: DefaultPasswordPolicy()}
+	return &Importer{client: client, passwordPolicy: DefaultPasswordPolicy(), deletedUserMode: DeletedUserModeDeactivated}
+}
+
+// SetDeletedUserMode controls how Mattermost accounts with delete_at > 0 are represented.
+// Anything other than DeletedUserModeLocked means DeletedUserModeDeactivated.
+func (i *Importer) SetDeletedUserMode(mode string) {
+	if mode == DeletedUserModeLocked {
+		i.deletedUserMode = DeletedUserModeLocked
+		return
+	}
+	i.deletedUserMode = DeletedUserModeDeactivated
+}
+
+// locksDeletedUsers reports whether deleted accounts are locked rather than deactivated.
+// Locked accounts keep their room memberships; deactivated ones must not have any.
+func (i *Importer) locksDeletedUsers() bool {
+	return i.deletedUserMode == DeletedUserModeLocked
 }
 
 // SetPasswordPolicy controls how passwords are assigned to newly created users.
@@ -315,8 +344,12 @@ func (i *Importer) ImportUsers(users []mattermost.User, existingMapping map[stri
 			progress("users", idx+1, total, user.Username)
 		}
 
-		// Deleted/locked users are imported as deactivated so they exist for channel history and show as locked in synapse-admin
-		deactivated := user.IsDeleted()
+		// Deleted Mattermost accounts are still created in Matrix - the history needs them to
+		// attribute messages to - but they are closed off. How depends on deleted_user_mode:
+		// deactivated (Synapse's own account closure, which also parts every room) or locked
+		// (login refused, memberships kept).
+		lockDeleted := user.IsDeleted() && i.locksDeletedUsers()
+		deactivated := user.IsDeleted() && !lockDeleted
 
 		// Synapse reserves all-numeric localparts for guest accounts.
 		if isNumericOnlyUsername(user.Username) {
@@ -364,12 +397,19 @@ func (i *Importer) ImportUsers(users []mattermost.User, existingMapping map[stri
 			// User already exists, add to mapping
 			mxID := i.client.FormatUserID(user.Username)
 			mapping[user.ID] = mxID
-			// Keep them deactivated if they are deleted/locked in Mattermost
+			// Close the account off if it is deleted in Mattermost
 			if deactivated {
 				if err := i.client.SetUserDeactivated(mxID, true); err != nil {
 					logger.Warn("Failed to set existing user '%s' as deactivated: %v", user.Username, err)
 				} else {
-					logger.Info("User '%s' already exists; set deactivated (locked) to match Mattermost", user.Username)
+					logger.Info("User '%s' already exists; set deactivated to match Mattermost", user.Username)
+				}
+			}
+			if lockDeleted {
+				if err := i.client.SetUserLocked(mxID, true); err != nil {
+					logger.Warn("Failed to lock existing user '%s': %v", user.Username, err)
+				} else {
+					logger.Info("User '%s' already exists; set locked to match Mattermost", user.Username)
 				}
 			}
 			// Anyone who signed in through SSO before the migration lands here, and would
@@ -406,7 +446,10 @@ func (i *Importer) ImportUsers(users []mattermost.User, existingMapping map[stri
 			Deactivated: deactivated,
 		}
 		if deactivated {
-			logger.Info("User '%s' is deleted/locked in Mattermost; creating in Matrix as deactivated (locked)", user.Username)
+			logger.Info("User '%s' is deleted in Mattermost; creating in Matrix as deactivated (Synapse will part it from every room)", user.Username)
+		}
+		if lockDeleted {
+			logger.Info("User '%s' is deleted in Mattermost; creating in Matrix and locking it (room memberships are kept)", user.Username)
 		}
 
 		resp, err := i.client.CreateUser(user.Username, req)
@@ -424,6 +467,15 @@ func (i *Importer) ImportUsers(users []mattermost.User, existingMapping map[stri
 			continue
 		}
 		logger.Success("Created user '%s' -> %s", user.Username, resp.UserID)
+
+		// Locking is a second call rather than a field on CreateUserRequest: a Synapse too old
+		// to know "locked" would reject the whole creation, and an account that exists but is
+		// not locked is far better than no account at all for the history.
+		if lockDeleted {
+			if err := i.client.SetUserLocked(resp.UserID, true); err != nil {
+				logger.Warn("Created '%s' but could not lock it: %v", user.Username, err)
+			}
+		}
 
 		if password != "" {
 			i.generatedCredentials = append(i.generatedCredentials, UserCredential{
@@ -759,6 +811,7 @@ func (i *Importer) ImportChannelsAsRooms(channels []mattermost.Channel, existing
 // ApplyTeamMemberships invites users to spaces based on team memberships
 func (i *Importer) ApplyTeamMemberships(
 	memberships []mattermost.TeamMember,
+	users []mattermost.User,
 	userMapping map[string]string,
 	spaceMapping map[string]string,
 	defaultSpaceOwnerID string,
@@ -768,6 +821,13 @@ func (i *Importer) ApplyTeamMemberships(
 	total := len(memberships)
 	ensuredSpacesForForceJoin := make(map[string]struct{})
 	unjoinableSpaces := make(map[string]struct{})
+
+	// Deleted accounts under the deactivated mode must end up in no space at all - see
+	// deletedUsersExcluded. A deleted TeamMember row is a different thing and is skipped
+	// below regardless of mode.
+	deletedUserByID := deletedUserIDs(users)
+	excludeDeleted := i.deletedUsersExcluded()
+	deletedSkipped := 0
 
 	logger.Info("Starting team membership import: %d memberships to process", total)
 
@@ -779,6 +839,14 @@ func (i *Importer) ApplyTeamMemberships(
 		// Skip deleted memberships
 		if membership.IsDeleted() {
 			logger.Info("Team membership %d/%d: deleted, skipping", idx+1, total)
+			stats.MembersSkipped++
+			continue
+		}
+
+		// Skip members whose account is deleted. Adding them would put a deactivated account
+		// back into a space Synapse had already removed it from.
+		if excludeDeleted && deletedUserByID[membership.UserID] {
+			deletedSkipped++
 			stats.MembersSkipped++
 			continue
 		}
@@ -845,12 +913,43 @@ func (i *Importer) ApplyTeamMemberships(
 
 	logger.Info("Team membership import completed: added=%d, skipped=%d, failed=%d",
 		stats.MembersAdded, stats.MembersSkipped, stats.MembersFailed)
+	if deletedSkipped > 0 {
+		logger.Info("Team membership import: %d membership(s) skipped because the account is deleted in Mattermost and deleted_user_mode is %q", deletedSkipped, DeletedUserModeDeactivated)
+	}
 
 	spacesToLeave := make([]string, 0, len(ensuredSpacesForForceJoin))
 	for spaceID := range ensuredSpacesForForceJoin {
 		spacesToLeave = append(spacesToLeave, spaceID)
 	}
 	return stats, spacesToLeave, nil
+}
+
+// deletedUserIDs indexes which Mattermost user IDs belong to deleted accounts.
+func deletedUserIDs(users []mattermost.User) map[string]bool {
+	deleted := make(map[string]bool, len(users))
+	for idx := range users {
+		if users[idx].IsDeleted() {
+			deleted[users[idx].ID] = true
+		}
+	}
+	return deleted
+}
+
+// deletedUsersExcluded reports whether deleted Mattermost accounts should be left out of room
+// and space memberships entirely.
+//
+// Under DeletedUserModeDeactivated they must be: Synapse parts a deactivated account from
+// every room as part of deactivating it, so adding them back produces a state the homeserver
+// would never reach on its own - an account that cannot log in, sitting in the member list of
+// rooms it was already removed from. Under DeletedUserModeLocked the opposite is wanted, since
+// the point of locking is that the membership survives.
+//
+// Their messages are unaffected either way. Matrix keeps events after their sender leaves, and
+// message import re-joins an absent author for exactly as long as it takes to replay their
+// posts before withdrawing it again - see sendWithMembershipRecovery and
+// LeaveHistoryMemberships.
+func (i *Importer) deletedUsersExcluded() bool {
+	return !i.locksDeletedUsers()
 }
 
 // ApplyChannelMemberships invites users to rooms based on channel memberships.
@@ -886,6 +985,12 @@ func (i *Importer) ApplyChannelMemberships(
 	unmapped := make(map[string]*unmappedChannel)
 	unmappedTotal := 0
 
+	// Deleted accounts under the deactivated mode must end up in no room at all - see
+	// deletedUsersExcluded.
+	deletedUserByID := deletedUserIDs(users)
+	excludeDeleted := i.deletedUsersExcluded()
+	deletedSkipped := 0
+
 	channelByID := make(map[string]mattermost.Channel)
 	groupChannelIDs := make(map[string]bool)
 	directChannelIDs := make(map[string]bool)
@@ -906,6 +1011,10 @@ func (i *Importer) ApplyChannelMemberships(
 		for _, membership := range memberships {
 			mappedUserID, ok := userMapping[membership.UserID]
 			if !ok || mappedUserID == "" {
+				continue
+			}
+			// A deactivated account cannot act, so it is no use as an inviter.
+			if excludeDeleted && deletedUserByID[membership.UserID] {
 				continue
 			}
 			seen, ok := seenByChannel[membership.ChannelID]
@@ -962,6 +1071,13 @@ func (i *Importer) ApplyChannelMemberships(
 		}
 
 		if directChannelIDs[membership.ChannelID] {
+			bump(skippedByType, channelType)
+			stats.MembersSkipped++
+			continue
+		}
+
+		if excludeDeleted && deletedUserByID[membership.UserID] {
+			deletedSkipped++
 			bump(skippedByType, channelType)
 			stats.MembersSkipped++
 			continue
@@ -1204,6 +1320,9 @@ func (i *Importer) ApplyChannelMemberships(
 	logger.Info("ApplyChannelMemberships: admin cleanup completed: left_channels=%d leave_failures=%d attempted=%d",
 		leftChannels, failedLeaveChannels, len(roomsToLeaveAfter))
 
+	if deletedSkipped > 0 {
+		logger.Info("Channel membership import: %d membership(s) skipped because the account is deleted in Mattermost and deleted_user_mode is %q", deletedSkipped, DeletedUserModeDeactivated)
+	}
 	logger.Info("Channel membership import completed: added=%d, skipped=%d, failed=%d",
 		stats.MembersAdded, stats.MembersSkipped, stats.MembersFailed)
 	logger.Info("Channel membership type summary: failed(O=%d,P=%d,G=%d,D=%d,?=%d) skipped(O=%d,P=%d,G=%d,D=%d,?=%d)",

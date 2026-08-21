@@ -196,6 +196,7 @@ Under `matrix.import` in `config.yaml` you can set:
 | `import_reactions` | `true` | Import emoji reactions as Matrix `m.reaction` annotations, after the messages they belong to. See [Reactions import](#reactions-import) below. |
 | `space_visibility` | `invite_only` | Visibility of Matrix spaces created from Mattermost teams. **`invite_only`**: spaces are private (recommended; matches Mattermost team behaviour). **`public`**: spaces are publicly joinable. **`from_mattermost`**: derive per team from its type (`O` → public, `I` → invite-only). |
 | `fallback_room_creator` | — | Matrix username (**localpart only**, e.g. `admin` for `@admin:domain`) used as room creator when the Mattermost channel has an empty `creator_id`, or when the real creator is a locked/deactivated account. If the user does not exist, the admin account from `auth.username` is used instead. Only meaningful with `preserve_owner_and_alias: true`. |
+| `deleted_user_mode` | `deactivated` | How a Mattermost account with `delete_at > 0` is represented in Matrix. The account is created either way — the history needs it to attribute messages to — and its messages are never redacted. **`deactivated`**: Synapse's own account closure. No login, and the account is removed from every room, which is what Synapse does to any account being deactivated; the migration follows through by not adding deleted users to rooms during membership import and removing leftover memberships in `import leave-rooms`. **`locked`**: Synapse's reversible lock. No login, but room memberships are kept, so the account still appears in member lists as it did in Mattermost. Requires a Synapse new enough to accept `locked` on the admin user API. |
 | `user_password.mode` | `auto` | How imported users get a password. **`auto`**: no password when `matrix.mas.enabled` is true (accounts are SSO-only), a random password otherwise. **`random`**: always generate a distinct random password per user. **`local_only`**: generate one only for users whose Mattermost account had no SSO provider (`auth_service` empty) — see [Mixed workspaces](#mixed-workspaces-mode-local_only). **`none`**: never set a password. |
 | `user_password.length` | `24` | Length of generated passwords. Valid range 12–128. |
 | `user_password.write_file` | `true` | Write generated passwords to `<assets_dir>/user-passwords-<timestamp>.csv` (mode `0600`) so they can be distributed. Set `false` to discard them. |
@@ -367,7 +368,7 @@ ID to point at. They are not a separate step.
 ./matrixmigrate export messages
 ./matrixmigrate import messages
 
-# Cleanup: admin leaves every migrated room and space
+# Cleanup: remove deactivated users, the migration bot and the admin from all rooms
 ./matrixmigrate import leave-rooms
 
 # Run with specific config
@@ -440,23 +441,40 @@ The connection test provides detailed step-by-step diagnostics:
 | 2b | `import memberships` | Apply memberships in Matrix |
 | 3a | `export messages` | Export all messages from Mattermost |
 | 3b | `import messages` | Import messages to Matrix rooms (requires Application Service for timestamps) |
-| 4 | `import leave-rooms` | Optional cleanup: make the migration admin leave every migrated room and space |
+| 4 | `import leave-rooms` | Cleanup: remove deactivated accounts, the Application Service bot and the migration admin from all migrated rooms |
 
-### Leaving migrated rooms
+### Cleaning up room memberships
 
-The import steps already have the admin leave rooms as they go, but a failed leave is only
-logged as a warning. With `force_join` and `import_direct_messages` enabled the admin enters
-a great many rooms, so a few leftovers are normal — and each one means the migration admin
-sits in a private room or someone else's direct message indefinitely.
+A migration puts three kinds of account into rooms that should not stay there. `import
+leave-rooms` takes all three back out, in this order:
+
+1. **Deactivated users.** Synapse removes an account from every room as part of deactivating
+   it, so a deactivated account sitting in a member list is a leftover — and re-deactivating
+   it will not clear it, because Synapse only parts rooms on the transition. Only runs under
+   `deleted_user_mode: deactivated`; under `locked` those memberships are meant to stay.
+2. **The Application Service bot.** It joins rooms only so it can post on behalf of authors
+   whose Mattermost account no longer exists.
+3. **The migration admin.** The import steps already have it leave rooms as they go, but a
+   failed leave is only logged as a warning. With `force_join` and `import_direct_messages`
+   enabled the admin enters a great many rooms, so a few leftovers are normal — and each one
+   means the migration admin sits in a private room or someone else's direct message
+   indefinitely.
 
 ```bash
 ./matrixmigrate import leave-rooms
 ```
 
-It walks every room and space in the asset mapping, so it needs `import_assets` to have
-completed but has no other dependency, and it is safe to repeat: a room the admin is not in
-counts as already left rather than as a failure. Run it once at the end of a migration and
-check the summary line for a non-zero failure count.
+An account holding power level 100 in a room is left in place: it is the room's owner, and a
+room with no administrator cannot be repaired without a server admin. Those are reported as
+`kept-as-owner` rather than as failures.
+
+Messages are unaffected. Matrix keeps events after their sender leaves the room, so removing
+somebody from a room does not remove anything they wrote in it.
+
+The step needs `import_assets` to have completed but has no other dependency, and it is safe
+to repeat: an account already out of a room counts as already removed rather than as a
+failure. Run it once at the end of a migration and check the summary lines for a non-zero
+failure count.
 
 ## Architecture
 

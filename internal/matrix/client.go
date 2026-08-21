@@ -526,6 +526,86 @@ func (c *Client) SetUserDeactivated(userID string, deactivated bool) error {
 	return nil
 }
 
+// SetUserLocked sets or clears Synapse's lock flag on a user.
+//
+// Locking is the reversible half of SetUserDeactivated: the account is refused login and API
+// access with M_USER_LOCKED, but it keeps its devices and, crucially here, its room
+// memberships. Deactivation instead parts the account from every room it is in.
+//
+// The flag is only understood by a Synapse new enough to accept "locked" on the admin user
+// API; an older server answers 400 and the account is left as it was.
+func (c *Client) SetUserLocked(userID string, locked bool) error {
+	endpoint := fmt.Sprintf("/_synapse/admin/v2/users/%s", url.PathEscape(userID))
+	body := map[string]interface{}{"locked": locked}
+	respBody, statusCode, err := c.doRequest("PUT", endpoint, body)
+	if err != nil {
+		return err
+	}
+	if statusCode != http.StatusOK && statusCode != http.StatusCreated {
+		var resp GenericResponse
+		json.Unmarshal(respBody, &resp)
+		if statusCode == http.StatusBadRequest {
+			return fmt.Errorf("SetUserLocked returned status %d (%s): this Synapse may be too old to support locking - use matrix.import.deleted_user_mode: deactivated", statusCode, resp.Error)
+		}
+		return fmt.Errorf("SetUserLocked returned status %d: %s", statusCode, resp.Error)
+	}
+	logger.Info("SetUserLocked: %s -> %v", userID, locked)
+	return nil
+}
+
+// AdminUserJoinedRooms lists every room userID is joined to, through the Synapse admin API.
+//
+// joinedRoomIDs asks the same question as the user, through the application service, which
+// a deactivated account cannot answer - and deactivated accounts are exactly the ones whose
+// leftover memberships need finding. The admin route needs no cooperation from the account.
+func (c *Client) AdminUserJoinedRooms(userID string) ([]string, error) {
+	endpoint := fmt.Sprintf("/_synapse/admin/v1/users/%s/joined_rooms", url.PathEscape(userID))
+	body, statusCode, err := c.doRequest("GET", endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	var resp struct {
+		JoinedRooms []string `json:"joined_rooms"`
+		Errcode     string   `json:"errcode"`
+		Error       string   `json:"error"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("failed to parse response: %w", err)
+	}
+	if statusCode != http.StatusOK {
+		return nil, fmt.Errorf("API error (%d): %s - %s", statusCode, resp.Errcode, resp.Error)
+	}
+	return resp.JoinedRooms, nil
+}
+
+// KickUserFromRoom removes userID from roomID using the admin's own token.
+//
+// LeaveRoomAsUser is the gentler form and is preferred where it works, but it acts *as* the
+// account, which a deactivated one cannot do. A kick is performed by the admin instead, so it
+// only needs the admin to be in the room with enough power - see ensureAdminCanActIn.
+func (c *Client) KickUserFromRoom(roomID, userID, reason string) error {
+	logger.Debug("KickUserFromRoom: room=%s user=%s", roomID, userID)
+	endpoint := fmt.Sprintf("/_matrix/client/v3/rooms/%s/kick", url.PathEscape(roomID))
+	req := map[string]string{"user_id": userID}
+	if reason != "" {
+		req["reason"] = reason
+	}
+	body, statusCode, err := c.doRequest("POST", endpoint, req)
+	if err != nil {
+		return err
+	}
+	if statusCode != http.StatusOK {
+		var resp GenericResponse
+		json.Unmarshal(body, &resp)
+		// Already gone is the desired end state, not a failure.
+		if statusCode == http.StatusForbidden && strings.Contains(resp.Error, "not in room") {
+			return nil
+		}
+		return fmt.Errorf("API error (%d): %s - %s", statusCode, resp.Errcode, resp.Error)
+	}
+	return nil
+}
+
 // updateUserProfile sets display name and email (threepids) on Synapse for a user.
 // Used after MAS user creation so the profile is stored on the homeserver.
 func (c *Client) updateUserProfile(userID, displayName, email string) error {

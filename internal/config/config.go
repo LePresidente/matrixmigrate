@@ -96,7 +96,25 @@ type ImportConfig struct {
 	ImportReactions bool `mapstructure:"import_reactions"`
 	// UserPassword: how passwords are assigned to newly created Matrix users.
 	UserPassword UserPasswordConfig `mapstructure:"user_password"`
+	// DeletedUserMode: how a Mattermost account with delete_at > 0 is represented in Matrix.
+	// "deactivated" (default) or "locked". See the DeletedUserMode* constants.
+	DeletedUserMode string `mapstructure:"deleted_user_mode"`
 }
+
+// Modes for ImportConfig.DeletedUserMode.
+const (
+	// DeletedUserModeDeactivated deactivates the Matrix account, which is what Synapse does
+	// to any account being closed: it cannot log in, and it is removed from every room. The
+	// migration follows that through - deleted users are not added to rooms during membership
+	// import, and any membership they already have is withdrawn by the leave-rooms step.
+	// Their messages stay in the history either way; deactivation is not redaction.
+	DeletedUserModeDeactivated = "deactivated"
+	// DeletedUserModeLocked uses Synapse's reversible lock instead. The account cannot log in
+	// but keeps its room memberships, so it still appears in member lists and the room reads
+	// as it did in Mattermost. Requires a Synapse new enough to accept "locked" on the admin
+	// user API; older servers reject it and the account is left unlocked.
+	DeletedUserModeLocked = "locked"
+)
 
 // User password modes for ImportConfig.UserPassword.Mode
 const (
@@ -320,6 +338,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("matrix.import.user_password.mode", UserPasswordModeAuto)
 	v.SetDefault("matrix.import.user_password.length", 24)
 	v.SetDefault("matrix.import.user_password.write_file", true)
+	v.SetDefault("matrix.import.deleted_user_mode", DeletedUserModeDeactivated)
 	v.SetDefault("data.assets_dir", "./data/assets")
 	v.SetDefault("data.mappings_dir", "./data/mappings")
 	v.SetDefault("data.state_file", "./data/state.json")
@@ -460,6 +479,14 @@ func (c *Config) Validate() error {
 	if l := c.Matrix.Import.UserPassword.Length; l != 0 && (l < 12 || l > 128) {
 		return fmt.Errorf("matrix.import.user_password.length must be between 12 and 128, got %d", l)
 	}
+	// Validate deleted_user_mode
+	switch c.Matrix.Import.DeletedUserMode {
+	case "", DeletedUserModeDeactivated, DeletedUserModeLocked:
+		// valid
+	default:
+		return fmt.Errorf("matrix.import.deleted_user_mode must be %q or %q, got %q",
+			DeletedUserModeDeactivated, DeletedUserModeLocked, c.Matrix.Import.DeletedUserMode)
+	}
 
 	// Validate file attachment config. Without this the run gets all the way to message
 	// import before failing once per file, having already created users, rooms and
@@ -575,6 +602,15 @@ func (c *Config) GetUserPasswordMode() string {
 		}
 		return UserPasswordModeRandom
 	}
+}
+
+// GetDeletedUserMode returns how deleted Mattermost accounts are represented in Matrix:
+// DeletedUserModeDeactivated (the default) or DeletedUserModeLocked.
+func (c *Config) GetDeletedUserMode() string {
+	if c.Matrix.Import.DeletedUserMode == DeletedUserModeLocked {
+		return DeletedUserModeLocked
+	}
+	return DeletedUserModeDeactivated
 }
 
 // GetUserPasswordLength returns the configured generated-password length, or 24 when unset.
