@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 
+	"github.com/aligundogdu/matrixmigrate/internal/logger"
 	_ "github.com/lib/pq"
 )
 
@@ -278,17 +279,76 @@ func (c *Client) GetChannelCount() (int, error) {
 	return count, err
 }
 
-// GetPosts retrieves all posts from the database (excluding deleted and system messages)
-func (c *Client) GetPosts() ([]Post, error) {
-	query := `
-		SELECT 
-			id, createat, updateat, deleteat, userid, channelid,
+// postsSchema describes the optional columns of the posts table on this server.
+//
+// ispinned only exists from Mattermost 3.6 onwards. Probing beats a blind SELECT, which would
+// fail the whole message export on an older installation.
+type postsSchema struct {
+	hasIsPinned bool
+}
+
+// postColumns returns the SELECT list for a post row, in the order Scan expects. Both variants
+// end in an ispinned expression so the scan target list never changes.
+func postColumns(hasIsPinned bool) string {
+	pinned := "false AS ispinned"
+	if hasIsPinned {
+		pinned = "COALESCE(ispinned, false) AS ispinned"
+	}
+	return `id, createat, updateat, deleteat, userid, channelid,
 			COALESCE(rootid, '') as rootid,
 			COALESCE(originalid, '') as originalid,
 			COALESCE(message, '') as message,
 			COALESCE(type, '') as type,
 			COALESCE(props, '{}') as props,
-			COALESCE(fileids, '[]') as fileids
+			COALESCE(fileids, '[]') as fileids,
+			` + pinned
+}
+
+// inspectPosts reports which optional columns the posts table offers.
+//
+// The schema filter matters: without it a same-named table in another schema would be mistaken
+// for this one, and the query could then reference a column the table on the search path lacks.
+func (c *Client) inspectPosts() (postsSchema, error) {
+	var schema postsSchema
+
+	rows, err := c.db.Query(`
+		SELECT column_name FROM information_schema.columns
+		WHERE table_schema = current_schema() AND table_name = 'posts'
+	`)
+	if err != nil {
+		return schema, fmt.Errorf("failed to inspect posts table: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var column string
+		if err := rows.Scan(&column); err != nil {
+			return schema, fmt.Errorf("failed to scan posts column name: %w", err)
+		}
+		if column == "ispinned" {
+			schema.hasIsPinned = true
+		}
+	}
+
+	if err := rows.Err(); err != nil {
+		return schema, fmt.Errorf("error iterating posts columns: %w", err)
+	}
+
+	return schema, nil
+}
+
+// GetPosts retrieves all posts from the database (excluding deleted and system messages)
+func (c *Client) GetPosts() ([]Post, error) {
+	schema, err := c.inspectPosts()
+	if err != nil {
+		return nil, err
+	}
+	if !schema.hasIsPinned {
+		logger.Info("posts table has no ispinned column; every post exports as unpinned")
+	}
+
+	query := `
+		SELECT ` + postColumns(schema.hasIsPinned) + `
 		FROM posts
 		WHERE deleteat = 0
 		AND (type = '' OR type IS NULL)
@@ -307,7 +367,7 @@ func (c *Client) GetPosts() ([]Post, error) {
 		err := rows.Scan(
 			&p.ID, &p.CreateAt, &p.UpdateAt, &p.DeleteAt,
 			&p.UserID, &p.ChannelID, &p.RootID, &p.OriginalID,
-			&p.Message, &p.Type, &p.Props, &p.FileIDs,
+			&p.Message, &p.Type, &p.Props, &p.FileIDs, &p.IsPinned,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan post: %w", err)
@@ -324,15 +384,13 @@ func (c *Client) GetPosts() ([]Post, error) {
 
 // GetPostsByChannel retrieves posts for a specific channel
 func (c *Client) GetPostsByChannel(channelID string) ([]Post, error) {
+	schema, err := c.inspectPosts()
+	if err != nil {
+		return nil, err
+	}
+
 	query := `
-		SELECT 
-			id, createat, updateat, deleteat, userid, channelid,
-			COALESCE(rootid, '') as rootid,
-			COALESCE(originalid, '') as originalid,
-			COALESCE(message, '') as message,
-			COALESCE(type, '') as type,
-			COALESCE(props, '{}') as props,
-			COALESCE(fileids, '[]') as fileids
+		SELECT ` + postColumns(schema.hasIsPinned) + `
 		FROM posts
 		WHERE channelid = $1
 		AND deleteat = 0
@@ -352,7 +410,7 @@ func (c *Client) GetPostsByChannel(channelID string) ([]Post, error) {
 		err := rows.Scan(
 			&p.ID, &p.CreateAt, &p.UpdateAt, &p.DeleteAt,
 			&p.UserID, &p.ChannelID, &p.RootID, &p.OriginalID,
-			&p.Message, &p.Type, &p.Props, &p.FileIDs,
+			&p.Message, &p.Type, &p.Props, &p.FileIDs, &p.IsPinned,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan post: %w", err)

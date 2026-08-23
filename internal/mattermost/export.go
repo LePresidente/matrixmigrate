@@ -293,6 +293,14 @@ func (e *Exporter) ExportMessages(progress ExportProgressCallback) (*Messages, e
 		progress("messages", len(posts), totalCount)
 	}
 
+	pinnedPosts := 0
+	for idx := range messages.Posts {
+		if messages.Posts[idx].IsPinned {
+			pinnedPosts++
+		}
+	}
+	logger.Info("Exported %d pinned post(s)", pinnedPosts)
+
 	// Export file infos
 	if progress != nil {
 		progress("files", 0, 0)

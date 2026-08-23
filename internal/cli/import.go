@@ -11,6 +11,20 @@ import (
 	"github.com/aligundogdu/matrixmigrate/internal/migration"
 )
 
+// progressStageFor maps a MessageImportCallback channel name to the label and unit noun the
+// CLI progress line should use for it. An empty label means channelName is the base message
+// pass and the caller's current label/unit should be left alone.
+func progressStageFor(channelName string) (label, unit string) {
+	switch channelName {
+	case matrix.ReactionProgressStage:
+		return "Reactions", "reactions"
+	case matrix.PinProgressStage:
+		return "Pinned messages", "rooms"
+	default:
+		return "", ""
+	}
+}
+
 func formatETA(d time.Duration) string {
 	if d < 0 {
 		d = 0
@@ -282,18 +296,20 @@ func runImportMessages(cmd *cobra.Command, args []string) error {
 	startedAt := time.Now()
 	lastProgressPrint := time.Time{}
 	const progressPrintInterval = 10 * time.Second
-	// The reaction pass reuses this callback with a counter of its own, so the label, the rate
-	// and the ETA all have to start over when it begins - otherwise reactions are reported as
-	// messages, at a rate averaged over a run that has already finished.
+	// The reaction and pin passes reuse this callback with counters of their own, so the label,
+	// the rate and the ETA all have to start over when either begins - otherwise reactions or
+	// pinned rooms are reported under the previous pass's label, at a rate averaged over a run
+	// that has already finished.
 	label := "Messages"
 	unit := "msg"
 	progress := func(current, total int, channelName, status string) {
 		if total <= 0 {
 			return
 		}
-		if channelName == matrix.ReactionProgressStage && label != "Reactions" {
-			label = "Reactions"
-			unit = "reactions"
+		stageLabel, stageUnit := progressStageFor(channelName)
+		if stageLabel != "" && label != stageLabel {
+			label = stageLabel
+			unit = stageUnit
 			startedAt = time.Now()
 			lastProgressPrint = time.Time{}
 		}
@@ -332,6 +348,9 @@ func runImportMessages(cmd *cobra.Command, args []string) error {
 		result.FilesLinked, result.FilesUploaded, result.FilesSkipped, result.FilesTooLarge))
 	printInfo(fmt.Sprintf("  Reactions: imported=%d, skipped=%d, failed=%d, custom_emoji=%d",
 		result.ReactionsImported, result.ReactionsSkipped, result.ReactionsFailed, result.ReactionsCustomEmoji))
+	printInfo(fmt.Sprintf("  Pinned: rooms_updated=%d unchanged=%d events_added=%d skipped=%d failed=%d",
+		result.PinnedRoomsUpdated, result.PinnedRoomsUnchanged, result.PinnedEventsAdded,
+		result.PinsSkipped, result.PinsFailed))
 
 	if result.MappingFile != "" {
 		printSuccess(i18n.T("messages.mapping_saved", result.MappingFile))
