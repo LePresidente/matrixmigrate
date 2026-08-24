@@ -740,8 +740,12 @@ func (i *Importer) ImportChannelsAsRooms(channels []mattermost.Channel, existing
 			continue
 		}
 
-		topic := channel.Purpose
-		if topic == "" {
+		topic := ""
+		if channel.Purpose != "" && channel.Header != "" {
+			topic = channel.Purpose + " " + channel.Header
+		} else if channel.Purpose != "" {
+			topic = channel.Purpose
+		} else if channel.Header != "" {
 			topic = channel.Header
 		}
 
