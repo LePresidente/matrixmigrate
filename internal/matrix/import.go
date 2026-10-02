@@ -2339,7 +2339,6 @@ func (i *Importer) ImportMessagesWithFiles(
 					continue
 				}
 				result.Stats.MessagesFailed++
-				result.Errors = append(result.Errors, fmt.Sprintf("Failed to send message %s: the post has no text and none of its attachments could be sent", post.ID))
 				if progress != nil {
 					progress(idx+1, total, post.ChannelID, "failed:send_error")
 				}
@@ -2505,8 +2504,10 @@ func attachmentNamesBody(files []mattermost.FileInfo) string {
 
 // importAttachmentsAsPost sends the attachments of a post that has no text, in place of a text
 // event. The first attachment event sent becomes the post's event, so replies, reactions and
-// pins resolve to it, and a reply's thread advances to it. It reports whether the post was
-// mapped; when it was not, nothing about the post is recorded and a later run retries it.
+// pins resolve to it, and a reply's thread advances to it. When no attachment could be sent, a
+// text event naming them stands for the post instead, and the attachments stay unrecorded for
+// the next run. It reports whether the post was mapped; when it was not (an interrupt, or the
+// text failed too), nothing about the post is recorded and a later run retries it.
 func (i *Importer) importAttachmentsAsPost(
 	result *ImportMessagesResult,
 	post mattermost.Post,
@@ -2533,7 +2534,29 @@ func (i *Importer) importAttachmentsAsPost(
 		*largestTooLargeSize = maxTooLargeSize
 	}
 	if eventID == "" {
-		return false
+		// An interrupt leaves the post unsent; the next run sends it with its attachments.
+		if i.isInterrupted() {
+			return false
+		}
+		// No attachment event stands for the post: send the text naming its files instead, so
+		// replies, reactions and pins have an event to point at. The files stay unrecorded and
+		// the next run sends them onto this event.
+		body := attachmentNamesBody(liveAttachments(files))
+		resp, recovery, err := i.sendWithMembershipRecovery(roomID, senderID, func(sender string) (*SendMessageResponse, error) {
+			if threadRoot != "" {
+				return i.client.SendReplyWithTimestamp(roomID, body, threadRoot, threadLatest[post.RootID], post.CreateAt, sender)
+			}
+			return i.client.SendMessageWithTimestamp(roomID, body, post.CreateAt, sender)
+		})
+		if recovery != "" {
+			logger.Info("Post %s: %s", post.ID, recovery)
+		}
+		if err != nil {
+			result.Errors = append(result.Errors, fmt.Sprintf("Failed to send message %s: none of its attachments could be sent, nor the text naming them: %v", post.ID, err))
+			return false
+		}
+		logger.Warn("Post %s has no text and none of its attachments could be sent; sent a text naming them, the attachments are retried on the next run", post.ID)
+		eventID = resp.EventID
 	}
 
 	result.Mapping[post.ID] = eventID

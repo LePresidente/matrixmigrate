@@ -25,6 +25,7 @@ type attachmentServer struct {
 	uploads     []string
 	failUploads map[string]bool
 	onSend      func(sends int)
+	onUpload    func(name string)
 }
 
 func (as *attachmentServer) snapshot() (sends []map[string]interface{}, ids []string, uploads []string) {
@@ -52,6 +53,9 @@ func newAttachmentServer(t *testing.T, as *attachmentServer) *httptest.Server {
 			_, _ = fmt.Fprintf(w, `{"event_id":%q}`, id)
 		case strings.Contains(r.URL.Path, "/media/v3/upload"):
 			name := r.URL.Query().Get("filename")
+			if as.onUpload != nil {
+				as.onUpload(name)
+			}
 			as.mu.Lock()
 			fail := as.failUploads[name]
 			if !fail {
@@ -274,26 +278,133 @@ func TestFailedUploadLeavesFileUnrecorded(t *testing.T) {
 	if _, ok := result.Mapping["p1"]; !ok {
 		t.Errorf("p1's text was sent but p1 is not mapped")
 	}
-	if _, ok := result.Mapping["p2"]; ok {
-		t.Errorf("file-only p2 has no event but is mapped: %v", result.Mapping)
+	// The file-only p2 stands as a placeholder naming its file, so it is mapped.
+	if _, ok := result.Mapping["p2"]; !ok {
+		t.Errorf("file-only p2 is not mapped to its placeholder: %v", result.Mapping)
 	}
-	if result.Stats.MessagesFailed != 1 || result.Stats.MessagesImported != 1 {
-		t.Errorf("stats = %+v, want 1 imported, 1 failed", result.Stats)
-	}
-	found := false
-	for _, e := range result.Errors {
-		if strings.Contains(e, "p2") && strings.Contains(e, "no text") && strings.Contains(e, "none of its attachments could be sent") {
-			found = true
-		}
-	}
-	if !found {
-		t.Errorf("errors = %v, want one saying p2 has no text and no attachment could be sent", result.Errors)
+	if result.Stats.MessagesFailed != 0 || result.Stats.MessagesImported != 2 {
+		t.Errorf("stats = %+v, want 2 imported, 0 failed", result.Stats)
 	}
 	sends, _, _ := as.snapshot()
 	for _, s := range sends {
 		if isBlankText(s) {
 			t.Errorf("a blank text event was sent: %v", s)
 		}
+	}
+}
+
+// A file-only post none of whose attachments can be sent stands as a text event naming the
+// files, so replies, reactions and pins still have an event to point at. The files stay
+// unrecorded for the next run.
+func TestFileOnlyPostWithAllAttachmentsFailingSendsPlaceholder(t *testing.T) {
+	f1 := attachment("f1", "p1", "a.png", "image/png")
+	f2 := attachment("f2", "p1", "b.txt", "text/plain")
+	as := &attachmentServer{failUploads: map[string]bool{"a.png": true, "b.txt": true}}
+	i, fc := attachmentFixture(t, as, []mattermost.FileInfo{f1, f2})
+
+	posts := []mattermost.Post{
+		{ID: "p1", ChannelID: "c1", UserID: "u-alice", Message: "", CreateAt: 1000},
+		{ID: "p2", ChannelID: "c1", UserID: "u-bob", Message: "nice", RootID: "p1", CreateAt: 1001},
+	}
+	result, err := i.ImportMessagesWithFiles(posts, attachmentRooms, interruptTestUsers, nil,
+		filesByPostOf(f1, f2), nil, fc, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sends, ids, _ := as.snapshot()
+	if len(sends) != 2 {
+		t.Fatalf("sends = %v, want the placeholder and the reply", sends)
+	}
+	if sends[0]["msgtype"] != "m.text" || sends[0]["body"] != "📎 a.png, b.txt" {
+		t.Errorf("first send = %v, want a text event naming both files", sends[0])
+	}
+	if result.Mapping["p1"] != ids[0] {
+		t.Errorf("p1 maps to %q, want the placeholder %q", result.Mapping["p1"], ids[0])
+	}
+	if len(result.FileMapping) != 0 {
+		t.Errorf("file mapping = %v, want no file recorded", result.FileMapping)
+	}
+	rel, _ := sends[1]["m.relates_to"].(map[string]interface{})
+	if rel["rel_type"] != "m.thread" || rel["event_id"] != ids[0] {
+		t.Errorf("reply p2 relation = %v, want a thread on the placeholder %q", rel, ids[0])
+	}
+	if result.Stats.MessagesImported != 2 || result.Stats.MessagesFailed != 0 || result.Stats.RepliesImported != 1 {
+		t.Errorf("stats = %+v, want 2 imported, 0 failed, 1 reply", result.Stats)
+	}
+}
+
+// The run after a placeholder sends the attachment that failed, once, and no second placeholder.
+func TestPlaceholderPostGetsItsAttachmentOnTheNextRun(t *testing.T) {
+	f1 := attachment("f1", "p1", "a.png", "image/png")
+	as := &attachmentServer{}
+	i, fc := attachmentFixture(t, as, []mattermost.FileInfo{f1})
+	onDisk := filepath.Join(fc.LocalDataPath, filepath.FromSlash(f1.Path))
+	saved, err := os.ReadFile(onDisk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(onDisk); err != nil {
+		t.Fatal(err)
+	}
+
+	posts := []mattermost.Post{{ID: "p1", ChannelID: "c1", UserID: "u-alice", Message: "", CreateAt: 1000}}
+	first, err := i.ImportMessagesWithFiles(posts, attachmentRooms, interruptTestUsers, nil,
+		filesByPostOf(f1), nil, fc, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := first.Mapping["p1"]; !ok {
+		t.Fatalf("first run did not map p1: %v", first.Mapping)
+	}
+
+	if err := os.WriteFile(onDisk, saved, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	second, err := i.ImportMessagesWithFiles(posts, attachmentRooms, interruptTestUsers, first.Mapping,
+		filesByPostOf(f1), first.FileMapping, fc, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sends, ids, uploads := as.snapshot()
+	if len(sends) != 2 || sends[0]["msgtype"] != "m.text" || sends[1]["msgtype"] != "m.image" {
+		t.Fatalf("sends = %v, want the placeholder then the image, nothing else", sends)
+	}
+	if len(uploads) != 1 {
+		t.Errorf("uploads = %v, want exactly one", uploads)
+	}
+	if second.FileMapping["f1"] != ids[1] || second.Mapping["p1"] != ids[0] {
+		t.Errorf("mapping = %v files = %v, want p1 on the placeholder and f1 on the image", second.Mapping, second.FileMapping)
+	}
+}
+
+// An interrupt that stops a file-only post before any attachment is sent leaves it unsent and
+// unmapped: no placeholder goes out for a post the next run will send properly.
+func TestInterruptBeforeFirstAttachmentOfFileOnlyPostSendsNothing(t *testing.T) {
+	f1 := attachment("f1", "p1", "a.png", "image/png")
+	f2 := attachment("f2", "p1", "b.txt", "text/plain")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	as := &attachmentServer{
+		failUploads: map[string]bool{"a.png": true},
+		onUpload:    func(string) { cancel() },
+	}
+	i, fc := attachmentFixture(t, as, []mattermost.FileInfo{f1, f2})
+	i.SetContext(ctx)
+
+	posts := []mattermost.Post{{ID: "p1", ChannelID: "c1", UserID: "u-alice", Message: "", CreateAt: 1000}}
+	result, err := i.ImportMessagesWithFiles(posts, attachmentRooms, interruptTestUsers, nil,
+		filesByPostOf(f1, f2), nil, fc, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sends, _, _ := as.snapshot()
+	if len(sends) != 0 {
+		t.Errorf("sends = %v, want none", sends)
+	}
+	if len(result.Mapping) != 0 || len(result.FileMapping) != 0 {
+		t.Errorf("mapping = %v files = %v, want nothing recorded", result.Mapping, result.FileMapping)
 	}
 }
 
