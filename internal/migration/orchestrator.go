@@ -1647,8 +1647,9 @@ func (o *Orchestrator) ImportMessages(progress matrix.MessageImportCallback) (*I
 					logger.Warn("Upload mode: failed to close Mattermost SSH file reader: %v", closeErr)
 				}
 			}()
-			fileConfig.RemoteReadFile = remoteExecutor.ReadFile
-			logger.Info("Upload mode: Mattermost SSH file reader enabled for remote local_data_path")
+			readWithSudo := o.config.Mattermost.Files.ReadWithSudo
+			fileConfig.RemoteReadFile = attachmentReader(remoteExecutor.ReadFileAsUser, remoteExecutor.ReadFile, readWithSudo)
+			logger.Info("Upload mode: Mattermost SSH file reader enabled for remote local_data_path (read_with_sudo: %t)", readWithSudo)
 		}
 	}
 	logger.Info("File mode: %s, S3 URL: %s", fileConfig.Mode, fileConfig.S3PublicURL)
@@ -1830,4 +1831,20 @@ func (o *Orchestrator) ImportMessages(progress matrix.MessageImportCallback) (*I
 
 		MappingFile: mappingFile,
 	}, nil
+}
+
+// attachmentReader picks how attachments are read over SSH: as the SSH user by default, or
+// with the `sudo cat` fallback when mattermost.files.read_with_sudo is set. A failed plain
+// read names that option, since a permission error is the usual cause.
+func attachmentReader(asUser, withSudo func(string) ([]byte, error), useSudo bool) func(string) ([]byte, error) {
+	if useSudo {
+		return withSudo
+	}
+	return func(path string) ([]byte, error) {
+		data, err := asUser(path)
+		if err != nil {
+			return nil, fmt.Errorf("%w (if the SSH user lacks permission, set mattermost.files.read_with_sudo: true to retry with sudo)", err)
+		}
+		return data, nil
+	}
 }

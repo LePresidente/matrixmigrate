@@ -53,6 +53,10 @@ type FilesConfig struct {
 	// When true, upload failures may fall back to sending S3/public links (if s3_public_url is set).
 	// When false (default), upload failures are skipped and logged as errors.
 	FallbackToLinkOnUploadFailure bool `mapstructure:"fallback_to_link_on_upload_failure"`
+
+	// When true, attachments read over SSH fall back to `sudo cat` if the SSH user cannot
+	// read them. When false (default), they are read as the SSH user only.
+	ReadWithSudo bool `mapstructure:"read_with_sudo"`
 }
 
 // MatrixConfig holds Matrix server configuration
@@ -335,6 +339,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("mattermost.database.host", "localhost")
 	v.SetDefault("mattermost.database.port", 5432)
 	v.SetDefault("mattermost.files.fallback_to_link_on_upload_failure", false)
+	v.SetDefault("mattermost.files.read_with_sudo", false)
 	v.SetDefault("matrix.ssh.port", 22)
 	v.SetDefault("matrix.api.base_url", "http://localhost:8008")
 	v.SetDefault("matrix.api.port", 8008) // Synapse API port for SSH tunnel

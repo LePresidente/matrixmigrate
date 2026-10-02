@@ -97,6 +97,11 @@ mattermost:
     # If false (default), failed uploads are skipped and logged.
     fallback_to_link_on_upload_failure: false
 
+    # Upload mode reads attachments missing from this machine over mattermost.ssh, as the
+    # SSH user. Set true to retry with `sudo cat` when that user lacks permission
+    # (needs passwordless sudo on the Mattermost server). Default: false.
+    # read_with_sudo: false
+
 # Matrix Synapse server configuration
 matrix:
   # Leave `ssh` empty to use direct mode: the Matrix API is reached over `api.base_url`

@@ -220,6 +220,7 @@ Under `mattermost.files` in `config.yaml`:
 | `local_data_path` | — | Path to the Mattermost file storage directory, as reachable from the machine running the tool (typically an NFS/SSHFS mount of Mattermost's `data/` directory). Required when `mode: "upload"`. |
 | `max_upload_size_mb` | `50` | Files larger than this are not uploaded. Must not exceed the Synapse `max_upload_size` setting, or uploads will be rejected by the homeserver. Rejected files are counted and reported at the end of the import. |
 | `fallback_to_link_on_upload_failure` | `false` | When `mode: "upload"` and an individual upload fails, fall back to linking that file instead of recording an error. Useful for a first pass over a large archive where a handful of files are unreadable. |
+| `read_with_sudo` | `false` | When `mode: "upload"` and an attachment is not under `local_data_path` on this machine, it is read from the Mattermost server over SSH as the SSH user. Set this to `true` to retry with `sudo cat` when that user cannot read it (requires passwordless sudo). Off by default so the migration does not run privileged commands on the Mattermost server unasked. |
 
 ### Matrix import options
 

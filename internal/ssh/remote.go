@@ -45,7 +45,33 @@ func (r *RemoteExecutor) Close() error {
 	return nil
 }
 
-// ReadFile reads a file from the remote server
+// ReadFileAsUser reads a file from the remote server as the SSH user, without sudo.
+func (r *RemoteExecutor) ReadFileAsUser(path string) ([]byte, error) {
+	session, err := r.client.NewSession()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create session: %w", err)
+	}
+	defer session.Close()
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	session.Stdout = &stdout
+	session.Stderr = &stderr
+
+	if err := session.Run("cat " + shellQuote(path)); err != nil {
+		detail := strings.TrimSpace(stderr.String())
+		if detail == "" {
+			detail = err.Error()
+		}
+		return nil, fmt.Errorf("failed to read file %s as SSH user: %s", path, detail)
+	}
+
+	return stdout.Bytes(), nil
+}
+
+// ReadFile reads a file from the remote server, falling back to `sudo cat` when the SSH
+// user cannot read it. Used for Mattermost's config.json; attachments use ReadFileAsUser
+// unless mattermost.files.read_with_sudo is set.
 func (r *RemoteExecutor) ReadFile(path string) ([]byte, error) {
 	session, err := r.client.NewSession()
 	if err != nil {
