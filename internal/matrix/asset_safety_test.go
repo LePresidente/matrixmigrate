@@ -204,3 +204,49 @@ func TestSetDirectRoomForUserMissingAccountDataIsEmpty(t *testing.T) {
 		t.Errorf("%d PUTs, want 1", puts)
 	}
 }
+
+// A re-run's checkpoints replace the newest mapping file, so none of them may drop anything the
+// previous run recorded, including a room (such as a DM) that is not among the channels imported.
+func TestImportAssetsCheckpointsKeepExistingMappings(t *testing.T) {
+	n := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/createRoom"):
+			n++
+			_, _ = fmt.Fprintf(w, `{"room_id":"!new%d:example.com"}`, n)
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/_synapse/admin/v2/users/"):
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"errcode":"M_NOT_FOUND","error":"User not found"}`))
+		default:
+			_, _ = w.Write([]byte(`{}`))
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	imp := NewImporter(NewClient(srv.URL, "admin-token", "example.com"))
+	var snaps []assetSnapshot
+	imp.SetAssetCheckpoint(func(users, spaces, rooms map[string]string) {
+		snaps = append(snaps, assetSnapshot{users, spaces, rooms})
+	})
+	existing := &ExistingMappings{
+		Users:  map[string]string{"u0": "@bob_dev:example.com"},
+		Spaces: map[string]string{"t0": "!space:example.com"},
+		Rooms:  map[string]string{"c0": "!room:example.com", "dm0": "!dm:example.com"},
+	}
+	assets := &mattermost.Assets{
+		Users:    []mattermost.User{{ID: "u1", Username: "alice"}},
+		Teams:    []mattermost.Team{{ID: "t0"}, {ID: "t1", Name: "team", DisplayName: "Team"}},
+		Channels: []mattermost.Channel{{ID: "c0", DisplayName: "Zero", Type: "O"}, {ID: "c1", Name: "one", DisplayName: "One", Type: "O"}},
+	}
+	if _, err := imp.ImportAssets(assets, existing, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(snaps) < 3 {
+		t.Fatalf("only %d checkpoints", len(snaps))
+	}
+	for idx, s := range snaps {
+		if s.users["u0"] == "" || s.spaces["t0"] != "!space:example.com" || s.rooms["c0"] != "!room:example.com" || s.rooms["dm0"] != "!dm:example.com" {
+			t.Errorf("checkpoint %d lost existing mappings: %+v", idx, s)
+		}
+	}
+}

@@ -1857,6 +1857,13 @@ func (i *Importer) ImportAssets(assets *mattermost.Assets, existingMappings *Exi
 			len(existingMappings.Users), len(existingMappings.Spaces), len(existingMappings.Rooms))
 	}
 
+	// Seed the checkpointed state with everything already mapped, so an early checkpoint of a
+	// re-run (after the users, before any space or room) never records a subset of what the
+	// previous run saved.
+	i.assetUsers = copyMapping(existingMappings.Users)
+	i.assetSpaces = copyMapping(existingMappings.Spaces)
+	i.assetRooms = copyMapping(existingMappings.Rooms)
+
 	// Import users
 	logger.Info("=== Starting User Import ===")
 	userMapping, userStats, err := i.ImportUsers(assets.Users, existingMappings.Users, progress)
