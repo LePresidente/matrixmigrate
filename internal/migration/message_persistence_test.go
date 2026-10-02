@@ -160,3 +160,68 @@ func TestMessageMappingSaveFailureNamesFileAndCheckpoint(t *testing.T) {
 		}
 	}
 }
+
+// A message mapping written before attachments were tracked, imported again in upload mode:
+// the attachments of posts it already holds are taken as sent - nothing is uploaded for them -
+// and recorded so in the saved mapping, while a post it does not hold gets its file uploaded
+// once.
+func TestImportMessagesAdoptsLegacyMappingWithoutReupload(t *testing.T) {
+	files := []mattermost.FileInfo{
+		{ID: "f1", PostID: "p1", Name: "a.png", Path: "20240101/f1/a.png", Size: 6, MimeType: "image/png"},
+		{ID: "f2", PostID: "p1", Name: "b.txt", Path: "20240101/f2/b.txt", Size: 6, MimeType: "text/plain"},
+		{ID: "f3", PostID: "p2", Name: "c.txt", Path: "20240101/f3/c.txt", Size: 6, MimeType: "text/plain"},
+	}
+	messages := &mattermost.Messages{
+		Posts: []mattermost.Post{
+			{ID: "p1", ChannelID: "c1", UserID: "u-alice", Message: "old", CreateAt: 1000},
+			{ID: "p2", ChannelID: "c1", UserID: "u-alice", Message: "new", CreateAt: 1001},
+		},
+		Files: files,
+	}
+	mappingsDir := filepath.Join(t.TempDir(), "mappings")
+	f := newMessageImportFixture(t, mappingsDir, messages)
+
+	dataDir := t.TempDir()
+	for _, file := range files {
+		p := filepath.Join(dataDir, filepath.FromSlash(file.Path))
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte("bytes!"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f.cfg.Mattermost.Files.Mode = "upload"
+	f.cfg.Mattermost.Files.LocalDataPath = dataDir
+
+	legacy := `{"version": "1.0", "messages": {"p1": {"mattermost_id": "p1", "matrix_event_id": "$old"}}}`
+	if err := os.WriteFile(filepath.Join(mappingsDir, "message-mapping-20200101-000000.json"), []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := f.o.ImportMessages(nil); err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, uploads := f.counts()
+	if len(uploads) != 1 || uploads[0] != "c.txt" {
+		t.Errorf("uploads = %v, want only c.txt, once", uploads)
+	}
+	latest, err := GetLatestMessageMappingFile(mappingsDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	saved, err := LoadMessageMapping(latest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sent := saved.FileIDs()
+	for _, id := range []string{"f1", "f2"} {
+		if _, ok := sent[id]; !ok {
+			t.Errorf("%s of the already-imported post is not marked sent: %v", id, sent)
+		}
+	}
+	if sent["f3"] == "" {
+		t.Errorf("f3 was uploaded but its event is not recorded: %v", sent)
+	}
+}
