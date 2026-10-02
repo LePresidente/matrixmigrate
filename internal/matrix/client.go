@@ -222,6 +222,11 @@ func (c *Client) SetMASClient(mas *MASClient) {
 	}
 }
 
+// UsesMAS reports whether user creation and lookup go through the Matrix Authentication Service.
+func (c *Client) UsesMAS() bool {
+	return c.masClient != nil
+}
+
 // GetHomeserver returns the current homeserver domain
 func (c *Client) GetHomeserver() string {
 	return c.homeserver
@@ -1134,7 +1139,12 @@ func (c *Client) setDirectRoomForUser(userID, otherUserID, roomID string) error 
 	if c.asToken == "" {
 		return fmt.Errorf("setting m.direct requires Application Service token")
 	}
-	existing, _ := c.GetAccountData(userID, "m.direct")
+	// A failed read must not fall through as "empty": the write below replaces the whole
+	// m.direct, which would erase the user's other direct-message rooms.
+	existing, err := c.GetAccountData(userID, "m.direct")
+	if err != nil {
+		return fmt.Errorf("reading m.direct for %s: %w", userID, err)
+	}
 	direct, _ := existing.(map[string]interface{})
 	if direct == nil {
 		direct = make(map[string]interface{})
@@ -1351,8 +1361,10 @@ func (c *Client) InviteUser(roomID, userID string) error {
 	if statusCode == http.StatusForbidden {
 		var resp GenericResponse
 		json.Unmarshal(body, &resp)
-		if resp.Errcode == "M_FORBIDDEN" {
-			return nil // Already a member, not an error
+		// Synapse: "<user> is already in the room." Any other 403 (not allowed to invite,
+		// banned, ...) means the invite did not happen.
+		if resp.Errcode == "M_FORBIDDEN" && strings.Contains(strings.ToLower(resp.Error), "already in the room") {
+			return nil
 		}
 	}
 	if statusCode != http.StatusOK {

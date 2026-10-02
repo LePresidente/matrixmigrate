@@ -70,6 +70,14 @@ type Importer struct {
 	reactionCheckpointFn    func(map[string]string)
 	reactionCheckpointEvery int
 
+	// assetCheckpointFn, when set, is told the user, space and room mappings as they grow
+	// during asset import, so a crash leaves a mapping file that a re-run resumes from instead of
+	// creating the same spaces and rooms again. The assets* maps are the running state it reports.
+	assetCheckpointFn func(users, spaces, rooms map[string]string)
+	assetUsers        map[string]string
+	assetSpaces       map[string]string
+	assetRooms        map[string]string
+
 	// knownMentionUsers holds the localparts of users this run knows exist, derived from the
 	// migration's user mapping. A nil map disables mention gating.
 	knownMentionUsers map[string]struct{}
@@ -425,13 +433,15 @@ func (i *Importer) ImportUsers(users []mattermost.User, existingMapping map[stri
 		exists := false
 		existsCheck, err := i.client.UserExists(user.Username)
 		if err != nil {
-			// If check fails with "Can only look up local users", ignore it
-			// CreateUser is idempotent anyway, so we can just try to create
-			if strings.Contains(err.Error(), "Can only look up local users") {
-				logger.Info("UserExists check not available for '%s', will try to create", user.Username)
-			} else {
-				logger.Warn("UserExists check failed for '%s': %v, will try to create anyway", user.Username, err)
+			if !i.client.UsesMAS() {
+				// On plain Synapse, creating is an upsert that would replace an existing
+				// account's password and profile, so an unconfirmed account is left alone.
+				logger.Error("Could not confirm whether user '%s' exists (%v); the account was left untouched - re-run import assets to pick it up", user.Username, err)
+				stats.UsersFailed++
+				continue
 			}
+			// MAS answers 409 for an existing user, so trying to create is safe.
+			logger.Warn("UserExists check failed for '%s': %v, will try to create anyway", user.Username, err)
 		} else {
 			exists = existsCheck
 		}
@@ -544,6 +554,9 @@ func (i *Importer) ImportUsers(users []mattermost.User, existingMapping map[stri
 		stats.UsersCreated++
 	}
 
+	i.assetUsers = copyMapping(mapping)
+	i.checkpointAssets()
+
 	return mapping, stats, nil
 }
 
@@ -592,6 +605,7 @@ func (i *Importer) ImportTeamsAsSpaces(teams []mattermost.Team, existingMapping 
 	for k, v := range existingMapping {
 		mapping[k] = v
 	}
+	i.assetSpaces = copyMapping(mapping)
 
 	for idx, team := range teams {
 		if i.stopForInterrupt("space import", idx, total) {
@@ -642,6 +656,8 @@ func (i *Importer) ImportTeamsAsSpaces(teams []mattermost.Team, existingMapping 
 		logger.Success("Created space '%s' -> %s", team.DisplayName, resp.RoomID)
 		mapping[team.ID] = resp.RoomID
 		stats.SpacesCreated++
+		i.assetSpaces[team.ID] = resp.RoomID
+		i.checkpointAssets()
 	}
 
 	return mapping, stats, nil
@@ -766,6 +782,7 @@ func (i *Importer) ImportChannelsAsRooms(channels []mattermost.Channel, existing
 	for k, v := range existingMapping {
 		mapping[k] = v
 	}
+	i.assetRooms = copyMapping(mapping)
 
 	for idx, channel := range channels {
 		if i.stopForInterrupt("room import", idx, total) {
@@ -868,6 +885,8 @@ func (i *Importer) ImportChannelsAsRooms(channels []mattermost.Channel, existing
 		}
 		mapping[channel.ID] = resp.RoomID
 		stats.RoomsCreated++
+		i.assetRooms[channel.ID] = resp.RoomID
+		i.checkpointAssets()
 	}
 
 	return mapping, stats, nil
@@ -1488,6 +1507,17 @@ func (i *Importer) ImportDirectChannelsAsDMs(
 		mapping[k] = v
 	}
 
+	// The checkpoint reports every room, so it carries the regular rooms made earlier in this
+	// run as well as the DMs; the caller merges both into one room mapping.
+	if i.assetRooms == nil {
+		i.assetRooms = make(map[string]string)
+	}
+	for k, v := range existingMapping {
+		if _, ok := i.assetRooms[k]; !ok {
+			i.assetRooms[k] = v
+		}
+	}
+
 	if !i.client.HasASToken() {
 		logger.Warn("ImportDirectChannelsAsDMs: Application Service token not set; DMs will be created but m.direct (People list) cannot be set for users")
 	}
@@ -1597,6 +1627,8 @@ func (i *Importer) ImportDirectChannelsAsDMs(
 		}
 		mapping[channel.ID] = resp.RoomID
 		stats.RoomsCreated++
+		i.assetRooms[channel.ID] = resp.RoomID
+		i.checkpointAssets()
 	}
 
 	if breakdown := skips.String(); breakdown != "" {
@@ -1744,6 +1776,29 @@ func (i *Importer) maybeCheckpoint(mapping map[string]string) {
 		snapshot[k] = v
 	}
 	i.checkpointFn(snapshot)
+}
+
+// SetAssetCheckpoint installs fn, called with the user, space and room mappings so far after
+// the users are imported and after every space, room and DM created. The maps handed to fn are
+// copies, safe to persist without racing the import. A nil fn disables it.
+func (i *Importer) SetAssetCheckpoint(fn func(users, spaces, rooms map[string]string)) {
+	i.assetCheckpointFn = fn
+}
+
+// checkpointAssets reports the running asset mappings to the checkpoint callback, if any.
+func (i *Importer) checkpointAssets() {
+	if i.assetCheckpointFn == nil {
+		return
+	}
+	i.assetCheckpointFn(copyMapping(i.assetUsers), copyMapping(i.assetSpaces), copyMapping(i.assetRooms))
+}
+
+func copyMapping(m map[string]string) map[string]string {
+	out := make(map[string]string, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
 }
 
 // SetReactionCheckpoint installs fn, called every `every` sent reactions with the
