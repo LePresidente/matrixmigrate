@@ -235,3 +235,73 @@ func TestImportAssetsStopsOnCorruptMapping(t *testing.T) {
 		t.Errorf("step status = %s, want failed", step.Status)
 	}
 }
+
+// A user whose existence could not be confirmed has no mapping, so the message import would
+// send their posts as the fallback sender for good. The asset step must save what it did and
+// then fail, saying how many users need another run.
+func TestImportAssetsFailsWhenUsersUnconfirmed(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &config.Config{}
+	cfg.Data = config.DataConfig{
+		AssetsDir:   filepath.Join(dir, "assets"),
+		MappingsDir: filepath.Join(dir, "mappings"),
+		StateFile:   filepath.Join(dir, "state.json"),
+	}
+	cfg.Matrix.Homeserver = "example.com"
+	for _, d := range []string{cfg.Data.AssetsDir, cfg.Data.MappingsDir} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	assetFile := filepath.Join(cfg.Data.AssetsDir, "mattermost-assets-1.json.gz")
+	assets := &mattermost.Assets{
+		Users:    []mattermost.User{{ID: "u1", Username: "alice"}, {ID: "u2", Username: "bob_dev"}},
+		Channels: []mattermost.Channel{{ID: "c1", Name: "one", DisplayName: "One", Type: "O"}},
+	}
+	if err := archive.SaveGzipJSON(assetFile, assets); err != nil {
+		t.Fatal(err)
+	}
+	state := NewMigrationState()
+	state.CompleteStep(StepExportAssets, assetFile)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/_synapse/admin/v2/users/@alice"):
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"errcode":"M_FORBIDDEN","error":"nope"}`))
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/_synapse/admin/v2/users/"):
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"errcode":"M_NOT_FOUND","error":"User not found"}`))
+		case strings.HasSuffix(r.URL.Path, "/createRoom"):
+			_, _ = w.Write([]byte(`{"room_id":"!r1:example.com"}`))
+		default:
+			_, _ = w.Write([]byte(`{}`))
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	o := &Orchestrator{
+		config:        cfg,
+		state:         state,
+		tunnelManager: ssh.NewTunnelManager(),
+		mxClient:      matrix.NewClientWithRateLimit(srv.URL, "admin-token", "example.com", matrix.RateLimitConfig{}),
+	}
+	_, err := o.ImportAssets(nil)
+	if err == nil || !strings.Contains(err.Error(), "1 user") || !strings.Contains(err.Error(), "import assets") {
+		t.Fatalf("err = %v, want one naming 1 unconfirmed user and asking for import assets again", err)
+	}
+	if step := state.GetStep(StepImportAssets); step.Status != StatusFailed {
+		t.Errorf("step status = %s, want failed", step.Status)
+	}
+	latest, _ := GetLatestMappingFile(cfg.Data.MappingsDir)
+	m, lerr := LoadMapping(latest)
+	if lerr != nil {
+		t.Fatalf("no mapping saved: %v", lerr)
+	}
+	if m.Channels["c1"] != "!r1:example.com" || m.Users["u2"] != "@bob_dev:example.com" {
+		t.Errorf("saved mapping = %+v, want the room and the created user", m)
+	}
+	if _, ok := m.Users["u1"]; ok {
+		t.Error("the unconfirmed user must not be mapped")
+	}
+}

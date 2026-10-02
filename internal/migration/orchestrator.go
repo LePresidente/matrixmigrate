@@ -944,6 +944,16 @@ func (o *Orchestrator) ImportAssets(progress ProgressCallback) (*OperationResult
 		return nil, interruptedAfterSave()
 	}
 
+	// A user left untouched because their existence could not be confirmed has no mapping, so
+	// the message import would send their posts as the fallback sender, for good. Everything
+	// else is saved; the step stays failed until a re-run has confirmed them.
+	if n := importResult.Stats.UsersUnconfirmed; n > 0 {
+		err := fmt.Errorf("%d user(s) could not be confirmed to exist and were left untouched (see the log); everything else is saved to %s - run import assets again before importing messages, or their posts would be sent as the fallback sender", n, mappingFile)
+		o.state.FailStep(StepImportAssets, err)
+		o.SaveState()
+		return nil, err
+	}
+
 	// Complete step
 	o.state.CompleteStep(StepImportAssets, mappingFile)
 	result.OutputFile = mappingFile

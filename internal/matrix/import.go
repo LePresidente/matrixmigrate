@@ -1883,6 +1883,7 @@ func (i *Importer) ImportAssets(assets *mattermost.Assets, existingMappings *Exi
 	result.Stats.UsersCreated = userStats.UsersCreated
 	result.Stats.UsersSkipped = userStats.UsersSkipped
 	result.Stats.UsersFailed = userStats.UsersFailed
+	result.Stats.UsersUnconfirmed = userStats.UsersUnconfirmed
 	logger.Info("User import completed: created=%d, skipped=%d, failed=%d",
 		userStats.UsersCreated, userStats.UsersSkipped, userStats.UsersFailed)
 
