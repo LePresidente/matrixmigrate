@@ -69,6 +69,9 @@ func (i *Importer) RemoveDeletedUsersFromRooms(
 
 	logger.Info("Removing deactivated accounts from rooms: %d account(s) to check", len(targets))
 	for idx, mxID := range targets {
+		if i.stopForInterrupt("deactivated-account room removal", idx, len(targets)) {
+			break
+		}
 		if progress != nil {
 			progress("remove_deactivated_users", idx+1, len(targets), mxID)
 		}
@@ -145,7 +148,10 @@ func (i *Importer) removeFromEveryRoom(userID string, preferAdminKick bool, reas
 	}
 	sort.Strings(rooms)
 
-	for _, roomID := range rooms {
+	for idx, roomID := range rooms {
+		if i.stopForInterrupt("room removal for "+userID, idx, len(rooms)) {
+			break
+		}
 		content, perr := i.client.getPowerLevels(roomID)
 		if perr != nil || content == nil {
 			logger.Warn("Could not read power levels for room %s (%v); keeping %s in place", roomID, perr, userID)

@@ -1,6 +1,7 @@
 package matrix
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path"
@@ -88,6 +89,9 @@ type Importer struct {
 	// DeletedUserModeDeactivated (the default) or DeletedUserModeLocked. It also decides
 	// whether those accounts are given room memberships at all - see ApplyChannelMemberships.
 	deletedUserMode string
+
+	// ctx is cancelled when the run is interrupted; every per-item loop checks it. See SetContext.
+	ctx context.Context
 }
 
 // Modes for Importer.deletedUserMode. They mirror the matrix.import.deleted_user_mode config
@@ -106,6 +110,28 @@ func (i *Importer) HistoryJoins() []HistoryMembership {
 // NewImporter creates a new importer
 func NewImporter(client *Client) *Importer {
 	return &Importer{client: client, passwordPolicy: DefaultPasswordPolicy(), deletedUserMode: DeletedUserModeDeactivated}
+}
+
+// SetContext installs the context whose cancellation interrupts the import. Each per-item
+// loop checks it before starting the next item and stops cleanly, so the item in flight is
+// finished and recorded, and the function's own cleanup and summary still run.
+func (i *Importer) SetContext(ctx context.Context) {
+	i.ctx = ctx
+}
+
+// isInterrupted reports whether the context installed with SetContext has been cancelled.
+func (i *Importer) isInterrupted() bool {
+	return i.ctx != nil && i.ctx.Err() != nil
+}
+
+// stopForInterrupt is the check at the top of every per-item loop: it reports whether the run
+// has been interrupted and, if so, logs how far the loop got.
+func (i *Importer) stopForInterrupt(what string, done, total int) bool {
+	if !i.isInterrupted() {
+		return false
+	}
+	logger.Warn("Interrupted: %s stopped after %d of %d", what, done, total)
+	return true
 }
 
 // SetDeletedUserMode controls how Mattermost accounts with delete_at > 0 are represented.
@@ -338,6 +364,9 @@ func (i *Importer) ImportUsers(users []mattermost.User, existingMapping map[stri
 	logger.Info("Existing mappings copied: %d entries", len(existingMapping))
 
 	for idx, user := range users {
+		if i.stopForInterrupt("user import", idx, total) {
+			break
+		}
 		logger.Info("Processing user %d/%d: %s (ID: %s)", idx+1, total, user.Username, user.ID)
 
 		if progress != nil {
@@ -539,6 +568,9 @@ func (i *Importer) ImportTeamsAsSpaces(teams []mattermost.Team, existingMapping 
 	}
 
 	for idx, team := range teams {
+		if i.stopForInterrupt("space import", idx, total) {
+			break
+		}
 		if progress != nil {
 			progress("spaces", idx+1, total, team.DisplayName)
 		}
@@ -710,6 +742,9 @@ func (i *Importer) ImportChannelsAsRooms(channels []mattermost.Channel, existing
 	}
 
 	for idx, channel := range channels {
+		if i.stopForInterrupt("room import", idx, total) {
+			break
+		}
 		if progress != nil {
 			progress("rooms", idx+1, total, channel.DisplayName)
 		}
@@ -836,6 +871,9 @@ func (i *Importer) ApplyTeamMemberships(
 	logger.Info("Starting team membership import: %d memberships to process", total)
 
 	for idx, membership := range memberships {
+		if i.stopForInterrupt("team membership import", idx, total) {
+			break
+		}
 		if progress != nil {
 			progress("team_memberships", idx+1, total, "")
 		}
@@ -1055,6 +1093,9 @@ func (i *Importer) ApplyChannelMemberships(
 	logger.Info("Starting channel membership import: %d memberships to process (%d DM channels will be skipped)", total, len(directChannelIDs))
 
 	for idx, membership := range memberships {
+		if i.stopForInterrupt("channel membership import", idx, total) {
+			break
+		}
 		if progress != nil {
 			progress("channel_memberships", idx+1, total, "")
 		}
@@ -1438,6 +1479,9 @@ func (i *Importer) ImportDirectChannelsAsDMs(
 	skips := &skipTally{}
 
 	for idx, channel := range directChannels {
+		if i.stopForInterrupt("direct message import", idx, total) {
+			break
+		}
 		if progress != nil {
 			progress("dm_rooms", idx+1, total, channel.ID)
 		}
@@ -1558,6 +1602,9 @@ func (i *Importer) LinkRoomsToSpaces(
 	ensuredSpaceIDs := make(map[string]struct{})
 
 	for idx, channel := range channels {
+		if i.stopForInterrupt("room linking", idx, total) {
+			break
+		}
 		if progress != nil {
 			progress("linking", idx+1, total, channel.DisplayName)
 		}
@@ -2202,6 +2249,9 @@ func (i *Importer) ImportMessagesWithFiles(
 	totalTooLarge := 0
 	var largestTooLargeSize int64
 	for idx, post := range posts {
+		if i.stopForInterrupt("message import", idx, total) {
+			break
+		}
 		// Check if already imported
 		if _, exists := existingMapping[post.ID]; exists {
 			result.Stats.MessagesSkipped++
@@ -2327,15 +2377,22 @@ func (i *Importer) ImportMessagesWithFiles(
 
 	}
 
+	// An interrupted run skips the reaction and pin passes: both are replayed from the saved
+	// mapping when the import is run again.
+	interrupted := i.isInterrupted()
+	if interrupted && (reactionImport != nil || pinImport != nil) {
+		logger.Warn("Interrupted: skipping the reaction and pin passes; they run when the import is resumed")
+	}
+
 	// Reactions come last: an annotation can only point at an event that already exists.
-	if reactionImport != nil && len(reactionImport.Reactions) > 0 {
+	if !interrupted && reactionImport != nil && len(reactionImport.Reactions) > 0 {
 		i.importReactions(result, reactionImport.Reactions, roomByPost, userMapping,
 			reactionImport.AlreadyImported, progress)
 	}
 
 	// Pins come after reactions: the state event names event IDs, so every message it points
 	// at must already have been sent.
-	if pinImport != nil {
+	if !interrupted && pinImport != nil {
 		i.importPins(result, posts, roomByPost, progress)
 	}
 
@@ -2404,6 +2461,9 @@ func (i *Importer) importReactions(
 	tally := &skipTally{}
 
 	for idx, reaction := range reactions {
+		if i.stopForInterrupt("reaction import", idx, total) {
+			break
+		}
 		key := reaction.Key()
 
 		if _, done := alreadyImported[key]; done {
@@ -2514,6 +2574,9 @@ func (i *Importer) EnableEmailNotifications(
 	serverSideMissing := false
 
 	for idx, user := range users {
+		if i.stopForInterrupt("email notification setup", idx, total) {
+			break
+		}
 		if progress != nil {
 			progress("enable_notifications", idx+1, total, user.Username)
 		}
@@ -2590,6 +2653,9 @@ func (i *Importer) LeaveMigratedRooms(roomIDs []string, progress ImportProgressC
 	processed := 0
 
 	for _, roomID := range roomIDs {
+		if i.stopForInterrupt("leaving migrated rooms", processed, total) {
+			break
+		}
 		if roomID == "" {
 			continue
 		}

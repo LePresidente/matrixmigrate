@@ -89,6 +89,10 @@ type Client struct {
 	// roomInfos caches room ID -> creator and room version, looked up when writing power levels
 	roomInfos   map[string]roomInfo
 	roomInfosMu sync.Mutex
+
+	// ctx is cancelled when the run is interrupted. It cuts the client's waits short; it is
+	// deliberately not attached to the HTTP requests themselves - see SetContext.
+	ctx context.Context
 }
 
 // roomInfo is the part of the admin room details needed to write power levels correctly.
@@ -190,6 +194,16 @@ func NewClientWithRateLimit(baseURL, adminToken, homeserver string, rlConfig Rat
 	}
 }
 
+// SetContext installs the context whose cancellation marks the run as interrupted. Call it
+// before issuing requests; without it the client never considers itself interrupted.
+//
+// Cancellation only shortens waits. A request waiting to retry gives up with the context's
+// error, and a request waiting for its rate-limit slot is sent at once - so the cleanup an
+// interrupted step still performs (leaving rooms, withdrawing memberships) keeps working.
+func (c *Client) SetContext(ctx context.Context) {
+	c.ctx = ctx
+}
+
 // SetHomeserver updates the homeserver domain
 func (c *Client) SetHomeserver(homeserver string) {
 	c.homeserver = homeserver
@@ -256,93 +270,54 @@ func (c *Client) doRequest(method, endpoint string, body interface{}) ([]byte, i
 	return c.doRequestWithRetry(method, endpoint, body, 0)
 }
 
-// doRequestWithRetry performs an HTTP request with retry logic for rate limiting
+// doRequestWithRetry performs an HTTP request as the admin, with retry logic for rate limiting
 func (c *Client) doRequestWithRetry(method, endpoint string, body interface{}, retryCount int) ([]byte, int, error) {
-	// Rate limiting: ensure minimum time between requests
+	return c.doRequestWithTokenAndRetry(method, endpoint, body, c.adminToken, retryCount)
+}
+
+// interruptContext returns the context installed with SetContext, or one that is never
+// cancelled when there is none.
+func (c *Client) interruptContext() context.Context {
+	if c.ctx == nil {
+		return context.Background()
+	}
+	return c.ctx
+}
+
+// waitForRateLimitSlot blocks until the minimum gap since the previous request has passed.
+// An interrupt ends the wait at once and the request is still sent: the calls made after an
+// interrupt are the cleanup that has to happen anyway.
+func (c *Client) waitForRateLimitSlot() {
 	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.rateLimit > 0 {
-		elapsed := time.Since(c.lastRequest)
-		if elapsed < c.rateLimit {
-			sleepTime := c.rateLimit - elapsed
-			time.Sleep(sleepTime)
+		if wait := c.rateLimit - time.Since(c.lastRequest); wait > 0 {
+			_ = sleepUnlessDone(c.interruptContext(), wait)
 		}
 	}
 	c.lastRequest = time.Now()
-	c.mu.Unlock()
+}
 
-	var reqBody io.Reader
-	if body != nil {
-		jsonBody, err := json.Marshal(body)
-		if err != nil {
-			return nil, 0, fmt.Errorf("failed to marshal request body: %w", err)
-		}
-		reqBody = bytes.NewReader(jsonBody)
+// waitBeforeRetry sleeps for d before a retry. It returns the context's error instead if the
+// run is interrupted first, so a request does not sit out a long backoff only to be retried
+// after the user asked to stop.
+func (c *Client) waitBeforeRetry(d time.Duration) error {
+	return sleepUnlessDone(c.interruptContext(), d)
+}
+
+// sleepUnlessDone sleeps for d, returning early with ctx's error if ctx is done first.
+func sleepUnlessDone(ctx context.Context, d time.Duration) error {
+	if err := ctx.Err(); err != nil {
+		return err
 	}
-
-	reqURL := c.baseURL + endpoint
-	req, err := http.NewRequest(method, reqURL, reqBody)
-	if err != nil {
-		return nil, 0, fmt.Errorf("failed to create request: %w", err)
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
-
-	req.Header.Set("Authorization", "Bearer "+c.adminToken)
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		if shouldRetryRequestErr(err) && isNonIdempotent(method, endpoint) {
-			logger.Warn("Request transport error on %s; not retrying (room may have been created): %v", endpoint, err)
-			return nil, 0, fmt.Errorf("%w: %v", ErrCreateRoomTimeout, err)
-		}
-		if shouldRetryRequestErr(err) && retryCount < c.maxRetries {
-			retryAfter := retryDelay(c.retryBaseDelay, retryCount)
-			logger.Warn("Request transport error, retrying in %v (%d/%d): %v", retryAfter, retryCount+1, c.maxRetries, err)
-			time.Sleep(retryAfter)
-			return c.doRequestWithRetry(method, endpoint, body, retryCount+1)
-		}
-		return nil, 0, fmt.Errorf("request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, resp.StatusCode, fmt.Errorf("failed to read response body: %w", err)
-	}
-
-	// Handle rate limiting (429) with exponential backoff
-	if resp.StatusCode == http.StatusTooManyRequests {
-		if retryCount >= c.maxRetries {
-			return nil, resp.StatusCode, fmt.Errorf("rate limit exceeded after %d retries", c.maxRetries)
-		}
-
-		// Try to use Retry-After header if present
-		var retryAfter time.Duration
-		if retryAfterStr := resp.Header.Get("Retry-After"); retryAfterStr != "" {
-			// Retry-After can be in seconds (integer) or HTTP-date format
-			if seconds, err := strconv.Atoi(retryAfterStr); err == nil {
-				retryAfter = time.Duration(seconds) * time.Second
-			}
-		}
-
-		// If no Retry-After header, use exponential backoff
-		if retryAfter == 0 {
-			// Exponential backoff: base * 2^retryCount (e.g., 2s, 4s, 8s, 16s, 32s)
-			retryAfter = c.retryBaseDelay * time.Duration(1<<uint(retryCount))
-		}
-
-		// Cap the delay at 60 seconds
-		if retryAfter > 60*time.Second {
-			retryAfter = 60 * time.Second
-		}
-
-		logger.Warn("Rate limit hit (429), waiting %v before retry %d/%d", retryAfter, retryCount+1, c.maxRetries)
-		time.Sleep(retryAfter)
-
-		// Retry
-		return c.doRequestWithRetry(method, endpoint, body, retryCount+1)
-	}
-
-	return respBody, resp.StatusCode, nil
 }
 
 // WhoAmI returns the current user ID for the admin token
@@ -2246,19 +2221,11 @@ func (c *Client) doRequestWithToken(method, endpoint string, body interface{}, t
 	return c.doRequestWithTokenAndRetry(method, endpoint, body, token, 0)
 }
 
-// doRequestWithTokenAndRetry performs an HTTP request with retry logic
+// doRequestWithTokenAndRetry performs an HTTP request with rate limiting and retry logic.
+// Transport errors and 429 responses are retried with backoff unless the run is interrupted
+// while waiting, in which case the error wraps the context's error.
 func (c *Client) doRequestWithTokenAndRetry(method, endpoint string, body interface{}, token string, retryCount int) ([]byte, int, error) {
-	// Rate limiting
-	c.mu.Lock()
-	if c.rateLimit > 0 {
-		elapsed := time.Since(c.lastRequest)
-		if elapsed < c.rateLimit {
-			sleepTime := c.rateLimit - elapsed
-			time.Sleep(sleepTime)
-		}
-	}
-	c.lastRequest = time.Now()
-	c.mu.Unlock()
+	c.waitForRateLimitSlot()
 
 	var reqBody io.Reader
 	if body != nil {
@@ -2287,7 +2254,9 @@ func (c *Client) doRequestWithTokenAndRetry(method, endpoint string, body interf
 		if shouldRetryRequestErr(err) && retryCount < c.maxRetries {
 			retryAfter := retryDelay(c.retryBaseDelay, retryCount)
 			logger.Warn("Request transport error, retrying in %v (%d/%d): %v", retryAfter, retryCount+1, c.maxRetries, err)
-			time.Sleep(retryAfter)
+			if werr := c.waitBeforeRetry(retryAfter); werr != nil {
+				return nil, 0, fmt.Errorf("request failed (%v); retry abandoned: %w", err, werr)
+			}
 			return c.doRequestWithTokenAndRetry(method, endpoint, body, token, retryCount+1)
 		}
 		return nil, 0, fmt.Errorf("request failed: %w", err)
@@ -2305,6 +2274,7 @@ func (c *Client) doRequestWithTokenAndRetry(method, endpoint string, body interf
 			return nil, resp.StatusCode, fmt.Errorf("rate limit exceeded after %d retries", c.maxRetries)
 		}
 
+		// Retry-After can be in seconds (integer) or HTTP-date format; only seconds are used.
 		var retryAfter time.Duration
 		if retryAfterStr := resp.Header.Get("Retry-After"); retryAfterStr != "" {
 			if seconds, err := strconv.Atoi(retryAfterStr); err == nil {
@@ -2312,6 +2282,7 @@ func (c *Client) doRequestWithTokenAndRetry(method, endpoint string, body interf
 			}
 		}
 
+		// Without a Retry-After header, back off exponentially: base * 2^retryCount.
 		if retryAfter == 0 {
 			retryAfter = c.retryBaseDelay * time.Duration(1<<uint(retryCount))
 		}
@@ -2321,7 +2292,9 @@ func (c *Client) doRequestWithTokenAndRetry(method, endpoint string, body interf
 		}
 
 		logger.Warn("Rate limit hit (429), waiting %v before retry %d/%d", retryAfter, retryCount+1, c.maxRetries)
-		time.Sleep(retryAfter)
+		if werr := c.waitBeforeRetry(retryAfter); werr != nil {
+			return nil, resp.StatusCode, fmt.Errorf("rate limited (429); retry abandoned: %w", werr)
+		}
 
 		return c.doRequestWithTokenAndRetry(method, endpoint, body, token, retryCount+1)
 	}
@@ -2413,16 +2386,7 @@ type UploadMediaResponse struct {
 func (c *Client) UploadMedia(data []byte, filename, contentType string) (*UploadMediaResponse, error) {
 	endpoint := fmt.Sprintf("/_matrix/media/v3/upload?filename=%s", url.QueryEscape(filename))
 
-	// Rate limiting
-	c.mu.Lock()
-	if c.rateLimit > 0 {
-		elapsed := time.Since(c.lastRequest)
-		if elapsed < c.rateLimit {
-			time.Sleep(c.rateLimit - elapsed)
-		}
-	}
-	c.lastRequest = time.Now()
-	c.mu.Unlock()
+	c.waitForRateLimitSlot()
 
 	reqURL := c.baseURL + endpoint
 	req, err := http.NewRequest("POST", reqURL, bytes.NewReader(data))

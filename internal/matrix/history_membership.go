@@ -96,7 +96,10 @@ func (i *Importer) ensureHistoryAuthorsJoined(
 
 	var joined []HistoryMembership
 	failed := 0
-	for _, roomID := range rooms {
+	for idx, roomID := range rooms {
+		if i.stopForInterrupt("past-author membership", idx, len(rooms)) {
+			break
+		}
 		current, err := i.client.roomMemberIDs(roomID)
 		if err != nil {
 			// Better to attempt the joins than to skip the room: ForceJoinUser is idempotent,
