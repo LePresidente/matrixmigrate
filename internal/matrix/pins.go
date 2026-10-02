@@ -179,7 +179,8 @@ func (c *Client) readRoomPins(roomID string) ([]string, *pinRoomView, error) {
 // The admin writes when the room's state shows it joined with the power to pin. Otherwise the
 // Application Service writes as a joined local member who has that power. Only when neither
 // can work — no AS token, or every candidate refused — is the admin joined to the room and
-// made to write, which is what a deployment without an AS token has always done.
+// made to write, which is what a deployment without an AS token has always done. That last
+// step is skipped when the admin was already in the room and refused: joining changes nothing.
 //
 // adminID is the admin's own user ID, "" when it is not known; the admin is then never
 // assumed to be in the room.
@@ -189,14 +190,15 @@ func (c *Client) writeRoomPins(roomID string, eventIDs []string, view *pinRoomVi
 	}
 
 	required := requiredPinPowerLevel(view.levels)
+	var adminErr error
 	if adminCanPin(*view, adminID, required) {
 		endpoint := fmt.Sprintf("/_matrix/client/v3/rooms/%s/state/%s",
 			url.PathEscape(roomID), EventTypePinnedEvents)
-		err := c.putPinnedEvents(endpoint, eventIDs, "")
-		if err == nil || !isPinRefusal(err) {
-			return err
+		adminErr = c.putPinnedEvents(endpoint, eventIDs, "")
+		if adminErr == nil || !isPinRefusal(adminErr) {
+			return adminErr
 		}
-		logger.Debug("writeRoomPins: admin refused in room=%s (%v); trying the Application Service", roomID, err)
+		logger.Debug("writeRoomPins: admin refused in room=%s (%v); trying the Application Service", roomID, adminErr)
 	}
 
 	var asErr error
@@ -208,10 +210,17 @@ func (c *Client) writeRoomPins(roomID string, eventIDs []string, view *pinRoomVi
 				return asErr
 			}
 		}
-		logger.Debug("writeRoomPins: no joined member could pin in room=%s (candidates %v, last error %v); joining the admin",
+		logger.Debug("writeRoomPins: no joined member could pin in room=%s (candidates %v, last error %v)",
 			roomID, candidates, asErr)
 	}
 
+	// An admin that is already in the room and was refused gains nothing from joining it.
+	if adminErr != nil {
+		if asErr != nil {
+			return fmt.Errorf("%w (application service attempt: %v)", adminErr, asErr)
+		}
+		return adminErr
+	}
 	err := c.setPinnedEvents(roomID, eventIDs)
 	if err != nil && asErr != nil {
 		return fmt.Errorf("%w (application service attempt: %v)", err, asErr)

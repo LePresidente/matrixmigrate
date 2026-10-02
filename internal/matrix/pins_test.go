@@ -632,3 +632,23 @@ func TestNewPinCountIgnoresDuplicatesAndExistingPins(t *testing.T) {
 		t.Fatalf("newPinCount = %d, want 2 ($c and $d)", got)
 	}
 }
+
+func TestImportPinsDoesNotRejoinAnAdminThatWasRefusedInTheRoom(t *testing.T) {
+	// The state says the admin may pin, the server says otherwise (a stale read, a server
+	// rule). It is already in the room, so joining and writing again would only be refused
+	// again.
+	state := pinRoomState(pinTestAdmin,
+		map[string]any{"users": map[string]any{pinTestAdmin: 100}},
+		[]string{pinTestAdmin}, nil)
+	f, c := newFakePinServer(t, state)
+	f.refuse[""] = refusal{http.StatusForbidden, "M_FORBIDDEN"}
+
+	result := runPinPass(c)
+
+	if result.Stats.PinsFailed != 1 {
+		t.Fatalf("stats = %+v, want the room counted as failed", result.Stats)
+	}
+	if f.joins != 0 || len(f.attempts) != 1 {
+		t.Fatalf("joins = %d, attempts = %q; want no join and a single admin write", f.joins, f.attempts)
+	}
+}
