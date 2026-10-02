@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net/http"
 	"strings"
 	"time"
@@ -645,23 +646,36 @@ func (o *Orchestrator) ExportAssets(progress ProgressCallback) (*OperationResult
 
 // loadExistingAssetMappings returns the union of the mapping file recorded in state (may be
 // empty) and the newest asset-mapping file in dir, the newer one winning on conflict. It
-// returns nil when neither can be loaded.
-func loadExistingAssetMappings(recordedFile, dir string) *matrix.ExistingMappings {
+// returns nil when there is neither. A file that exists but cannot be loaded is an error naming
+// it: importing as if nothing had been created would create every space and room again.
+func loadExistingAssetMappings(recordedFile, dir string) (*matrix.ExistingMappings, error) {
 	var sources []*Mapping
 	recorded := ""
 	if recordedFile != "" {
-		if m, err := LoadMapping(recordedFile); err == nil {
+		m, err := LoadMapping(recordedFile)
+		switch {
+		case err == nil:
 			sources = append(sources, m)
 			recorded = recordedFile
+		case errors.Is(err, fs.ErrNotExist):
+			logger.Warn("Asset mapping %s recorded in state no longer exists; using the newest mapping on disk", recordedFile)
+		default:
+			return nil, fmt.Errorf("cannot load asset mapping %s: %w (repair or restore the file; importing without it would create every space and room again)", recordedFile, err)
 		}
 	}
-	if latest, _ := GetLatestMappingFile(dir); latest != "" && latest != recorded {
-		if m, err := LoadMapping(latest); err == nil {
-			sources = append(sources, m)
+	latest, err := GetLatestMappingFile(dir)
+	if err != nil {
+		return nil, fmt.Errorf("cannot look for asset mappings in %s: %w", dir, err)
+	}
+	if latest != "" && latest != recorded {
+		m, err := LoadMapping(latest)
+		if err != nil {
+			return nil, fmt.Errorf("cannot load asset mapping %s: %w (repair or restore the file; importing without it would create every space and room again)", latest, err)
 		}
+		sources = append(sources, m)
 	}
 	if len(sources) == 0 {
-		return nil
+		return nil, nil
 	}
 	out := &matrix.ExistingMappings{
 		Users:  make(map[string]string),
@@ -679,7 +693,7 @@ func loadExistingAssetMappings(recordedFile, dir string) *matrix.ExistingMapping
 			out.Rooms[k] = v
 		}
 	}
-	return out
+	return out, nil
 }
 
 // ImportAssets imports assets to Matrix
@@ -730,7 +744,12 @@ func (o *Orchestrator) ImportAssets(progress ProgressCallback) (*OperationResult
 	// Existing mappings let a re-run skip what was already created: the union of the file the
 	// last completed run recorded and the newest mapping on disk, which may be a checkpoint
 	// from an interrupted run that never reached the state file.
-	existingMappings := loadExistingAssetMappings(o.state.GetStepOutputFile(StepImportAssets), o.config.Data.MappingsDir)
+	existingMappings, err := loadExistingAssetMappings(o.state.GetStepOutputFile(StepImportAssets), o.config.Data.MappingsDir)
+	if err != nil {
+		o.state.FailStep(StepImportAssets, err)
+		o.SaveState()
+		return nil, err
+	}
 
 	// One file name for the whole run: the checkpoints and the final save all write it, so a
 	// crash leaves the latest state in the newest asset-mapping file.
@@ -1654,7 +1673,13 @@ func (o *Orchestrator) ImportMessages(progress matrix.MessageImportCallback) (*I
 	logger.Info("Loaded asset mapping: %d rooms, %d users", len(assetMapping.Channels), len(assetMapping.Users))
 
 	// Load or create message mapping for resume support
-	msgMappingFile, _ := GetLatestMessageMappingFile(o.config.Data.MappingsDir)
+	msgMappingFile, err := GetLatestMessageMappingFile(o.config.Data.MappingsDir)
+	if err != nil {
+		err = fmt.Errorf("cannot look for an existing message mapping: %w", err)
+		o.state.FailStep(StepImportMessages, err)
+		o.SaveState()
+		return nil, err
+	}
 	msgMapping, err := loadOrCreateMessageMapping(msgMappingFile, o.config.Matrix.Homeserver)
 	if err != nil {
 		o.state.FailStep(StepImportMessages, err)
@@ -1848,7 +1873,7 @@ func (o *Orchestrator) ImportMessages(progress matrix.MessageImportCallback) (*I
 
 	mappingErr := SaveMessageMapping(msgMapping, mappingFile)
 	if mappingErr != nil {
-		logger.Warn("Failed to save message mapping: %v", mappingErr)
+		logger.Error("Failed to save message mapping to %s: %v", mappingFile, mappingErr)
 	} else {
 		logger.Info("Message mapping saved to %s", mappingFile)
 	}
@@ -1880,6 +1905,13 @@ func (o *Orchestrator) ImportMessages(progress matrix.MessageImportCallback) (*I
 		}
 		return nil, o.failInterrupted(StepImportMessages,
 			fmt.Errorf("message import %w: progress saved to %s (%d messages); run the same command again to resume", ErrInterrupted, mappingFile, len(msgMapping.Messages)))
+	}
+
+	if mappingErr != nil {
+		err := messageMappingSaveFailure(mappingFile, mappingErr)
+		o.state.FailStep(StepImportMessages, err)
+		o.SaveState()
+		return nil, err
 	}
 
 	logger.Success("Message import completed successfully")
@@ -1930,4 +1962,10 @@ func attachmentReader(asUser, withSudo func(string) ([]byte, error), useSudo boo
 		}
 		return data, nil
 	}
+}
+
+// messageMappingSaveFailure is the error for a final message-mapping save that failed. The
+// file is replaced atomically, so it still holds the newest checkpoint written to it.
+func messageMappingSaveFailure(mappingFile string, err error) error {
+	return fmt.Errorf("could not write the message mapping to %s: %w; the newest checkpoint in that file (if one was written) is the last good record, so a re-run sends again what was sent after it", mappingFile, err)
 }

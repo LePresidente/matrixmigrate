@@ -42,7 +42,10 @@ func TestLoadExistingAssetMappingsPrefersNewerFile(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got := loadExistingAssetMappings(oldFile, dir)
+	got, err := loadExistingAssetMappings(oldFile, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if got == nil {
 		t.Fatal("no mappings loaded")
 	}
@@ -56,8 +59,12 @@ func TestLoadExistingAssetMappingsPrefersNewerFile(t *testing.T) {
 		t.Errorf("spaces=%v rooms=%v, want both sources merged", got.Spaces, got.Rooms)
 	}
 
-	if loadExistingAssetMappings("", t.TempDir()) != nil {
-		t.Error("no sources should give nil")
+	if got, err := loadExistingAssetMappings("", t.TempDir()); got != nil || err != nil {
+		t.Errorf("no sources should give nil and no error, got %v, %v", got, err)
+	}
+	// A recorded file that has since been removed is not an error: there is nothing to lose.
+	if _, err := loadExistingAssetMappings(filepath.Join(dir, "gone.json"), dir); err != nil {
+		t.Errorf("missing recorded file: %v", err)
 	}
 }
 
@@ -145,5 +152,86 @@ func TestGetLatestMappingFilePicksByName(t *testing.T) {
 
 	if got, err := GetLatestMappingFile(t.TempDir()); got != "" || err != nil {
 		t.Errorf("empty dir: got %q, %v; want no file and no error", got, err)
+	}
+}
+
+// A mapping file that exists but cannot be read must stop the import: starting from nothing
+// would create every space, alias-less room and DM a second time.
+func TestLoadExistingAssetMappingsCorruptFileIsAnError(t *testing.T) {
+	for _, which := range []string{"recorded", "newest"} {
+		t.Run(which, func(t *testing.T) {
+			dir := t.TempDir()
+			good := filepath.Join(dir, "asset-mapping-20260101-120000.json")
+			if err := SaveMapping(NewMapping("example.com"), good); err != nil {
+				t.Fatal(err)
+			}
+			corrupt := filepath.Join(dir, "asset-mapping-20260102-120000.json")
+			if err := os.WriteFile(corrupt, []byte(`{"users": `), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			recorded := good
+			if which == "recorded" {
+				recorded = corrupt
+			}
+			got, err := loadExistingAssetMappings(recorded, dir)
+			if err == nil || !strings.Contains(err.Error(), corrupt) {
+				t.Errorf("got %v, %v; want an error naming %s", got, err, corrupt)
+			}
+		})
+	}
+}
+
+func TestImportAssetsStopsOnCorruptMapping(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &config.Config{}
+	cfg.Data = config.DataConfig{
+		AssetsDir:   filepath.Join(dir, "assets"),
+		MappingsDir: filepath.Join(dir, "mappings"),
+		StateFile:   filepath.Join(dir, "state.json"),
+	}
+	cfg.Matrix.Homeserver = "example.com"
+	for _, d := range []string{cfg.Data.AssetsDir, cfg.Data.MappingsDir} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	assetFile := filepath.Join(cfg.Data.AssetsDir, "mattermost-assets-1.json.gz")
+	assets := &mattermost.Assets{
+		Users:    []mattermost.User{{ID: "u1", Username: "alice"}},
+		Teams:    []mattermost.Team{{ID: "t1", Name: "team", DisplayName: "Team"}},
+		Channels: []mattermost.Channel{{ID: "c1", Name: "one", DisplayName: "One", Type: "O"}},
+	}
+	if err := archive.SaveGzipJSON(assetFile, assets); err != nil {
+		t.Fatal(err)
+	}
+	corrupt := filepath.Join(cfg.Data.MappingsDir, "asset-mapping-20260101-120000.json")
+	if err := os.WriteFile(corrupt, []byte("not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	state := NewMigrationState()
+	state.CompleteStep(StepExportAssets, assetFile)
+
+	requests := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	o := &Orchestrator{
+		config:        cfg,
+		state:         state,
+		tunnelManager: ssh.NewTunnelManager(),
+		mxClient:      matrix.NewClientWithRateLimit(srv.URL, "admin-token", "example.com", matrix.RateLimitConfig{}),
+	}
+	_, err := o.ImportAssets(nil)
+	if err == nil || !strings.Contains(err.Error(), corrupt) {
+		t.Fatalf("err = %v, want one naming %s", err, corrupt)
+	}
+	if requests != 0 {
+		t.Errorf("%d requests reached the homeserver, want none", requests)
+	}
+	if step := state.GetStep(StepImportAssets); step.Status != StatusFailed {
+		t.Errorf("step status = %s, want failed", step.Status)
 	}
 }
