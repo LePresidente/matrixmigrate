@@ -102,3 +102,18 @@ func TestResolveDBSSLModeIgnoresInvalidDiscovered(t *testing.T) {
 		t.Errorf("valid discovered value must be used, got %q", got)
 	}
 }
+
+// Direct mode uses base_url whether or not matrix.homeserver is set (it can be detected), so
+// the cleartext check must not depend on it.
+func TestValidateChecksBaseURLWithoutHomeserver(t *testing.T) {
+	c := &Config{}
+	c.Matrix.API.BaseURL = "http://example.com:8008"
+	err := c.Validate()
+	if err == nil || !strings.Contains(err.Error(), "matrix.api.base_url") {
+		t.Fatalf("expected a matrix.api.base_url error, got %v", err)
+	}
+	c.Matrix.AllowInsecureHTTP = true
+	if err := c.Validate(); err != nil {
+		t.Errorf("allow_insecure_http should disable the check: %v", err)
+	}
+}

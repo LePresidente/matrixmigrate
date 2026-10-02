@@ -506,12 +506,13 @@ func (c *Config) Validate() error {
 		if !hasAuth && !hasToken {
 			return fmt.Errorf("matrix: either auth (username/password_env) or api.admin_token_env is required")
 		}
-		// Direct mode only: over an SSH tunnel base_url is unused.
-		if c.Matrix.SSH.Host == "" && !c.Matrix.AllowInsecureHTTP && isCleartextRemoteHTTP(c.Matrix.API.BaseURL) {
-			return insecureHTTPError("matrix.api.base_url")
-		}
 	} else if c.Matrix.SSH.Host != "" {
 		return fmt.Errorf("matrix.homeserver is required")
+	}
+	// Direct mode only: over an SSH tunnel base_url is unused. Checked whether or not a
+	// homeserver is configured, since direct mode uses base_url either way.
+	if c.Matrix.SSH.Host == "" && !c.Matrix.AllowInsecureHTTP && isCleartextRemoteHTTP(c.Matrix.API.BaseURL) {
+		return insecureHTTPError("matrix.api.base_url")
 	}
 
 	// Validate public_room_join_rules
