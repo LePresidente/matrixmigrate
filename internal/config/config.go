@@ -2,6 +2,8 @@ package config
 
 import (
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -69,6 +71,11 @@ type MatrixConfig struct {
 	AppService AppServiceConfig `mapstructure:"appservice"` // Application Service for message import
 	MAS        MASConfig        `mapstructure:"mas"`        // Matrix Authentication Service for user creation
 	Import     ImportConfig     `mapstructure:"import"`     // Room/space import options (owner and alias)
+
+	// AllowInsecureHTTP permits http:// to a non-loopback host for matrix.api.base_url and
+	// matrix.mas.endpoint. Tokens and passwords are sent to those endpoints, so the default
+	// is to refuse.
+	AllowInsecureHTTP bool `mapstructure:"allow_insecure_http"`
 }
 
 // ImportConfig holds options for importing rooms and spaces from Mattermost
@@ -232,13 +239,43 @@ func ResolveDBSSLMode(configured, discovered, host string) string {
 	if configured != "" {
 		return configured
 	}
-	if discovered != "" {
+	// The discovered value comes from Mattermost's DataSource string and ends up in the DSN,
+	// so only a mode lib/pq accepts may pass through.
+	if isValidDBSSLMode(discovered) {
 		return discovered
 	}
 	if isLocalDBHost(host) {
 		return DBSSLModeDisable
 	}
 	return DBSSLModeRequire
+}
+
+func isValidDBSSLMode(m string) bool {
+	switch m {
+	case DBSSLModeDisable, DBSSLModeRequire, DBSSLModeVerifyCA, DBSSLModeVerifyFull:
+		return true
+	}
+	return false
+}
+
+// isCleartextRemoteHTTP reports whether rawURL is http:// to a host that is not loopback.
+func isCleartextRemoteHTTP(rawURL string) bool {
+	u, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil || !strings.EqualFold(u.Scheme, "http") {
+		return false
+	}
+	host := u.Hostname()
+	if strings.EqualFold(host, "localhost") {
+		return false
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		return false
+	}
+	return true
+}
+
+func insecureHTTPError(key string) error {
+	return fmt.Errorf("%s uses http:// to a non-loopback host, so tokens and passwords would cross the network unencrypted; use https:// or set matrix.allow_insecure_http: true", key)
 }
 
 // isLocalDBHost reports whether a connection to host stays on this machine. lib/pq treats a
@@ -340,6 +377,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("mattermost.database.port", 5432)
 	v.SetDefault("mattermost.files.fallback_to_link_on_upload_failure", false)
 	v.SetDefault("mattermost.files.read_with_sudo", false)
+	v.SetDefault("matrix.allow_insecure_http", false)
 	v.SetDefault("matrix.ssh.port", 22)
 	v.SetDefault("matrix.api.base_url", "http://localhost:8008")
 	v.SetDefault("matrix.api.port", 8008) // Synapse API port for SSH tunnel
@@ -468,6 +506,10 @@ func (c *Config) Validate() error {
 		if !hasAuth && !hasToken {
 			return fmt.Errorf("matrix: either auth (username/password_env) or api.admin_token_env is required")
 		}
+		// Direct mode only: over an SSH tunnel base_url is unused.
+		if c.Matrix.SSH.Host == "" && !c.Matrix.AllowInsecureHTTP && isCleartextRemoteHTTP(c.Matrix.API.BaseURL) {
+			return insecureHTTPError("matrix.api.base_url")
+		}
 	} else if c.Matrix.SSH.Host != "" {
 		return fmt.Errorf("matrix.homeserver is required")
 	}
@@ -535,6 +577,9 @@ func (c *Config) Validate() error {
 	if c.Matrix.MAS.Enabled {
 		if c.Matrix.MAS.Endpoint == "" {
 			return fmt.Errorf("matrix.mas.endpoint is required when mas is enabled")
+		}
+		if !c.Matrix.AllowInsecureHTTP && isCleartextRemoteHTTP(c.Matrix.MAS.Endpoint) {
+			return insecureHTTPError("matrix.mas.endpoint")
 		}
 		if c.Matrix.MAS.ClientIDEnv == "" || c.Matrix.MAS.ClientSecretEnv == "" {
 			return fmt.Errorf("matrix.mas.client_id_env and matrix.mas.client_secret_env are required when mas is enabled")

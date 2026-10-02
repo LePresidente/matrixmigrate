@@ -1941,6 +1941,20 @@ type FileConfig struct {
 	MaxUploadSize        int64                             // Max file size for upload
 }
 
+// isSafeAttachmentPath reports whether a Mattermost fileinfo.path may be joined onto the
+// data directory. The path comes from the Mattermost database, so it is not trusted: after
+// trimming one leading "/" it must be non-empty and stay inside the directory it is joined
+// to (no ".." escape, not absolute).
+func isSafeAttachmentPath(p string) bool {
+	rel := strings.TrimPrefix(p, "/")
+	return rel != "" && filepath.IsLocal(filepath.FromSlash(rel))
+}
+
+func recordUnsafeAttachmentPath(result *ImportMessagesResult, file mattermost.FileInfo) {
+	result.Stats.FilesSkipped++
+	result.Errors = append(result.Errors, fmt.Sprintf("Skipped file %s for post %s: unsafe attachment path %q", file.Name, file.PostID, file.Path))
+}
+
 func buildPublicFileURL(baseURL, filePath string) string {
 	base := strings.TrimSuffix(baseURL, "/")
 	rel := strings.TrimPrefix(filePath, "/")
@@ -1973,6 +1987,10 @@ func (i *Importer) sendLinkOrSkip(
 		result.Errors = append(result.Errors, fmt.Sprintf("Skipped file %s for post %s: %s", file.Name, file.PostID, reason))
 		return
 	}
+	if !isSafeAttachmentPath(file.Path) {
+		recordUnsafeAttachmentPath(result, file)
+		return
+	}
 	fileURL := buildPublicFileURL(fileConfig.S3PublicURL, file.Path)
 	var err error
 	if threadRootEventID != "" {
@@ -2001,6 +2019,20 @@ func (i *Importer) importPostFiles(
 	tooLargeCount := 0
 	var maxTooLargeSize int64
 	logger.Debug("importPostFiles: room=%s sender=%s files=%d mode=%s", roomID, senderID, len(files), fileConfig.Mode)
+	rejectTooLarge := func(file mattermost.FileInfo, size int64) {
+		logger.Debug("importPostFiles: file too large id=%s name=%s size=%d max=%d", file.ID, file.Name, size, fileConfig.MaxUploadSize)
+		result.Stats.FilesTooLarge++
+		tooLargeCount++
+		if size > maxTooLargeSize {
+			maxTooLargeSize = size
+		}
+		if fileConfig.UploadFallbackToLink {
+			i.sendLinkOrSkip(result, roomID, file, fileConfig, timestamp, senderID, threadRootEventID, threadLatestEventID, "file exceeds max_upload_size_mb")
+		} else {
+			result.Stats.FilesSkipped++
+			result.Errors = append(result.Errors, fmt.Sprintf("Skipped file %s for post %s: file size %d exceeds max_upload_size_mb (%d bytes)", file.Name, file.PostID, size, fileConfig.MaxUploadSize))
+		}
+	}
 	for _, file := range files {
 		if file.IsDeleted() {
 			logger.Debug("importPostFiles: skipping deleted file id=%s name=%s post=%s", file.ID, file.Name, file.PostID)
@@ -2008,18 +2040,7 @@ func (i *Importer) importPostFiles(
 			continue
 		}
 		if file.Size > fileConfig.MaxUploadSize {
-			logger.Debug("importPostFiles: file too large id=%s name=%s size=%d max=%d", file.ID, file.Name, file.Size, fileConfig.MaxUploadSize)
-			result.Stats.FilesTooLarge++
-			tooLargeCount++
-			if file.Size > maxTooLargeSize {
-				maxTooLargeSize = file.Size
-			}
-			if fileConfig.UploadFallbackToLink {
-				i.sendLinkOrSkip(result, roomID, file, fileConfig, timestamp, senderID, threadRootEventID, threadLatestEventID, "file exceeds max_upload_size_mb")
-			} else {
-				result.Stats.FilesSkipped++
-				result.Errors = append(result.Errors, fmt.Sprintf("Skipped file %s for post %s: file size %d exceeds max_upload_size_mb (%d bytes)", file.Name, file.PostID, file.Size, fileConfig.MaxUploadSize))
-			}
+			rejectTooLarge(file, file.Size)
 			continue
 		}
 		if fileConfig.LocalDataPath == "" {
@@ -2030,6 +2051,11 @@ func (i *Importer) importPostFiles(
 				result.Stats.FilesSkipped++
 				result.Errors = append(result.Errors, fmt.Sprintf("Skipped file %s for post %s: mattermost.files.local_data_path is empty", file.Name, file.PostID))
 			}
+			continue
+		}
+		if !isSafeAttachmentPath(file.Path) {
+			logger.Debug("importPostFiles: unsafe attachment path id=%s name=%s path=%q", file.ID, file.Name, file.Path)
+			recordUnsafeAttachmentPath(result, file)
 			continue
 		}
 		localPath := resolveLocalMattermostPath(fileConfig.LocalDataPath, file.Path)
@@ -2048,6 +2074,10 @@ func (i *Importer) importPostFiles(
 				result.Stats.FilesSkipped++
 				result.Errors = append(result.Errors, fmt.Sprintf("Skipped file %s for post %s: cannot read attachment bytes from %s: %v", file.Name, file.PostID, file.Path, err))
 			}
+			continue
+		}
+		if int64(len(data)) > fileConfig.MaxUploadSize {
+			rejectTooLarge(file, int64(len(data)))
 			continue
 		}
 		mimeType := strings.TrimSpace(file.MimeType)
@@ -2389,6 +2419,10 @@ func (i *Importer) ImportMessagesWithFiles(
 		// Append file links if mode is "link"
 		if fileConfig.Mode == "link" && len(files) > 0 && fileConfig.S3PublicURL != "" {
 			for _, file := range files {
+				if !isSafeAttachmentPath(file.Path) {
+					recordUnsafeAttachmentPath(result, file)
+					continue
+				}
 				fileURL := buildPublicFileURL(fileConfig.S3PublicURL, file.Path)
 				messageContent += fmt.Sprintf("\n\n📎 [%s](%s)", file.Name, fileURL)
 				result.Stats.FilesLinked++

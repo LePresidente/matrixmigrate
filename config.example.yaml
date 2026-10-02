@@ -137,6 +137,11 @@ matrix:
     # host_key_fingerprint: "SHA256:..."        # pin one key (ssh-keygen -lf of the server's ed25519 key)
     # known_hosts_path: "~/.ssh/known_hosts"    # default when unset
   
+  # Matrix API URLs (api.base_url in direct mode, mas.endpoint) must be https:// unless the
+  # host is loopback (localhost, 127.0.0.1, ::1): tokens and passwords are sent to them.
+  # Set true to allow cleartext http:// to a remote host anyway (e.g. a trusted private network).
+  # allow_insecure_http: false
+
   api:
     # After SSH tunnel, API will be available at localhost
     base_url: "http://localhost:8008"
@@ -268,8 +273,8 @@ matrix:
   mas:
     enabled: false
     
-    # MAS API base URL (e.g. http://mas.example.com:8080 or http://localhost:8080 if tunneled)
-    # endpoint: "http://mas.example.com:8080"
+    # MAS API base URL (e.g. https://mas.example.com or http://localhost:8080 if tunneled)
+    # endpoint: "https://mas.example.com"
     
     # OAuth client credentials - must be an admin client in MAS policy.data.admin_clients
     # client_id_env: "MAS_CLIENT_ID"

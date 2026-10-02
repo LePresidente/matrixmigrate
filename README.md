@@ -224,6 +224,14 @@ Under `mattermost.files` in `config.yaml`:
 | `fallback_to_link_on_upload_failure` | `false` | When `mode: "upload"` and an individual upload fails, fall back to linking that file instead of recording an error. Useful for a first pass over a large archive where a handful of files are unreadable. |
 | `read_with_sudo` | `false` | When `mode: "upload"` and an attachment is not under `local_data_path` on this machine, it is read from the Mattermost server over SSH as the SSH user. Set this to `true` to retry with `sudo cat` when that user cannot read it (requires passwordless sudo). Off by default so the migration does not run privileged commands on the Mattermost server unasked. |
 
+### Matrix connection options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `matrix.allow_insecure_http` | `false` | `matrix.api.base_url` (direct mode, no `matrix.ssh`) and `matrix.mas.endpoint` carry admin tokens and passwords, so `http://` to a host other than `localhost`, `127.0.0.1` or `::1` is rejected at startup. Set this to `true` to accept cleartext HTTP to a remote host anyway, for example on a trusted private network. |
+
+Attachment paths read from the Mattermost database must stay inside `local_data_path`; a path that is absolute or contains `..` is skipped and reported as an unsafe attachment path. A file whose real size exceeds `max_upload_size_mb` is treated as too large even if the export recorded a smaller size.
+
 ### Matrix import options
 
 Under `matrix.import` in `config.yaml` you can set:
@@ -822,7 +830,7 @@ matrix:
   # ... ssh, api, auth, homeserver ...
   mas:
     enabled: true
-    endpoint: "http://mas.example.com:8080"   # or http://localhost:8080 if you tunnel MAS
+    endpoint: "https://mas.example.com"   # or http://localhost:8080 if you tunnel MAS
     client_id_env: "MAS_CLIENT_ID"
     client_secret_env: "MAS_CLIENT_SECRET"
 ```
