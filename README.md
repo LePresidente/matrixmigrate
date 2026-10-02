@@ -621,8 +621,13 @@ data:
 - Pruning happens only after the step that writes that kind has completed. A failed or
   interrupted step deletes nothing, so the older files stay available to fall back on.
 - The file the step just wrote is always kept, and only files named
-  `asset-mapping-<timestamp>.json` or `message-mapping-<timestamp>.json` are ever considered:
-  `history-joins.json`, renamed copies and anything else in the directory are left alone.
+  `asset-mapping-<timestamp>.json` or `message-mapping-<timestamp>.json` are ever deleted:
+  `history-joins.json` and anything else in the directory are left alone.
+- Keep your own copies outside `data.mappings_dir`, or give them a name that does not start
+  with `asset-mapping-` or `message-mapping-`. The importer resumes from whichever file sorts
+  last under that prefix, so a copy called `message-mapping-backup.json` would be picked up
+  instead of the newest real mapping. While any file sorts after the one a run just wrote,
+  pruning is skipped and a warning names the file.
 - A file that cannot be deleted is logged as a warning and tried again on the next run.
 
 Exports and logs in `data.assets_dir` are not pruned.

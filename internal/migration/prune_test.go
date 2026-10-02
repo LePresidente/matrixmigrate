@@ -1,6 +1,8 @@
 package migration
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -202,6 +204,94 @@ func TestFailedMessageImportPrunesNothing(t *testing.T) {
 			t.Errorf("%s was removed by a failed step: %v", name, err)
 		}
 	}
+}
+
+// assertAllExist fails the test for every name missing from dir.
+func assertAllExist(t *testing.T, dir string, names ...string) {
+	t.Helper()
+	for _, name := range names {
+		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
+			t.Errorf("%s was removed: %v", name, err)
+		}
+	}
+}
+
+// The next run resumes from the file that sorts last under "message-mapping-*.json". When
+// that is not the file this run wrote - a copy with a non-timestamp name does that - the
+// directory is not in the state pruning assumes, and every file deleted would be a record
+// the operator needs to get back to a correct resume point.
+func TestPruneSkippedWhenARenamedCopySortsAfterTheNewMapping(t *testing.T) {
+	mappingsDir := filepath.Join(t.TempDir(), "mappings")
+	f := newMessageImportFixture(t, mappingsDir, onePost())
+	f.cfg.Data.KeepMappings = 1
+	writeFiles(t, mappingsDir, emptyMessageMapping, oldMessageMappings...)
+	writeFiles(t, mappingsDir, emptyMessageMapping, "message-mapping-backup.json")
+
+	if _, err := f.o.ImportMessages(nil); err != nil {
+		t.Fatal(err)
+	}
+
+	assertAllExist(t, mappingsDir, oldMessageMappings...)
+	assertAllExist(t, mappingsDir, "message-mapping-backup.json")
+}
+
+// Same hazard with a well-formed name: a mapping written while the clock was ahead outranks
+// everything written since, so each real run's output would be the next thing pruned.
+func TestPruneSkippedWhenAnExistingMappingIsDatedAfterTheNewOne(t *testing.T) {
+	mappingsDir := filepath.Join(t.TempDir(), "mappings")
+	f := newMessageImportFixture(t, mappingsDir, onePost())
+	f.cfg.Data.KeepMappings = 1
+	writeFiles(t, mappingsDir, emptyMessageMapping, oldMessageMappings...)
+	writeFiles(t, mappingsDir, emptyMessageMapping, "message-mapping-29990101-000000.json")
+
+	if _, err := f.o.ImportMessages(nil); err != nil {
+		t.Fatal(err)
+	}
+
+	assertAllExist(t, mappingsDir, oldMessageMappings...)
+	assertAllExist(t, mappingsDir, "message-mapping-29990101-000000.json")
+}
+
+func TestInterruptedMessageImportPrunesNothing(t *testing.T) {
+	mappingsDir := filepath.Join(t.TempDir(), "mappings")
+	f := newMessageImportFixture(t, mappingsDir, onePost())
+	f.cfg.Data.KeepMappings = 1
+	writeFiles(t, mappingsDir, emptyMessageMapping, oldMessageMappings...)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	f.o.SetContext(ctx)
+
+	_, err := f.o.ImportMessages(nil)
+	if !errors.Is(err, ErrInterrupted) {
+		t.Fatalf("ImportMessages error = %v, want ErrInterrupted", err)
+	}
+
+	assertAllExist(t, mappingsDir, oldMessageMappings...)
+}
+
+// mappings_dir is a directory, not a pattern: a name with glob characters in it must not make
+// the pruner reach into sibling directories.
+func TestPruneMappingFilesDoesNotTreatTheDirectoryAsAPattern(t *testing.T) {
+	base := t.TempDir()
+	dir := filepath.Join(base, "m[ab]")
+	sibling := filepath.Join(base, "ma")
+	names := []string{"asset-mapping-20240101-010000.json", "asset-mapping-20240102-010000.json"}
+	for _, d := range []string{dir, sibling} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		writeFiles(t, d, "12345", names...)
+	}
+
+	removed, _, failed := pruneMappingFiles(dir, assetMappingKind, 1)
+
+	if removed != 1 || failed != 0 {
+		t.Errorf("removed=%d failed=%d, want 1, 0", removed, failed)
+	}
+	if got := fileNames(t, dir); !reflect.DeepEqual(got, names[1:]) {
+		t.Errorf("files left in the directory = %v, want %v", got, names[1:])
+	}
+	assertAllExist(t, sibling, names...)
 }
 
 func TestImportAssetsPrunesOldAssetMappings(t *testing.T) {

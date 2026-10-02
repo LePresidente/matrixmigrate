@@ -75,10 +75,18 @@ func pruneMappingFiles(dir, kind string, keep int, protected ...string) (removed
 	if keep <= 0 {
 		return 0, 0, 0
 	}
-	paths, err := filepath.Glob(filepath.Join(dir, kind+"-*.json"))
+	// Read the directory rather than glob it: dir is a path, and a glob would read any
+	// "*", "?" or "[" in it as a pattern and reach into sibling directories.
+	entries, err := os.ReadDir(dir)
 	if err != nil {
-		logger.Warn("Could not list %s files in %s for pruning: %v", kind, dir, err)
+		logger.Warn("Could not list %s for pruning: %v", dir, err)
 		return 0, 0, 0
+	}
+	paths := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			paths = append(paths, filepath.Join(dir, entry.Name()))
+		}
 	}
 
 	for _, p := range mappingFilesToPrune(paths, kind, keep, protected...) {
@@ -100,13 +108,30 @@ func pruneMappingFiles(dir, kind string, keep int, protected ...string) (removed
 // pruneMappings applies data.keep_mappings to one kind of mapping file. It is called only
 // once the step that writes that kind has completed, so a failed or interrupted run never
 // deletes the older files an operator would fall back to. current is the file the step just
-// wrote; it is kept whatever its name sorts as.
+// wrote.
+//
+// Nothing is pruned unless current is also the file the next run will resume from - the one
+// that sorts last under "<kind>-*.json", which is how the importer finds it. A copy with a
+// non-timestamp name, or a mapping written while the clock was ahead, sorts after every real
+// run's output. The next run would then resume from that stale file, and the files pruning
+// would remove are exactly the ones needed to get back to a correct resume point.
 func (o *Orchestrator) pruneMappings(kind, current string) {
 	keep := o.config.Data.KeepMappings
 	if keep <= 0 {
 		return
 	}
-	removed, freed, failed := pruneMappingFiles(o.config.Data.MappingsDir, kind, keep, current)
+	dir := o.config.Data.MappingsDir
+	resumeFrom, err := latestFileByName(filepath.Join(dir, kind+"-*.json"))
+	if err != nil {
+		logger.Warn("Not pruning %s files: %v", kind, err)
+		return
+	}
+	if filepath.Base(resumeFrom) != filepath.Base(current) {
+		logger.Warn("Not pruning %s files: %s sorts after %s, the mapping this run wrote, so the next run would resume from it instead. Move or rename it (anything not matching %s-*.json), then pruning resumes",
+			kind, resumeFrom, current, kind)
+		return
+	}
+	removed, freed, failed := pruneMappingFiles(dir, kind, keep, current)
 	if removed == 0 && failed == 0 {
 		return
 	}
