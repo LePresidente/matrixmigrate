@@ -33,6 +33,15 @@ mattermost:
     
     # Option 2: Password authentication
     # password_env: "MM_SSH_PASSWORD"  # Env var containing SSH password
+
+    # Host key verification (protects the SSH password, database credentials and tokens).
+    # Checked in this order; by default the key must already be in ~/.ssh/known_hosts.
+    # First connection: check the fingerprint printed in the error, then add the host with
+    #   ssh-keyscan -p <port> <host> >> ~/.ssh/known_hosts
+    # or set host_key_fingerprint below.
+    # insecure_ignore_host_key: false           # true accepts ANY key - unsafe, logs a warning
+    # host_key_fingerprint: "SHA256:..."        # pin one key (as printed by ssh-keygen -lf)
+    # known_hosts_path: "~/.ssh/known_hosts"    # default when unset
   
   # Path to Mattermost config.json on remote server
   # Database credentials will be read from this file automatically!
@@ -107,6 +116,15 @@ matrix:
     
     # Option 2: Password authentication
     # password_env: "MX_SSH_PASSWORD"  # Env var containing SSH password
+
+    # Host key verification (protects the SSH password, database credentials and tokens).
+    # Checked in this order; by default the key must already be in ~/.ssh/known_hosts.
+    # First connection: check the fingerprint printed in the error, then add the host with
+    #   ssh-keyscan -p <port> <host> >> ~/.ssh/known_hosts
+    # or set host_key_fingerprint below.
+    # insecure_ignore_host_key: false           # true accepts ANY key - unsafe, logs a warning
+    # host_key_fingerprint: "SHA256:..."        # pin one key (as printed by ssh-keygen -lf)
+    # known_hosts_path: "~/.ssh/known_hosts"    # default when unset
   
   api:
     # After SSH tunnel, API will be available at localhost

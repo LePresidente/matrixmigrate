@@ -158,6 +158,44 @@ matrix:
    export MATRIX_ADMIN_PASSWORD="your-admin-password"
    ```
 
+### SSH host key verification
+
+Every SSH connection (database tunnel, Matrix API tunnel, reading `config.json` and
+attachments) verifies the server's host key before sending a password or forwarding
+credentials. Options under `mattermost.ssh` and `matrix.ssh`:
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `known_hosts_path` | `~/.ssh/known_hosts` | OpenSSH `known_hosts` file the host key is checked against. `~` and environment variables are expanded. |
+| `host_key_fingerprint` | — | Pin the server's key instead of using `known_hosts`: the `SHA256:...` value printed by `ssh-keygen -lf`. Only a key with exactly this fingerprint is accepted. |
+| `insecure_ignore_host_key` | `false` | Accept any host key. Anyone on the network path can then impersonate the server and capture the SSH password, the database credentials and the Matrix tokens. A warning naming the host is logged on every connection. Use only on a trusted, isolated network. |
+
+They are checked in this order: `insecure_ignore_host_key`, then `host_key_fingerprint`,
+then `known_hosts_path`.
+
+**First connection.** If the server is not in `known_hosts` yet, the connection fails and
+the error shows the key fingerprint the server presented. Compare it with the fingerprint
+on the server itself (`ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`, run there), then
+either add the host:
+
+```bash
+ssh-keyscan -p 22 mattermost.example.com >> ~/.ssh/known_hosts
+```
+
+or put the fingerprint in the config:
+
+```yaml
+mattermost:
+  ssh:
+    host: "mattermost.example.com"
+    host_key_fingerprint: "SHA256:..."
+```
+
+Connecting once with `ssh -p 22 alice@mattermost.example.com` and accepting the key also
+adds it. If the error instead says the host key does **not** match the known one, do not
+work around it: either the server's key was replaced, or the connection is being
+intercepted. Confirm with the server's administrator before editing `known_hosts`.
+
 ### How It Works
 
 **Mattermost**: The tool connects via SSH and reads `/opt/mattermost/config/config.json` to get database credentials. No manual database configuration needed!
@@ -873,6 +911,7 @@ Use `./matrixmigrate test all` to identify exactly where the connection fails.
 - For key auth: Ensure SSH key is properly configured and has correct permissions
 - For password auth: Check that the password environment variable is set
 - Verify the SSH port is correct (default: 22)
+- Host key errors ("is not in ...known_hosts", "known_hosts file ... does not exist"): see [SSH host key verification](#ssh-host-key-verification)
 
 ### Mattermost Config Not Found
 - Check the `config_path` in your config.yaml

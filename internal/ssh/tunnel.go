@@ -37,23 +37,13 @@ type TunnelConfig struct {
 
 // NewTunnel creates a new SSH tunnel
 func NewTunnel(cfg TunnelConfig) (*Tunnel, error) {
-	// Build auth methods
-	authMethods, err := buildAuthMethods(cfg.SSHConfig, cfg.Passphrase, cfg.Password)
+	sshConfig, err := newClientConfig(cfg.SSHConfig, cfg.Passphrase, cfg.Password, 30*time.Second)
 	if err != nil {
-		return nil, fmt.Errorf("failed to build auth methods: %w", err)
-	}
-
-	// Create SSH client config
-	sshConfig := &ssh.ClientConfig{
-		User:            cfg.SSHConfig.User,
-		Auth:            authMethods,
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(), // TODO: Add proper host key verification
-		Timeout:         30 * time.Second,
+		return nil, err
 	}
 
 	// Connect to SSH server
-	sshAddr := fmt.Sprintf("%s:%d", cfg.SSHConfig.Host, cfg.SSHConfig.Port)
-	client, err := ssh.Dial("tcp", sshAddr, sshConfig)
+	client, err := ssh.Dial("tcp", dialAddress(cfg.SSHConfig), sshConfig)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to SSH server: %w", err)
 	}
@@ -250,23 +240,13 @@ func TestConnection(cfg config.SSHConfig, passphrase string) error {
 
 // TestConnectionWithPassword tests SSH connection with optional password
 func TestConnectionWithPassword(cfg config.SSHConfig, passphrase, password string) error {
-	// Build auth methods
-	authMethods, err := buildAuthMethods(cfg, passphrase, password)
+	sshConfig, err := newClientConfig(cfg, passphrase, password, 10*time.Second)
 	if err != nil {
 		return err
 	}
 
-	// Create SSH client config
-	sshConfig := &ssh.ClientConfig{
-		User:            cfg.User,
-		Auth:            authMethods,
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-		Timeout:         10 * time.Second,
-	}
-
 	// Connect to SSH server
-	sshAddr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
-	client, err := ssh.Dial("tcp", sshAddr, sshConfig)
+	client, err := ssh.Dial("tcp", dialAddress(cfg), sshConfig)
 	if err != nil {
 		return fmt.Errorf("SSH connection failed: %w", err)
 	}

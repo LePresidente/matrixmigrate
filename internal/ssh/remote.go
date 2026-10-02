@@ -23,23 +23,13 @@ func NewRemoteExecutor(cfg config.SSHConfig, passphrase string) (*RemoteExecutor
 
 // NewRemoteExecutorWithPassword creates a new remote executor with optional password auth
 func NewRemoteExecutorWithPassword(cfg config.SSHConfig, passphrase, password string) (*RemoteExecutor, error) {
-	// Build auth methods
-	authMethods, err := buildAuthMethods(cfg, passphrase, password)
+	sshConfig, err := newClientConfig(cfg, passphrase, password, 30*time.Second)
 	if err != nil {
-		return nil, fmt.Errorf("failed to build auth methods: %w", err)
-	}
-
-	// Create SSH client config
-	sshConfig := &ssh.ClientConfig{
-		User:            cfg.User,
-		Auth:            authMethods,
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-		Timeout:         30 * time.Second,
+		return nil, err
 	}
 
 	// Connect to SSH server
-	sshAddr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
-	client, err := ssh.Dial("tcp", sshAddr, sshConfig)
+	client, err := ssh.Dial("tcp", dialAddress(cfg), sshConfig)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to SSH server: %w", err)
 	}

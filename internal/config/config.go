@@ -182,6 +182,12 @@ type SSHConfig struct {
 	KeyPath       string `mapstructure:"key_path"`       // Optional: path to SSH key
 	PassphraseEnv string `mapstructure:"passphrase_env"` // Optional: env var for key passphrase
 	PasswordEnv   string `mapstructure:"password_env"`   // Optional: env var for SSH password
+
+	// Host key verification. Checked in this order: InsecureIgnoreHostKey accepts any key,
+	// HostKeyFingerprint pins one key, otherwise the key must be in KnownHostsPath.
+	KnownHostsPath        string `mapstructure:"known_hosts_path"`         // Empty means ~/.ssh/known_hosts
+	HostKeyFingerprint    string `mapstructure:"host_key_fingerprint"`     // "SHA256:..." as printed by ssh-keygen -lf
+	InsecureIgnoreHostKey bool   `mapstructure:"insecure_ignore_host_key"` // Accept any host key (unsafe)
 }
 
 // DatabaseConfig holds PostgreSQL connection configuration (optional manual override)
@@ -393,6 +399,8 @@ func findOverlookedConfigFile(paths []string) string {
 func (c *Config) expandPaths() {
 	c.Mattermost.SSH.KeyPath = expandPath(c.Mattermost.SSH.KeyPath)
 	c.Matrix.SSH.KeyPath = expandPath(c.Matrix.SSH.KeyPath)
+	c.Mattermost.SSH.KnownHostsPath = expandPath(c.Mattermost.SSH.KnownHostsPath)
+	c.Matrix.SSH.KnownHostsPath = expandPath(c.Matrix.SSH.KnownHostsPath)
 	c.Data.AssetsDir = expandPath(c.Data.AssetsDir)
 	c.Data.MappingsDir = expandPath(c.Data.MappingsDir)
 	c.Data.StateFile = expandPath(c.Data.StateFile)
