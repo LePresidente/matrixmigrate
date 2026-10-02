@@ -95,6 +95,11 @@ type MessageStrings struct {
 	MigrationFailed    string `yaml:"migration_failed"`
 	MigrationCancelled string `yaml:"migration_cancelled"`
 	InterruptReceived  string `yaml:"interrupt_received"`
+	StepStopping       string `yaml:"step_stopping"`
+	StepStopHint       string `yaml:"step_stop_hint"`
+	StepInterrupted    string `yaml:"step_interrupted"`
+	InterruptedTitle   string `yaml:"interrupted_title"`
+	RoomsLinkFailed    string `yaml:"rooms_link_failed"`
 	StepCompleted      string `yaml:"step_completed"`
 	StepFailed         string `yaml:"step_failed"`
 	MappingSaved       string `yaml:"mapping_saved"`
@@ -411,6 +416,16 @@ func getMessageString(l *Locale, key string) string {
 		return l.Messages.MigrationCancelled
 	case "interrupt_received":
 		return l.Messages.InterruptReceived
+	case "step_stopping":
+		return l.Messages.StepStopping
+	case "step_stop_hint":
+		return l.Messages.StepStopHint
+	case "step_interrupted":
+		return l.Messages.StepInterrupted
+	case "interrupted_title":
+		return l.Messages.InterruptedTitle
+	case "rooms_link_failed":
+		return l.Messages.RoomsLinkFailed
 	case "step_completed":
 		return l.Messages.StepCompleted
 	case "step_failed":

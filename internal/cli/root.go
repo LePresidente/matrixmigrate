@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"sync/atomic"
 	"syscall"
 
 	"github.com/spf13/cobra"
@@ -79,8 +80,10 @@ Examples:
 			return cmd.Help()
 		}
 
-		// Start TUI
-		return tui.Run(cfg)
+		// Start TUI. It shows its own stopping notice, so the CLI one stays quiet.
+		tuiRunning.Store(true)
+		defer tuiRunning.Store(false)
+		return tui.Run(cmd.Context(), cfg)
 	},
 }
 
@@ -102,9 +105,13 @@ func Execute() error {
 	return rootCmd.ExecuteContext(ctx)
 }
 
+// tuiRunning is set while the TUI owns the terminal. The TUI reports an interrupt itself;
+// a line written to stderr then would land in the middle of its screen.
+var tuiRunning atomic.Bool
+
 // announceInterrupt waits for the first interrupt, then restores the default signal handling
 // (so a second Ctrl+C kills the process) and tells the user what is happening. It returns
-// without a word once finished is closed.
+// without a word once finished is closed, and prints nothing while the TUI is running.
 func announceInterrupt(ctx context.Context, stop func(), finished <-chan struct{}, out io.Writer) {
 	select {
 	case <-finished:
@@ -117,6 +124,9 @@ func announceInterrupt(ctx context.Context, stop func(), finished <-chan struct{
 	default:
 	}
 	stop()
+	if tuiRunning.Load() {
+		return
+	}
 	fmt.Fprintf(out, "⚠ %s\n", i18n.T("messages.interrupt_received"))
 }
 

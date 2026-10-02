@@ -1,7 +1,10 @@
 package tui
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"os"
 
 	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
@@ -33,6 +36,7 @@ const (
 	ViewProgress
 	ViewError
 	ViewSuccess
+	ViewInterrupted
 )
 
 // Model is the main application model
@@ -70,8 +74,27 @@ type Model struct {
 	// Program reference for sending messages from goroutines
 	program *tea.Program
 
+	// ctx is the parent of every step's context; cancelling it stops a running step.
+	ctx context.Context
+
+	// step is the migration step running in the background, nil when none is. While it is
+	// set no other step can start and the progress view cannot be left.
+	step *runningStep
+
+	// stopping is set once ctrl+c asked the running step to stop.
+	stopping bool
+
 	// Quitting
 	quitting bool
+}
+
+// runningStep is a migration step running in the background. A pointer, so every copy of
+// the Model refers to the same one.
+type runningStep struct {
+	// cancel cancels the context the step runs under.
+	cancel context.CancelFunc
+	// done is closed when the step's command returns.
+	done chan struct{}
 }
 
 // MenuItem represents a menu item
@@ -106,6 +129,7 @@ func NewModel(cfg *config.Config) (Model, error) {
 		orchestrator: orchestrator,
 		view:         ViewMenu,
 		spinner:      s,
+		ctx:          context.Background(),
 		width:        80,
 		height:       24,
 	}
@@ -225,7 +249,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case operationCompleteMsg:
-		if msg.err != nil {
+		if m.step != nil {
+			m.step.cancel() // releases the step's context
+			m.step = nil
+		}
+		m.stopping = false
+		if errors.Is(msg.err, migration.ErrInterrupted) {
+			m.errorMessage = msg.err.Error()
+			m.view = ViewInterrupted
+		} else if msg.err != nil {
 			m.errorMessage = msg.err.Error()
 			m.view = ViewError
 		} else {
@@ -240,7 +272,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case testCompleteMsg:
 		m.testResult = msg.result
 		m.testDone = true
-		m.view = ViewTestConnection
+		// Never pull the user off a running step's progress view.
+		if m.step == nil {
+			m.view = ViewTestConnection
+		}
 		return m, nil
 	}
 
@@ -251,6 +286,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "ctrl+c", "q":
+		if m.step != nil {
+			// While a step runs, ctrl+c asks it to stop after the item in flight and the
+			// view stays put until it returns; q does nothing.
+			if msg.String() == "ctrl+c" && !m.stopping {
+				m.step.cancel()
+				m.stopping = true
+			}
+			return m, nil
+		}
 		if m.view == ViewMenu {
 			m.quitting = true
 			return m, tea.Quit
@@ -278,6 +322,9 @@ func (m Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case "enter", " ":
+		if m.step != nil {
+			return m, nil
+		}
 		if m.view == ViewMenu {
 			item := m.menuItems[m.menuIndex]
 			if item.Disabled {
@@ -290,14 +337,14 @@ func (m Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.view = item.View
 			return m, m.handleViewChange(item.View)
 		}
-		if m.view == ViewError || m.view == ViewSuccess {
+		if m.view == ViewError || m.view == ViewSuccess || m.view == ViewInterrupted {
 			m.view = ViewMenu
 			return m, nil
 		}
 		return m, nil
 
 	case "esc":
-		if m.view != ViewMenu {
+		if m.step == nil && m.view != ViewMenu {
 			m.view = ViewMenu
 		}
 		return m, nil
@@ -310,21 +357,21 @@ func (m Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m *Model) handleViewChange(view View) tea.Cmd {
 	switch view {
 	case ViewExportAssets:
-		return m.runExportAssets()
+		return m.startStep(m.runExportAssets())
 	case ViewImportAssets:
-		return m.runImportAssets()
+		return m.startStep(m.runImportAssets())
 	case ViewExportMemberships:
-		return m.runExportMemberships()
+		return m.startStep(m.runExportMemberships())
 	case ViewImportMemberships:
-		return m.runImportMemberships()
+		return m.startStep(m.runImportMemberships())
 	case ViewLeaveRooms:
-		return m.runLeaveRooms()
+		return m.startStep(m.runLeaveRooms())
 	case ViewEnableNotifications:
-		return m.runEnableNotifications()
+		return m.startStep(m.runEnableNotifications())
 	case ViewExportMessages:
-		return m.runExportMessages()
+		return m.startStep(m.runExportMessages())
 	case ViewImportMessages:
-		return m.runImportMessages()
+		return m.startStep(m.runImportMessages())
 	case ViewTestConnection:
 		return m.runTestConnection()
 	case ViewStatus:
@@ -332,6 +379,22 @@ func (m *Model) handleViewChange(view View) tea.Cmd {
 		return nil
 	}
 	return nil
+}
+
+// startStep marks a step as running and gives it a fresh cancellable context, handed to the
+// orchestrator, so ctrl+c can stop it. The returned command runs cmd and then records that
+// the step has returned.
+func (m *Model) startStep(cmd tea.Cmd) tea.Cmd {
+	ctx, cancel := context.WithCancel(m.ctx)
+	m.orchestrator.SetContext(ctx)
+	run := &runningStep{cancel: cancel, done: make(chan struct{})}
+	m.step = run
+	m.stopping = false
+	m.progressStage, m.progressCurrent, m.progressTotal, m.progressItem = "", 0, 0, ""
+	return func() tea.Msg {
+		defer close(run.done)
+		return cmd()
+	}
 }
 
 // View renders the UI
@@ -351,6 +414,8 @@ func (m Model) View() string {
 		return m.renderError()
 	case ViewSuccess:
 		return m.renderSuccess()
+	case ViewInterrupted:
+		return m.renderInterrupted()
 	case ViewTestConnection:
 		return m.renderTestConnection()
 	case ViewExportAssets, ViewImportAssets, ViewExportMemberships, ViewImportMemberships, ViewExportMessages, ViewImportMessages, ViewLeaveRooms, ViewEnableNotifications:
@@ -466,16 +531,14 @@ func (m Model) renderProgress() string {
 		progressInfo = m.progressStage
 	}
 
-	content := BoxStyle.Render(
-		lipgloss.JoinVertical(
-			lipgloss.Left,
-			TitleStyle.Render(title),
-			"",
-			spinner+" "+progressInfo,
-		),
-	)
+	lines := []string{TitleStyle.Render(title), "", spinner + " " + progressInfo}
+	help := HelpStyle.Render(i18n.T("messages.step_stop_hint"))
+	if m.stopping {
+		lines = append(lines, "", WarningStyle.Render(i18n.T("messages.step_stopping")))
+		help = HelpStyle.Render("")
+	}
 
-	help := HelpStyle.Render("Please wait...")
+	content := BoxStyle.Render(lipgloss.JoinVertical(lipgloss.Left, lines...))
 
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center,
 		lipgloss.JoinVertical(lipgloss.Center, content, help))
@@ -563,6 +626,26 @@ func (m Model) renderError() string {
 		lipgloss.JoinVertical(lipgloss.Center, content, help))
 }
 
+// renderInterrupted renders the view for a step stopped by the user. Its progress was saved,
+// so this is not shown as a failure.
+func (m Model) renderInterrupted() string {
+	content := BoxStyle.Render(
+		lipgloss.JoinVertical(
+			lipgloss.Left,
+			WarningStyle.Render(i18n.T("messages.interrupted_title")),
+			"",
+			i18n.T("messages.step_interrupted"),
+			"",
+			DimStyle.Render(m.errorMessage),
+		),
+	)
+
+	help := HelpStyle.Render("Press enter to continue")
+
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center,
+		lipgloss.JoinVertical(lipgloss.Center, content, help))
+}
+
 // renderSuccess renders the success view with detailed stats
 func (m Model) renderSuccess() string {
 	var sections []string
@@ -638,7 +721,7 @@ func (m Model) renderSuccess() string {
 		}
 
 		// Import stats - Rooms
-		if r.RoomsCreated > 0 || r.RoomsSkipped > 0 || r.RoomsFailed > 0 || r.RoomsLinked > 0 {
+		if r.RoomsCreated > 0 || r.RoomsSkipped > 0 || r.RoomsFailed > 0 || r.RoomsLinked > 0 || r.RoomsLinkFailed > 0 {
 			sections = append(sections, SubtitleStyle.Render("💬 Rooms:"))
 			if r.RoomsCreated > 0 {
 				sections = append(sections, SuccessStyle.Render(fmt.Sprintf("   ✓ Created: %d", r.RoomsCreated)))
@@ -651,6 +734,9 @@ func (m Model) renderSuccess() string {
 			}
 			if r.RoomsFailed > 0 {
 				sections = append(sections, ErrorStyle.Render(fmt.Sprintf("   ✗ Failed: %d", r.RoomsFailed)))
+			}
+			if r.RoomsLinkFailed > 0 {
+				sections = append(sections, ErrorStyle.Render("   ✗ "+i18n.T("messages.rooms_link_failed", r.RoomsLinkFailed)))
 			}
 			sections = append(sections, "")
 		}
@@ -1042,15 +1128,28 @@ func (m *Model) runTestConnection() tea.Cmd {
 // programInstance holds the running program for sending messages from goroutines
 var programInstance *tea.Program
 
-// Run starts the TUI application
-func Run(cfg *config.Config) error {
+// Run starts the TUI application. Cancelling ctx stops a running step the way ctrl+c does.
+// When the TUI ends the orchestrator is closed, after any step still running has stopped.
+func Run(ctx context.Context, cfg *config.Config) error {
 	model, err := NewModel(cfg)
 	if err != nil {
 		return err
 	}
+	if ctx != nil {
+		model.ctx = ctx
+	}
+	defer model.orchestrator.Close()
 
 	programInstance = tea.NewProgram(model, tea.WithAltScreen())
-	_, err = programInstance.Run()
+	final, err := programInstance.Run()
+
+	// The keys cannot quit while a step runs, but a signal can end the program. Let the step
+	// finish its item and save its progress before the connections close under it.
+	if fm, ok := final.(Model); ok && fm.step != nil {
+		fmt.Fprintf(os.Stderr, "⚠ %s\n", i18n.T("messages.step_stopping"))
+		fm.step.cancel()
+		<-fm.step.done
+	}
 	return err
 }
 

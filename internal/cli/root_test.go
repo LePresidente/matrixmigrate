@@ -86,3 +86,34 @@ func TestRootCommandReturnsConfigLoadError(t *testing.T) {
 		t.Fatal("root command returned no error for a config file that does not parse")
 	}
 }
+
+// While the TUI owns the terminal it reports the interrupt itself; the CLI line would land in
+// the middle of its screen. Default signal handling is still restored.
+func TestAnnounceInterruptSilentWhileTUIRunning(t *testing.T) {
+	tuiRunning.Store(true)
+	defer tuiRunning.Store(false)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	stopped := make(chan struct{})
+	var out bytes.Buffer
+	done := make(chan struct{})
+	go func() {
+		announceInterrupt(ctx, func() { close(stopped) }, make(chan struct{}), &out)
+		close(done)
+	}()
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("announceInterrupt did not return after the context was cancelled")
+	}
+	select {
+	case <-stopped:
+	default:
+		t.Error("stop was not called, so a second signal would not kill the process")
+	}
+	if out.Len() != 0 {
+		t.Errorf("printed %q while the TUI was running", out.String())
+	}
+}
