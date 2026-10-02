@@ -1424,7 +1424,7 @@ func (c *Client) ForceJoinUser(roomID, userID string) error {
 			return nil // Idempotent: user is already a member
 		}
 		logger.Debug("ForceJoinUser: failed room=%s user=%s status=%d err=%s", roomID, userID, statusCode, resp.Error)
-		return fmt.Errorf("API error (%d): %s - %s", statusCode, resp.Errcode, resp.Error)
+		return &APIError{StatusCode: statusCode, Errcode: resp.Errcode, Message: resp.Error}
 	}
 	logger.Debug("ForceJoinUser: success room=%s user=%s", roomID, userID)
 	return nil
@@ -2346,6 +2346,31 @@ func threadRelation(rootEventID, latestEventID string) map[string]interface{} {
 			"event_id": fallback,
 		},
 	}
+}
+
+// APIError is a homeserver answering a request with a non-success status. Its text is the
+// same "API error (<status>): <errcode> - <error>" as the formatted errors elsewhere in this
+// client; the type exists so a caller can ask for the status instead of matching that text.
+type APIError struct {
+	StatusCode int
+	Errcode    string
+	Message    string
+}
+
+func (e *APIError) Error() string {
+	return fmt.Sprintf("API error (%d): %s - %s", e.StatusCode, e.Errcode, e.Message)
+}
+
+// isDefiniteRefusal reports whether err is the homeserver answering a request with a 4xx,
+// which means the request was refused and nothing was applied. Anything else - a 5xx (often a
+// proxy that gave up waiting), a transport error, a retry abandoned after an interrupt - leaves
+// open whether the homeserver acted on it. 408 is a timeout, so it is not a refusal either.
+func isDefiniteRefusal(err error) bool {
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	return apiErr.StatusCode >= 400 && apiErr.StatusCode < 500 && apiErr.StatusCode != http.StatusRequestTimeout
 }
 
 // ErrCreateRoomTimeout marks a createRoom request that failed at the transport layer.

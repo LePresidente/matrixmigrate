@@ -136,6 +136,10 @@ func (i *Importer) ensureHistoryAuthorsJoined(
 			if err := i.client.ForceJoinUser(roomID, mxid); err != nil {
 				logger.Warn("Could not join past author %s to room %s: %v", mxid, roomID, err)
 				failed++
+				if !isDefiniteRefusal(err) {
+					// The join may have been applied anyway: keep it tracked for the cleanup.
+					joined = append(joined, hm)
+				}
 				continue
 			}
 			joined = append(joined, hm)
@@ -143,7 +147,7 @@ func (i *Importer) ensureHistoryAuthorsJoined(
 	}
 
 	if len(joined) > 0 || failed > 0 {
-		logger.Info("Past-author membership: joined %d (user,room) pair(s), %d could not be joined", len(joined), failed)
+		logger.Info("Past-author membership: %d (user,room) pair(s) tracked for cleanup, %d join(s) failed", len(joined), failed)
 	}
 	return joined
 }
@@ -402,6 +406,10 @@ func (i *Importer) ensureFallbackSenderInRoom(roomID string) error {
 	hm := HistoryMembership{RoomID: roomID, UserID: botID}
 	i.recordHistoryJoin(hm)
 	if err := i.client.ForceJoinUser(roomID, botID); err != nil {
+		if !isDefiniteRefusal(err) {
+			// The join may have been applied anyway: keep it tracked for the cleanup.
+			i.historyJoins = append(i.historyJoins, hm)
+		}
 		return fmt.Errorf("could not join fallback sender %s to %s: %w", botID, roomID, err)
 	}
 
@@ -449,6 +457,9 @@ func (i *Importer) sendWithMembershipRecovery(roomID, senderID string, send func
 				if resp, err = send(senderID); err == nil {
 					return resp, "recovered: joined sender to room", nil
 				}
+			} else if !isDefiniteRefusal(jerr) {
+				// The join may have been applied anyway: keep it tracked for the cleanup.
+				i.historyJoins = append(i.historyJoins, hm)
 			}
 		}
 	}
