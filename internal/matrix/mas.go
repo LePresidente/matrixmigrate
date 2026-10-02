@@ -3,6 +3,7 @@ package matrix
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -13,6 +14,11 @@ import (
 
 	"github.com/aligundogdu/matrixmigrate/internal/logger"
 )
+
+// ErrUserAlreadyExists is returned by CreateUser when MAS reports the account already exists
+// (or its localpart is reserved). Nothing was created and no password or profile was set, so
+// the caller must treat the account as existing, not as created.
+var ErrUserAlreadyExists = errors.New("user already exists")
 
 // MASClient is a client for the Matrix Authentication Service Admin API.
 // It is used to create users in MAS so they can log in via SSO/OAuth without
@@ -200,8 +206,8 @@ func (m *MASClient) CreateUser(username string, req *CreateUserRequest) (*UserRe
 		}
 		if strings.Contains(strings.ToLower(errMsg), "already exists") ||
 			strings.Contains(strings.ToLower(errMsg), "reserved") {
-			logger.Info("User '%s' already exists in MAS, treating as success", username)
-			return &UserResponse{UserID: m.FormatUserID(username)}, nil
+			logger.Info("User '%s' already exists in MAS (status %d: %s)", username, statusCode, errMsg)
+			return nil, fmt.Errorf("MAS user '%s': %w", username, ErrUserAlreadyExists)
 		}
 		return nil, fmt.Errorf("MAS API error (%d): %s", statusCode, errMsg)
 	}

@@ -163,6 +163,11 @@ type ImportStats struct {
 	RoomsLeft       int `json:"rooms_left"`
 	RoomsLeaveSkip  int `json:"rooms_leave_skipped"`
 	RoomsLeaveFail  int `json:"rooms_leave_failed"`
+
+	// UsersUnconfirmed counts the users (also in UsersFailed) left untouched because their
+	// existence could not be checked. Their posts would go out as the fallback sender, so the
+	// asset import must be re-run before messages are imported.
+	UsersUnconfirmed int `json:"users_unconfirmed"`
 }
 
 // RoomPreset defines room creation presets

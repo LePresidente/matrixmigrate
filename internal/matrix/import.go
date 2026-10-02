@@ -2,6 +2,7 @@ package matrix
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path"
@@ -430,22 +431,15 @@ func (i *Importer) ImportUsers(users []mattermost.User, existingMapping map[stri
 			continue
 		}
 
-		// Try to check if user exists, but don't fail if check fails
-		// (some Matrix servers only allow checking local users)
-		exists := false
-		existsCheck, err := i.client.UserExists(user.Username)
+		// An account whose existence cannot be confirmed is left alone: on plain Synapse creating
+		// is an upsert that would replace its password and profile, and with MAS the profile
+		// write that follows a create would replace them on Synapse.
+		exists, err := i.client.UserExists(user.Username)
 		if err != nil {
-			if !i.client.UsesMAS() {
-				// On plain Synapse, creating is an upsert that would replace an existing
-				// account's password and profile, so an unconfirmed account is left alone.
-				logger.Error("Could not confirm whether user '%s' exists (%v); the account was left untouched - re-run import assets to pick it up", user.Username, err)
-				stats.UsersFailed++
-				continue
-			}
-			// MAS answers 409 for an existing user, so trying to create is safe.
-			logger.Warn("UserExists check failed for '%s': %v, will try to create anyway", user.Username, err)
-		} else {
-			exists = existsCheck
+			logger.Error("Could not confirm whether user '%s' exists (%v); the account was left untouched - re-run import assets to pick it up", user.Username, err)
+			stats.UsersFailed++
+			stats.UsersUnconfirmed++
+			continue
 		}
 
 		// Display name from Mattermost, used both for accounts we create and for filling in
@@ -461,33 +455,7 @@ func (i *Importer) ImportUsers(users []mattermost.User, existingMapping map[stri
 		email := strings.ToLower(strings.TrimSpace(user.Email))
 
 		if exists {
-			// User already exists, add to mapping
-			mxID := i.client.FormatUserID(user.Username)
-			mapping[user.ID] = mxID
-			// Close the account off if it is deleted in Mattermost
-			if deactivated {
-				if err := i.client.SetUserDeactivated(mxID, true); err != nil {
-					logger.Warn("Failed to set existing user '%s' as deactivated: %v", user.Username, err)
-				} else {
-					logger.Info("User '%s' already exists; set deactivated to match Mattermost", user.Username)
-				}
-			}
-			if lockDeleted {
-				if err := i.client.SetUserLocked(mxID, true); err != nil {
-					logger.Warn("Failed to lock existing user '%s': %v", user.Username, err)
-				} else {
-					logger.Info("User '%s' already exists; set locked to match Mattermost", user.Username)
-				}
-			}
-			// Anyone who signed in through SSO before the migration lands here, and would
-			// otherwise keep an account with no email address - and so no email notifications.
-			// Additive: nothing already on the account is overwritten.
-			if err := i.client.EnsureUserProfile(mxID, displayName, email); err != nil {
-				logger.Warn("Failed to complete profile for existing user '%s': %v", user.Username, err)
-			}
-			if email != "" {
-				i.client.EnsureMASEmail(user.Username, email)
-			}
+			mapping[user.ID] = i.adoptExistingUser(user.Username, displayName, email, deactivated, lockDeleted)
 			logger.Info("User '%s' already exists, skipped", user.Username)
 			stats.UsersSkipped++
 			continue
@@ -521,10 +489,10 @@ func (i *Importer) ImportUsers(users []mattermost.User, existingMapping map[stri
 
 		resp, err := i.client.CreateUser(user.Username, req)
 		if err != nil {
-			// Check if error is because user already exists
-			if strings.Contains(err.Error(), "already exists") || strings.Contains(err.Error(), "M_USER_IN_USE") {
-				// User exists, add to mapping
-				mapping[user.ID] = i.client.FormatUserID(user.Username)
+			// The account exists after all: nothing was created and no password was set, so it
+			// is treated exactly like one found by the existence check.
+			if errors.Is(err, ErrUserAlreadyExists) || strings.Contains(err.Error(), "already exists") || strings.Contains(err.Error(), "M_USER_IN_USE") {
+				mapping[user.ID] = i.adoptExistingUser(user.Username, displayName, email, deactivated, lockDeleted)
 				logger.Info("User '%s' already exists (detected during create), skipped", user.Username)
 				stats.UsersSkipped++
 				continue
@@ -560,6 +528,38 @@ func (i *Importer) ImportUsers(users []mattermost.User, existingMapping map[stri
 	i.checkpointAssets()
 
 	return mapping, stats, nil
+}
+
+// adoptExistingUser brings an account that already exists in line with Mattermost without
+// overwriting anything on it, and returns its Matrix user ID: deleted users are deactivated or
+// locked per deleted_user_mode, and a missing display name or email address is filled in.
+func (i *Importer) adoptExistingUser(username, displayName, email string, deactivated, lockDeleted bool) string {
+	mxID := i.client.FormatUserID(username)
+	// Close the account off if it is deleted in Mattermost
+	if deactivated {
+		if err := i.client.SetUserDeactivated(mxID, true); err != nil {
+			logger.Warn("Failed to set existing user '%s' as deactivated: %v", username, err)
+		} else {
+			logger.Info("User '%s' already exists; set deactivated to match Mattermost", username)
+		}
+	}
+	if lockDeleted {
+		if err := i.client.SetUserLocked(mxID, true); err != nil {
+			logger.Warn("Failed to lock existing user '%s': %v", username, err)
+		} else {
+			logger.Info("User '%s' already exists; set locked to match Mattermost", username)
+		}
+	}
+	// Anyone who signed in through SSO before the migration lands here, and would
+	// otherwise keep an account with no email address - and so no email notifications.
+	// Additive: nothing already on the account is overwritten.
+	if err := i.client.EnsureUserProfile(mxID, displayName, email); err != nil {
+		logger.Warn("Failed to complete profile for existing user '%s': %v", username, err)
+	}
+	if email != "" {
+		i.client.EnsureMASEmail(username, email)
+	}
+	return mxID
 }
 
 // resolveRoomOwner returns the Matrix user ID to use as room/space owner.
