@@ -53,8 +53,7 @@ func TestRequiredPinPowerLevelFallsBackToStateDefaultThenFifty(t *testing.T) {
 	if got := requiredPinPowerLevel(&PowerLevelsContent{StateDefault: 75}); got != 75 {
 		t.Fatalf("with state_default 75, got %d", got)
 	}
-	// StateDefault is unmarshalled with omitempty, so absent and 0 are indistinguishable;
-	// 50 is the spec default and the safe assumption.
+	// Content that never carried state_default gets the spec default of 50.
 	if got := requiredPinPowerLevel(&PowerLevelsContent{}); got != 50 {
 		t.Fatalf("with no state_default, got %d, want 50", got)
 	}
@@ -517,5 +516,64 @@ func TestImportPinsFallsBackToJoiningWithoutAnASToken(t *testing.T) {
 	}
 	if want := []pinWrite{{asUser: "", pinned: []string{"$new"}}}; !reflect.DeepEqual(f.writes, want) {
 		t.Fatalf("writes = %+v, want one write as the admin", f.writes)
+	}
+}
+
+func TestRequiredPinPowerLevelHonoursAnExplicitZeroStateDefault(t *testing.T) {
+	// state_default 0 means anyone may send state; reading it as "absent" would demand 50.
+	state := []adminStateEvent{{Type: EventTypePowerLevels, Content: []byte(`{"state_default":0}`)}}
+	if got := requiredPinPowerLevel(powerLevelsFromState(state)); got != 0 {
+		t.Fatalf("requiredPinPowerLevel with explicit state_default 0 = %d, want 0", got)
+	}
+
+	var decoded PowerLevelsContent
+	if err := json.Unmarshal([]byte(`{"state_default":0}`), &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if got := requiredPinPowerLevel(&decoded); got != 0 {
+		t.Fatalf("requiredPinPowerLevel of decoded content = %d, want 0", got)
+	}
+
+	var absent PowerLevelsContent
+	if err := json.Unmarshal([]byte(`{"users_default":0}`), &absent); err != nil {
+		t.Fatal(err)
+	}
+	if got := requiredPinPowerLevel(&absent); got != 50 {
+		t.Fatalf("requiredPinPowerLevel with no state_default = %d, want the spec default 50", got)
+	}
+}
+
+func TestPinCandidatesAddJoinedMembersWhenUsersDefaultIsEnough(t *testing.T) {
+	// users_default at or above the bar lets every member pin. An explicit entry still wins:
+	// carol is listed at 0 and so cannot, and a remote user is out of the AS's reach.
+	pl := &PowerLevelsContent{
+		UsersDefault: 50,
+		Users:        map[string]int{"@bob_dev:example.com": 100, "@carol:example.com": 0},
+	}
+	joined := map[string]struct{}{
+		"@dave:example.com": {}, "@alice:example.com": {}, "@bob_dev:example.com": {},
+		"@carol:example.com": {}, "@remote:other.example": {},
+	}
+	got := pinCandidates(pl, "example.com", 50, "", joined)
+	want := []string{"@bob_dev:example.com", "@alice:example.com", "@dave:example.com"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("pinCandidates = %v, want %v", got, want)
+	}
+}
+
+func TestImportPinsWritesAsAnUnlistedMemberWhenUsersDefaultIsEnough(t *testing.T) {
+	state := pinRoomState("@carol:example.com",
+		map[string]any{"users_default": 50, "users": map[string]any{"@bob_dev:example.com": 0}},
+		[]string{"@alice:example.com", "@bob_dev:example.com"}, nil)
+	f, c := newFakePinServer(t, state)
+	c.SetASToken("as-token")
+
+	result := runPinPass(c)
+
+	if result.Stats.PinnedRoomsUpdated != 1 {
+		t.Fatalf("stats = %+v, errors = %v; want one room updated", result.Stats, result.Errors)
+	}
+	if want := []string{"@alice:example.com"}; !reflect.DeepEqual(f.attempts, want) {
+		t.Fatalf("attempts = %v, want %v", f.attempts, want)
 	}
 }

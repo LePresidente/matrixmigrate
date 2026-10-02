@@ -1,5 +1,7 @@
 package matrix
 
+import "encoding/json"
+
 // User represents a Matrix user
 type User struct {
 	UserID      string `json:"user_id"`
@@ -132,6 +134,29 @@ type PowerLevelsContent struct {
 	Kick          int                       `json:"kick,omitempty"`
 	Redact        int                       `json:"redact,omitempty"`
 	Events        map[string]int            `json:"events,omitempty"`
+
+	// stateDefaultSet records whether decoded content carried state_default at all. The
+	// field above cannot tell an explicit 0 from an absent key, and the spec default for an
+	// absent one is 50.
+	stateDefaultSet bool
+}
+
+// UnmarshalJSON decodes power levels content, noting whether state_default was present.
+func (p *PowerLevelsContent) UnmarshalJSON(data []byte) error {
+	type plain PowerLevelsContent
+	var decoded plain
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	var presence struct {
+		StateDefault json.RawMessage `json:"state_default"`
+	}
+	if err := json.Unmarshal(data, &presence); err != nil {
+		return err
+	}
+	*p = PowerLevelsContent(decoded)
+	p.stateDefaultSet = presence.StateDefault != nil && string(presence.StateDefault) != "null"
+	return nil
 }
 
 // ImportResult represents the result of an import operation

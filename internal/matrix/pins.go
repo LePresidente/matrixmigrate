@@ -16,9 +16,8 @@ import (
 // EventTypePinnedEvents is the room state event holding a room's pinned message list.
 const EventTypePinnedEvents = "m.room.pinned_events"
 
-// defaultPinPowerLevel is what the Matrix spec gives state_default. PowerLevelsContent is
-// unmarshalled with omitempty, so an absent state_default and a genuine 0 are indistinguishable;
-// assuming 50 picks a user who can pin either way.
+// defaultPinPowerLevel is what the Matrix spec gives state_default when the power levels do
+// not set it.
 const defaultPinPowerLevel = 50
 
 // PinnedEventsContent is the content of an m.room.pinned_events state event.
@@ -233,13 +232,39 @@ func adminCanPin(view pinRoomView, adminID string, required int) bool {
 }
 
 // pinCandidates returns the local members the Application Service may pin as, in the order to
-// try them. A nil joined set means membership is unknown: every candidate is then kept.
+// try them: the explicitly powered ones and the creator, as pinCapableUsers ranks them, then —
+// when users_default alone is enough to pin — every other joined local member, by user ID.
+//
+// A nil joined set means membership is unknown: every candidate pinCapableUsers names is then
+// kept, and nobody can be added on the strength of users_default.
 func pinCandidates(pl *PowerLevelsContent, homeserver string, required int, creator string, joined map[string]struct{}) []string {
 	candidates := pinCapableUsers(pl, homeserver, required, creator)
 	if joined == nil {
 		return candidates
 	}
-	return onlyJoined(candidates, joined)
+	candidates = onlyJoined(candidates, joined)
+	if pl == nil || pl.UsersDefault < required {
+		return candidates
+	}
+
+	suffix := ":" + homeserver
+	listed := make(map[string]struct{}, len(candidates))
+	for _, user := range candidates {
+		listed[user] = struct{}{}
+	}
+	var unlisted []string
+	for user := range joined {
+		if _, in := listed[user]; in || !strings.HasSuffix(user, suffix) {
+			continue
+		}
+		// An explicit entry overrides users_default, in either direction.
+		if _, explicit := pl.Users[user]; explicit {
+			continue
+		}
+		unlisted = append(unlisted, user)
+	}
+	sort.Strings(unlisted)
+	return append(candidates, unlisted...)
 }
 
 // onlyJoined keeps the candidates who are currently in the room, in order.
@@ -470,7 +495,7 @@ func requiredPinPowerLevel(pl *PowerLevelsContent) int {
 	if level, ok := pl.Events[EventTypePinnedEvents]; ok {
 		return level
 	}
-	if pl.StateDefault > 0 {
+	if pl.stateDefaultSet || pl.StateDefault > 0 {
 		return pl.StateDefault
 	}
 	return defaultPinPowerLevel
