@@ -32,10 +32,6 @@ type Orchestrator struct {
 	mxToken        string
 	mxLoginBaseURL string
 
-	// forceMembershipReplay re-applies channel/team memberships even when the step already
-	// completed, so members who joined after the first run get added on a later run.
-	forceMembershipReplay bool
-
 	// ctx is cancelled when the user interrupts the run. See SetContext.
 	ctx context.Context
 }
@@ -111,12 +107,6 @@ func (o *Orchestrator) Close() error {
 	err := o.tunnelManager.CloseAll()
 	logger.Close()
 	return err
-}
-
-// SetForceMembershipReplay controls whether a completed membership step is re-applied on
-// re-run (to pick up members added since the first run). Force-join is idempotent.
-func (o *Orchestrator) SetForceMembershipReplay(force bool) {
-	o.forceMembershipReplay = force
 }
 
 // setLoginSession records a session opened by a password login so Close can revoke it.
@@ -1023,12 +1013,10 @@ func (o *Orchestrator) ImportMemberships(progress ProgressCallback) (*OperationR
 		logger.Error("Cannot run step: %s", reason)
 		return nil, fmt.Errorf("cannot run step: %s", reason)
 	}
-	// If memberships were already imported successfully, skip expensive replays by default.
-	// This keeps reruns fast and avoids reissuing force-join operations. When replay is
-	// forced, re-apply so members who joined after the first run get added (idempotent).
-	if step := o.state.GetStep(StepImportMemberships); step.Status == StatusCompleted && !o.forceMembershipReplay {
-		logger.Info("ImportMemberships: step already completed, skipping membership replay")
-		return result, nil
+	// A completed step is re-applied, not skipped, so members who joined after the first run
+	// get added. Force-join treats a user already in the room as success, so this is safe.
+	if step := o.state.GetStep(StepImportMemberships); step.Status == StatusCompleted {
+		logger.Info("ImportMemberships: step already completed, re-applying to pick up new members")
 	}
 
 	// Get the membership file and mapping file from previous steps

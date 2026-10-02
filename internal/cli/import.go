@@ -225,7 +225,6 @@ func runImportMemberships(cmd *cobra.Command, args []string) error {
 			return nil
 		}
 		printInfo("Membership import already completed; re-applying to pick up new members (force-join is idempotent).")
-		orch.SetForceMembershipReplay(true)
 	}
 
 	// Connect to Matrix
