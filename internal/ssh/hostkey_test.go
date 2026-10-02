@@ -1,7 +1,9 @@
 package ssh
 
 import (
+	"crypto/ecdsa"
 	"crypto/ed25519"
+	"crypto/elliptic"
 	"crypto/rand"
 	"net"
 	"os"
@@ -221,5 +223,107 @@ func TestNewClientConfigUsesHostKeyPolicy(t *testing.T) {
 	}
 	if err := clientCfg.HostKeyCallback(dialAddress(cfg), fakeAddr, newTestKey(t)); err == nil {
 		t.Error("unknown key accepted: the client config is not using the host key policy")
+	}
+}
+
+func newECDSATestKey(t *testing.T) ssh.PublicKey {
+	t.Helper()
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate ecdsa key: %v", err)
+	}
+	key, err := ssh.NewPublicKey(&priv.PublicKey)
+	if err != nil {
+		t.Fatalf("wrap ecdsa key: %v", err)
+	}
+	return key
+}
+
+// assertEd25519Preferred checks that ssh-ed25519 is offered first, that no certificate
+// algorithm is offered, and that every plain host key algorithm the library supports is
+// still offered.
+func assertEd25519Preferred(t *testing.T, algorithms []string) {
+	t.Helper()
+	if len(algorithms) == 0 || algorithms[0] != ssh.KeyAlgoED25519 {
+		t.Fatalf("algorithms = %v, want ssh-ed25519 first", algorithms)
+	}
+	offered := make(map[string]bool)
+	for _, algo := range algorithms {
+		if strings.Contains(algo, "-cert-") {
+			t.Errorf("certificate algorithm %s offered", algo)
+		}
+		offered[algo] = true
+	}
+	for _, algo := range ssh.SupportedAlgorithms().HostKeys {
+		if !strings.Contains(algo, "-cert-") && !offered[algo] {
+			t.Errorf("supported algorithm %s dropped from %v", algo, algorithms)
+		}
+	}
+}
+
+func TestHostKeyPinPrefersEd25519(t *testing.T) {
+	cfg := sshConfigFor(22)
+	cfg.HostKeyFingerprint = ssh.FingerprintSHA256(newTestKey(t))
+
+	policy, err := newHostKeyPolicy(cfg)
+	if err != nil {
+		t.Fatalf("newHostKeyPolicy: %v", err)
+	}
+	assertEd25519Preferred(t, policy.algorithms)
+}
+
+func TestHostKeyUnknownHostPrefersEd25519(t *testing.T) {
+	cfg := sshConfigFor(22)
+	cfg.KnownHostsPath = writeKnownHosts(t, "other.example.com", 22, newECDSATestKey(t))
+
+	policy, err := newHostKeyPolicy(cfg)
+	if err != nil {
+		t.Fatalf("newHostKeyPolicy: %v", err)
+	}
+	assertEd25519Preferred(t, policy.algorithms)
+}
+
+func TestHostKeyMissingKnownHostsPrefersEd25519(t *testing.T) {
+	cfg := sshConfigFor(22)
+	cfg.KnownHostsPath = filepath.Join(t.TempDir(), "missing_known_hosts")
+
+	policy, err := newHostKeyPolicy(cfg)
+	if err != nil {
+		t.Fatalf("newHostKeyPolicy: %v", err)
+	}
+	assertEd25519Preferred(t, policy.algorithms)
+}
+
+func TestHostKeyKnownECDSAKeepsECDSAOnly(t *testing.T) {
+	cfg := sshConfigFor(22)
+	cfg.KnownHostsPath = writeKnownHosts(t, testHost, 22, newECDSATestKey(t))
+
+	policy, err := newHostKeyPolicy(cfg)
+	if err != nil {
+		t.Fatalf("newHostKeyPolicy: %v", err)
+	}
+	if want := []string{ssh.KeyAlgoECDSA256}; !reflect.DeepEqual(policy.algorithms, want) {
+		t.Errorf("algorithms = %v, want %v", policy.algorithms, want)
+	}
+}
+
+func TestHostKeyPinMismatchNamesPresentedType(t *testing.T) {
+	cfg := sshConfigFor(22)
+	cfg.HostKeyFingerprint = ssh.FingerprintSHA256(newECDSATestKey(t))
+
+	err := checkHostKey(t, cfg, newTestKey(t))
+	if err == nil {
+		t.Fatal("key not matching the pin accepted")
+	}
+	msg := err.Error()
+	for _, want := range []string{
+		"ssh-ed25519",
+		"same type",
+		"/etc/ssh/ssh_host_ed25519_key.pub",
+		"intercept",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("error does not contain %q:\n%s", want, msg)
+		}
 	}
 }

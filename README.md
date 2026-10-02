@@ -167,16 +167,18 @@ credentials. Options under `mattermost.ssh` and `matrix.ssh`:
 | Option | Default | Description |
 |--------|---------|-------------|
 | `known_hosts_path` | `~/.ssh/known_hosts` | OpenSSH `known_hosts` file the host key is checked against. `~` and environment variables are expanded. |
-| `host_key_fingerprint` | — | Pin the server's key instead of using `known_hosts`: the `SHA256:...` value printed by `ssh-keygen -lf`. Only a key with exactly this fingerprint is accepted. |
+| `host_key_fingerprint` | — | Pin the server's key instead of using `known_hosts`: the `SHA256:...` value printed by `ssh-keygen -lf`. Only a key with exactly this fingerprint is accepted. Ed25519 is requested first, so pin the server's Ed25519 key (`/etc/ssh/ssh_host_ed25519_key.pub`); for a server without one, pin the key of the type named in the error. |
 | `insecure_ignore_host_key` | `false` | Accept any host key. Anyone on the network path can then impersonate the server and capture the SSH password, the database credentials and the Matrix tokens. A warning naming the host is logged on every connection. Use only on a trusted, isolated network. |
 
 They are checked in this order: `insecure_ignore_host_key`, then `host_key_fingerprint`,
 then `known_hosts_path`.
 
 **First connection.** If the server is not in `known_hosts` yet, the connection fails and
-the error shows the key fingerprint the server presented. Compare it with the fingerprint
-on the server itself (`ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`, run there), then
-either add the host:
+the error shows the type and fingerprint of the key the server presented (Ed25519 on a
+stock OpenSSH server, which is offered first). Compare it with the fingerprint of the key of
+that type on the server itself — `ssh-keygen -lf /etc/ssh/ssh_host_<type>_key.pub`, run
+there, for the key type shown in the error (the error names the exact file) — then either
+add the host:
 
 ```bash
 ssh-keyscan -p 22 mattermost.example.com >> ~/.ssh/known_hosts

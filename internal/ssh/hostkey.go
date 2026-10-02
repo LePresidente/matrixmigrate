@@ -65,7 +65,7 @@ func newHostKeyPolicy(cfg config.SSHConfig) (*hostKeyPolicy, error) {
 	}
 
 	if pin := strings.TrimSpace(cfg.HostKeyFingerprint); pin != "" {
-		return &hostKeyPolicy{callback: fingerprintCallback(pin)}, nil
+		return &hostKeyPolicy{callback: fingerprintCallback(pin), algorithms: preferredHostKeyAlgorithms()}, nil
 	}
 
 	path, err := knownHostsPath(cfg)
@@ -74,15 +74,20 @@ func newHostKeyPolicy(cfg config.SSHConfig) (*hostKeyPolicy, error) {
 	}
 	check, err := knownhosts.New(path)
 	if errors.Is(err, os.ErrNotExist) {
-		return &hostKeyPolicy{callback: missingKnownHostsCallback(cfg, path)}, nil
+		return &hostKeyPolicy{callback: missingKnownHostsCallback(cfg, path), algorithms: preferredHostKeyAlgorithms()}, nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to read SSH known_hosts file %s: %w", path, err)
 	}
 
+	algorithms := knownHostAlgorithms(check, dialAddress(cfg))
+	if algorithms == nil {
+		// Unknown host: the key it presents is the one the user is told to check and add.
+		algorithms = preferredHostKeyAlgorithms()
+	}
 	return &hostKeyPolicy{
 		callback:   knownHostsCallback(cfg, path, check),
-		algorithms: knownHostAlgorithms(check, dialAddress(cfg)),
+		algorithms: algorithms,
 	}, nil
 }
 
@@ -111,8 +116,11 @@ func fingerprintCallback(pin string) ssh.HostKeyCallback {
 			return nil
 		}
 		return fmt.Errorf("SSH host key for %s does NOT match host_key_fingerprint: the server presented %s key %s, expected %s. "+
-			"This can mean someone is intercepting the connection; confirm the server's key with its administrator before changing host_key_fingerprint",
-			hostname, key.Type(), got, pin)
+			"host_key_fingerprint must be the fingerprint of the server's host key of the same type (%s): "+
+			"if the pin was taken from a key of another type, replace it with the output of `ssh-keygen -lf %s` run on the server. "+
+			"If it was taken from that %s key, this can mean someone is intercepting the connection; "+
+			"confirm the server's key with its administrator before changing host_key_fingerprint",
+			hostname, key.Type(), got, pin, key.Type(), hostKeyFile(key.Type()), key.Type())
 	}
 }
 
@@ -120,7 +128,7 @@ func missingKnownHostsCallback(cfg config.SSHConfig, path string) ssh.HostKeyCal
 	return func(hostname string, _ net.Addr, key ssh.PublicKey) error {
 		return fmt.Errorf("cannot verify the SSH host key of %s: the known_hosts file %s does not exist. "+
 			"The server presented %s key %s. %s",
-			hostname, path, key.Type(), ssh.FingerprintSHA256(key), trustInstructions(cfg, path))
+			hostname, path, key.Type(), ssh.FingerprintSHA256(key), trustInstructions(cfg, path, key))
 	}
 }
 
@@ -137,7 +145,7 @@ func knownHostsCallback(cfg config.SSHConfig, path string, check ssh.HostKeyCall
 		if errors.As(err, &keyErr) {
 			if len(keyErr.Want) == 0 {
 				return fmt.Errorf("SSH host %s is not in %s; the server presented %s. %s",
-					hostname, path, presented, trustInstructions(cfg, path))
+					hostname, path, presented, trustInstructions(cfg, path, key))
 			}
 			known := make([]string, 0, len(keyErr.Want))
 			for _, want := range keyErr.Want {
@@ -161,11 +169,43 @@ func knownHostsCallback(cfg config.SSHConfig, path string, check ssh.HostKeyCall
 	}
 }
 
-// trustInstructions names the two ways to make an unknown host trusted.
-func trustInstructions(cfg config.SSHConfig, path string) string {
-	return fmt.Sprintf("Check that fingerprint with the server's administrator (ssh-keygen -lf on the server), then either "+
-		"add the host with `ssh-keyscan -p %d %s >> %s`, or set host_key_fingerprint to the fingerprint in the ssh config",
-		cfg.Port, cfg.Host, path)
+// trustInstructions names the two ways to make an unknown host trusted, after checking the
+// presented key against the server's own copy of it.
+func trustInstructions(cfg config.SSHConfig, path string, key ssh.PublicKey) string {
+	return fmt.Sprintf("Check that fingerprint against `ssh-keygen -lf %s` run on the server (or ask its administrator), then either "+
+		"add the host with `ssh-keyscan -p %d %s >> %s`, or set host_key_fingerprint to that fingerprint in the ssh config",
+		hostKeyFile(key.Type()), cfg.Port, cfg.Host, path)
+}
+
+// hostKeyFile is where a stock OpenSSH server keeps its public host key of keyType.
+func hostKeyFile(keyType string) string {
+	name := strings.TrimPrefix(keyType, "ssh-")
+	if strings.HasPrefix(keyType, "ecdsa-") {
+		name = "ecdsa"
+	}
+	return "/etc/ssh/ssh_host_" + name + "_key.pub"
+}
+
+// preferredHostKeyAlgorithms is the handshake preference when known_hosts does not dictate
+// the key type: ssh-ed25519 first, then the other plain host key algorithms the library
+// supports, in its order. The library default puts Ed25519 last, so a stock OpenSSH server
+// would present its ECDSA key, while `ssh` itself, ssh-keyscan's first line and the pin the
+// docs suggest all use Ed25519. Certificate algorithms are left out: certificates are not
+// verified here, and a certificate's fingerprint is not the one the user is told to compare.
+// ssh-rsa (SHA-1) is appended last because the library default still offers it, for servers
+// with only an RSA key and no rsa-sha2 support.
+func preferredHostKeyAlgorithms() []string {
+	algorithms := []string{ssh.KeyAlgoED25519}
+	for _, algo := range ssh.SupportedAlgorithms().HostKeys {
+		if algo != ssh.KeyAlgoED25519 && !isCertAlgorithm(algo) {
+			algorithms = append(algorithms, algo)
+		}
+	}
+	return append(algorithms, ssh.KeyAlgoRSA)
+}
+
+func isCertAlgorithm(algo string) bool {
+	return strings.Contains(algo, "-cert-")
 }
 
 // knownHostAlgorithms returns the host key algorithms matching the key types known_hosts

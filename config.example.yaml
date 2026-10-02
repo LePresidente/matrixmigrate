@@ -36,11 +36,14 @@ mattermost:
 
     # Host key verification (protects the SSH password, database credentials and tokens).
     # Checked in this order; by default the key must already be in ~/.ssh/known_hosts.
-    # First connection: check the fingerprint printed in the error, then add the host with
+    # First connection: the error prints the type and fingerprint of the key the server
+    # presented (Ed25519 is requested first). Compare it with
+    #   ssh-keygen -lf /etc/ssh/ssh_host_<type>_key.pub   (run on the server)
+    # for the key type shown in the error, then add the host with
     #   ssh-keyscan -p <port> <host> >> ~/.ssh/known_hosts
     # or set host_key_fingerprint below.
     # insecure_ignore_host_key: false           # true accepts ANY key - unsafe, logs a warning
-    # host_key_fingerprint: "SHA256:..."        # pin one key (as printed by ssh-keygen -lf)
+    # host_key_fingerprint: "SHA256:..."        # pin one key (ssh-keygen -lf of the server's ed25519 key)
     # known_hosts_path: "~/.ssh/known_hosts"    # default when unset
   
   # Path to Mattermost config.json on remote server
@@ -124,11 +127,14 @@ matrix:
 
     # Host key verification (protects the SSH password, database credentials and tokens).
     # Checked in this order; by default the key must already be in ~/.ssh/known_hosts.
-    # First connection: check the fingerprint printed in the error, then add the host with
+    # First connection: the error prints the type and fingerprint of the key the server
+    # presented (Ed25519 is requested first). Compare it with
+    #   ssh-keygen -lf /etc/ssh/ssh_host_<type>_key.pub   (run on the server)
+    # for the key type shown in the error, then add the host with
     #   ssh-keyscan -p <port> <host> >> ~/.ssh/known_hosts
     # or set host_key_fingerprint below.
     # insecure_ignore_host_key: false           # true accepts ANY key - unsafe, logs a warning
-    # host_key_fingerprint: "SHA256:..."        # pin one key (as printed by ssh-keygen -lf)
+    # host_key_fingerprint: "SHA256:..."        # pin one key (ssh-keygen -lf of the server's ed25519 key)
     # known_hosts_path: "~/.ssh/known_hosts"    # default when unset
   
   api:
