@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -93,6 +94,79 @@ func TestIsRoomClosedErrIgnoresUnrelatedForbidden(t *testing.T) {
 	}
 	if !isRoomClosedErr(errString("API error (403): M_FORBIDDEN - You are not invited to this room.")) {
 		t.Fatal("invite-only refusal should be recognised")
+	}
+}
+
+func TestIsRoomClosedErr(t *testing.T) {
+	cases := []struct {
+		name string
+		err  string
+		want bool
+	}{
+		{"not invited", "API error (403): M_FORBIDDEN - You are not invited to this room.", true},
+		{"restricted, Synapse 1.159", "API error (403): M_FORBIDDEN - You do not belong to any of the required rooms/spaces to join this room.", true},
+		{"invite-only", "API error (403): M_FORBIDDEN - This room is invite-only.", true},
+		{"restricted, Synapse 1.162", "admin join room: API error (404): M_UNKNOWN - Can't join remote room because no servers that are in the room have been provided.", true},
+		{"unknown room", "admin join room: API error (404): M_NOT_FOUND - Unknown room", false},
+		{"unrelated forbidden", "API error (403): M_FORBIDDEN - You don't have permission to post", false},
+	}
+	for _, tc := range cases {
+		if got := isRoomClosedErr(errString(tc.err)); got != tc.want {
+			t.Errorf("%s: isRoomClosedErr = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestEnsureAdminCanActInRecoversSynapse162Refusal covers a restricted room refusing the
+// plain join with the 404 that Synapse 1.162 uses; the invite must still be arranged, as an
+// existing member.
+func TestEnsureAdminCanActInRecoversSynapse162Refusal(t *testing.T) {
+	var mu sync.Mutex
+	invited := false
+	inviteUser := ""
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+		switch {
+		case strings.Contains(path, "/account/whoami"):
+			_ = json.NewEncoder(w).Encode(map[string]string{"user_id": "@admin:example.com"})
+		case strings.HasSuffix(path, "/invite"):
+			mu.Lock()
+			invited = true
+			inviteUser = r.URL.Query().Get("user_id")
+			mu.Unlock()
+			_, _ = w.Write([]byte(`{}`))
+		case strings.Contains(path, "/join"):
+			mu.Lock()
+			ok := invited
+			mu.Unlock()
+			if !ok {
+				w.WriteHeader(http.StatusNotFound)
+				_, _ = w.Write([]byte(`{"errcode":"M_UNKNOWN","error":"Can't join remote room because no servers that are in the room have been provided."}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"room_id":"!restricted:example.com"}`))
+		default:
+			_, _ = w.Write([]byte(`{}`))
+		}
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	c := NewClient(srv.URL, "admin-token", "example.com")
+	c.SetASToken("as-token")
+	i := NewImporter(c)
+
+	if err := i.ensureAdminCanActIn("!restricted:example.com", []string{"@alice:example.com"}); err != nil {
+		t.Fatalf("expected recovery via member invite, got %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if !invited {
+		t.Fatal("an existing member should have been asked to invite the admin")
+	}
+	if inviteUser != "@alice:example.com" {
+		t.Fatalf("invite should be made as an existing member, got user_id %q", inviteUser)
 	}
 }
 

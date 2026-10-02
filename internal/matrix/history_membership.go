@@ -203,11 +203,20 @@ func (i *Importer) ensureAdminCanActIn(roomID string, currentMembers []string) e
 
 // isRoomClosedErr reports whether err is a room refusing an uninvited join, as opposed to a
 // failure that arranging an invite would not fix.
+//
+// Synapse 1.159 and earlier refuse the plain join of a restricted room with 403 M_FORBIDDEN.
+// Synapse 1.162 answers the same request with 404 M_UNKNOWN "Can't join remote room because
+// no servers that are in the room have been provided" - the wording of its restricted-join
+// path, even though the room is local. That is why a 404 is in the list; it is matched on the
+// message, so other 404s (an unknown room, say) are still not treated as a closed room.
 func isRoomClosedErr(err error) bool {
 	if err == nil {
 		return false
 	}
 	msg := err.Error()
+	if strings.Contains(msg, "Can't join remote room") {
+		return true
+	}
 	if !strings.Contains(msg, "M_FORBIDDEN") {
 		return false
 	}
@@ -381,6 +390,9 @@ func uniqueHistoryMemberships(memberships []HistoryMembership) []HistoryMembersh
 // failed, 766 of them.
 //
 // Rooms are remembered so a channel full of orphaned posts costs one join, not one per post.
+// A failure is remembered too, for the rest of the run: retrying a room that refused cost 535
+// requests in one live run and drew rate-limit responses. A failure while the run is being
+// interrupted says nothing about the room, so that one is not remembered.
 func (i *Importer) ensureFallbackSenderInRoom(roomID string) error {
 	if i.fallbackSenderRooms == nil {
 		i.fallbackSenderRooms = make(map[string]struct{})
@@ -388,6 +400,21 @@ func (i *Importer) ensureFallbackSenderInRoom(roomID string) error {
 	if _, done := i.fallbackSenderRooms[roomID]; done {
 		return nil
 	}
+	if i.fallbackSenderFailures == nil {
+		i.fallbackSenderFailures = make(map[string]error)
+	}
+	if prev, failed := i.fallbackSenderFailures[roomID]; failed {
+		return prev
+	}
+	err := i.joinFallbackSender(roomID)
+	if err != nil && !i.isInterrupted() {
+		i.fallbackSenderFailures[roomID] = err
+	}
+	return err
+}
+
+// joinFallbackSender does the work of ensureFallbackSenderInRoom for a room not yet seen.
+func (i *Importer) joinFallbackSender(roomID string) error {
 
 	botID, err := i.client.ASBotUserID()
 	if err != nil {

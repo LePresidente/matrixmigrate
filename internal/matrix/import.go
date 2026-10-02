@@ -99,6 +99,9 @@ type Importer struct {
 	// fallbackSenderRooms remembers rooms the AS bot has been joined to, so a channel full
 	// of posts by deleted accounts costs one join rather than one per post.
 	fallbackSenderRooms map[string]struct{}
+	// fallbackSenderFailures remembers why joining the AS bot to a room failed, so the same
+	// room is not retried for every later post.
+	fallbackSenderFailures map[string]error
 
 	// deletedUserMode decides what a Mattermost account with delete_at > 0 becomes in Matrix:
 	// DeletedUserModeDeactivated (the default) or DeletedUserModeLocked. It also decides
