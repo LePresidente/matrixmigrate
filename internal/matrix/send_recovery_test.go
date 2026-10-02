@@ -70,7 +70,9 @@ func TestSendWithMembershipRecoveryJoinsSenderAndRetries(t *testing.T) {
 	c.SetASToken("as-token")
 	i := NewImporter(c)
 
-	resp, note, err := i.sendWithMembershipRecovery("!room", "hello", 1, "@late:example.com")
+	resp, note, err := i.sendWithMembershipRecovery("!room", "@late:example.com", func(sender string) (*SendMessageResponse, error) {
+		return c.SendMessageWithTimestamp("!room", "hello", 1, sender)
+	})
 	if err != nil {
 		t.Fatalf("expected recovery to succeed, got %v", err)
 	}
@@ -113,7 +115,10 @@ func TestSendWithMembershipRecoveryLeavesOtherErrorsAlone(t *testing.T) {
 	c.SetASToken("as-token")
 	i := NewImporter(c)
 
-	if _, _, err := i.sendWithMembershipRecovery("!room", "x", 1, "@u:example.com"); err == nil {
+	send := func(sender string) (*SendMessageResponse, error) {
+		return c.SendMessageWithTimestamp("!room", "x", 1, sender)
+	}
+	if _, _, err := i.sendWithMembershipRecovery("!room", "@u:example.com", send); err == nil {
 		t.Fatal("expected the error to surface")
 	}
 	if joins != 0 {

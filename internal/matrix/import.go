@@ -80,6 +80,10 @@ type Importer struct {
 	// historyJoins records memberships created purely so a past author could be
 	// impersonated while their messages were replayed. LeaveHistoryMemberships undoes them.
 	historyJoins []HistoryMembership
+	// historyJoinRecorder, when set, is told about each history membership before the
+	// force-join that creates it, so it can be persisted ahead of the change. See
+	// SetHistoryJoinRecorder.
+	historyJoinRecorder func(HistoryMembership)
 
 	// fallbackSenderRooms remembers rooms the AS bot has been joined to, so a channel full
 	// of posts by deleted accounts costs one join rather than one per post.
@@ -105,6 +109,28 @@ const (
 // HistoryJoins returns the memberships this import created solely to replay history.
 func (i *Importer) HistoryJoins() []HistoryMembership {
 	return i.historyJoins
+}
+
+// SetHistoryJoinRecorder installs fn to be called before every force-join made only to
+// replay history. The caller persists the membership, so that if the run dies before
+// LeaveHistoryMemberships the join can still be undone later; a crash between the record and
+// the join leaves at worst an entry for a membership that never existed, which the leave
+// treats as already gone.
+func (i *Importer) SetHistoryJoinRecorder(fn func(HistoryMembership)) {
+	i.historyJoinRecorder = fn
+}
+
+// AddHistoryJoins seeds the memberships LeaveHistoryMemberships will withdraw, typically with
+// the ones an earlier, interrupted run recorded but never undid.
+func (i *Importer) AddHistoryJoins(memberships ...HistoryMembership) {
+	i.historyJoins = append(i.historyJoins, memberships...)
+}
+
+// recordHistoryJoin reports m to the recorder, if one is installed. Call it before the join.
+func (i *Importer) recordHistoryJoin(m HistoryMembership) {
+	if i.historyJoinRecorder != nil {
+		i.historyJoinRecorder(m)
+	}
 }
 
 // NewImporter creates a new importer
@@ -2140,7 +2166,9 @@ func (i *Importer) ImportMessages(
 			}
 		} else {
 			// Regular message
-			resp, recovery, sendErr := i.sendWithMembershipRecovery(roomID, messageContent, post.CreateAt, senderID)
+			resp, recovery, sendErr := i.sendWithMembershipRecovery(roomID, senderID, func(sender string) (*SendMessageResponse, error) {
+				return i.client.SendMessageWithTimestamp(roomID, messageContent, post.CreateAt, sender)
+			})
 			if recovery != "" {
 				logger.Info("Post %s: %s", post.ID, recovery)
 			}
@@ -2315,7 +2343,12 @@ func (i *Importer) ImportMessagesWithFiles(
 				result.Stats.RepliesFailed++
 				result.Errors = append(result.Errors, fmt.Sprintf("Parent post %s not found for reply %s", post.RootID, post.ID))
 
-				resp, sendErr := i.client.SendMessageWithTimestamp(roomID, messageContent, post.CreateAt, senderID)
+				resp, recovery, sendErr := i.sendWithMembershipRecovery(roomID, senderID, func(sender string) (*SendMessageResponse, error) {
+					return i.client.SendMessageWithTimestamp(roomID, messageContent, post.CreateAt, sender)
+				})
+				if recovery != "" {
+					logger.Info("Post %s: %s", post.ID, recovery)
+				}
 				if sendErr != nil {
 					result.Stats.MessagesFailed++
 					result.Errors = append(result.Errors, fmt.Sprintf("Failed to send message %s: %v", post.ID, sendErr))
@@ -2326,7 +2359,12 @@ func (i *Importer) ImportMessagesWithFiles(
 				}
 				eventID = resp.EventID
 			} else {
-				resp, sendErr := i.client.SendReplyWithTimestamp(roomID, messageContent, parentEventID, threadLatest[post.RootID], post.CreateAt, senderID)
+				resp, recovery, sendErr := i.sendWithMembershipRecovery(roomID, senderID, func(sender string) (*SendMessageResponse, error) {
+					return i.client.SendReplyWithTimestamp(roomID, messageContent, parentEventID, threadLatest[post.RootID], post.CreateAt, sender)
+				})
+				if recovery != "" {
+					logger.Info("Reply %s: %s", post.ID, recovery)
+				}
 				if sendErr != nil {
 					result.Stats.RepliesFailed++
 					result.Errors = append(result.Errors, fmt.Sprintf("Failed to send reply %s: %v", post.ID, sendErr))
@@ -2341,7 +2379,9 @@ func (i *Importer) ImportMessagesWithFiles(
 				attachmentReplyToEventID = parentEventID
 			}
 		} else {
-			resp, recovery, sendErr := i.sendWithMembershipRecovery(roomID, messageContent, post.CreateAt, senderID)
+			resp, recovery, sendErr := i.sendWithMembershipRecovery(roomID, senderID, func(sender string) (*SendMessageResponse, error) {
+				return i.client.SendMessageWithTimestamp(roomID, messageContent, post.CreateAt, sender)
+			})
 			if recovery != "" {
 				logger.Info("Post %s: %s", post.ID, recovery)
 			}
