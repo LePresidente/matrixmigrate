@@ -2,9 +2,12 @@ package config
 
 import (
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"unicode"
 
 	"github.com/spf13/viper"
 )
@@ -53,6 +56,10 @@ type FilesConfig struct {
 	// When true, upload failures may fall back to sending S3/public links (if s3_public_url is set).
 	// When false (default), upload failures are skipped and logged as errors.
 	FallbackToLinkOnUploadFailure bool `mapstructure:"fallback_to_link_on_upload_failure"`
+
+	// When true, attachments read over SSH fall back to `sudo cat` if the SSH user cannot
+	// read them. When false (default), they are read as the SSH user only.
+	ReadWithSudo bool `mapstructure:"read_with_sudo"`
 }
 
 // MatrixConfig holds Matrix server configuration
@@ -65,6 +72,11 @@ type MatrixConfig struct {
 	AppService AppServiceConfig `mapstructure:"appservice"` // Application Service for message import
 	MAS        MASConfig        `mapstructure:"mas"`        // Matrix Authentication Service for user creation
 	Import     ImportConfig     `mapstructure:"import"`     // Room/space import options (owner and alias)
+
+	// AllowInsecureHTTP permits http:// to a non-loopback host for matrix.api.base_url and
+	// matrix.mas.endpoint. Tokens and passwords are sent to those endpoints, so the default
+	// is to refuse.
+	AllowInsecureHTTP bool `mapstructure:"allow_insecure_http"`
 }
 
 // ImportConfig holds options for importing rooms and spaces from Mattermost
@@ -182,6 +194,12 @@ type SSHConfig struct {
 	KeyPath       string `mapstructure:"key_path"`       // Optional: path to SSH key
 	PassphraseEnv string `mapstructure:"passphrase_env"` // Optional: env var for key passphrase
 	PasswordEnv   string `mapstructure:"password_env"`   // Optional: env var for SSH password
+
+	// Host key verification. Checked in this order: InsecureIgnoreHostKey accepts any key,
+	// HostKeyFingerprint pins one key, otherwise the key must be in KnownHostsPath.
+	KnownHostsPath        string `mapstructure:"known_hosts_path"`         // Empty means ~/.ssh/known_hosts
+	HostKeyFingerprint    string `mapstructure:"host_key_fingerprint"`     // "SHA256:..." as printed by ssh-keygen -lf
+	InsecureIgnoreHostKey bool   `mapstructure:"insecure_ignore_host_key"` // Accept any host key (unsafe)
 }
 
 // DatabaseConfig holds PostgreSQL connection configuration (optional manual override)
@@ -222,13 +240,43 @@ func ResolveDBSSLMode(configured, discovered, host string) string {
 	if configured != "" {
 		return configured
 	}
-	if discovered != "" {
+	// The discovered value comes from Mattermost's DataSource string and ends up in the DSN,
+	// so only a mode lib/pq accepts may pass through.
+	if isValidDBSSLMode(discovered) {
 		return discovered
 	}
 	if isLocalDBHost(host) {
 		return DBSSLModeDisable
 	}
 	return DBSSLModeRequire
+}
+
+func isValidDBSSLMode(m string) bool {
+	switch m {
+	case DBSSLModeDisable, DBSSLModeRequire, DBSSLModeVerifyCA, DBSSLModeVerifyFull:
+		return true
+	}
+	return false
+}
+
+// isCleartextRemoteHTTP reports whether rawURL is http:// to a host that is not loopback.
+func isCleartextRemoteHTTP(rawURL string) bool {
+	u, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil || !strings.EqualFold(u.Scheme, "http") {
+		return false
+	}
+	host := u.Hostname()
+	if strings.EqualFold(host, "localhost") {
+		return false
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		return false
+	}
+	return true
+}
+
+func insecureHTTPError(key string) error {
+	return fmt.Errorf("%s uses http:// to a non-loopback host, so tokens and passwords would cross the network unencrypted; use https:// or set matrix.allow_insecure_http: true", key)
 }
 
 // isLocalDBHost reports whether a connection to host stays on this machine. lib/pq treats a
@@ -329,6 +377,8 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("mattermost.database.host", "localhost")
 	v.SetDefault("mattermost.database.port", 5432)
 	v.SetDefault("mattermost.files.fallback_to_link_on_upload_failure", false)
+	v.SetDefault("mattermost.files.read_with_sudo", false)
+	v.SetDefault("matrix.allow_insecure_http", false)
 	v.SetDefault("matrix.ssh.port", 22)
 	v.SetDefault("matrix.api.base_url", "http://localhost:8008")
 	v.SetDefault("matrix.api.port", 8008) // Synapse API port for SSH tunnel
@@ -393,6 +443,8 @@ func findOverlookedConfigFile(paths []string) string {
 func (c *Config) expandPaths() {
 	c.Mattermost.SSH.KeyPath = expandPath(c.Mattermost.SSH.KeyPath)
 	c.Matrix.SSH.KeyPath = expandPath(c.Matrix.SSH.KeyPath)
+	c.Mattermost.SSH.KnownHostsPath = expandPath(c.Mattermost.SSH.KnownHostsPath)
+	c.Matrix.SSH.KnownHostsPath = expandPath(c.Matrix.SSH.KnownHostsPath)
 	c.Data.AssetsDir = expandPath(c.Data.AssetsDir)
 	c.Data.MappingsDir = expandPath(c.Data.MappingsDir)
 	c.Data.StateFile = expandPath(c.Data.StateFile)
@@ -418,8 +470,28 @@ func expandPath(path string) string {
 	return path
 }
 
+// validateHostKeyFingerprint checks a pinned host key is written the way the SSH layer
+// compares it: the SHA256 fingerprint alone, as ssh-keygen -lf prints it in its second field.
+// Anything else - the whole ssh-keygen line, an MD5 fingerprint - could never match, and the
+// connection would then be refused as if the host key had changed.
+func validateHostKeyFingerprint(key, fp string) error {
+	if fp == "" {
+		return nil
+	}
+	if !strings.HasPrefix(fp, "SHA256:") || strings.ContainsFunc(fp, unicode.IsSpace) {
+		return fmt.Errorf("%s must be the SHA256 fingerprint alone, in the form \"SHA256:<base64>\" with no spaces - the second field printed by `ssh-keygen -lf <host key file>` - got %q", key, fp)
+	}
+	return nil
+}
+
 // Validate validates the configuration
 func (c *Config) Validate() error {
+	if err := validateHostKeyFingerprint("mattermost.ssh.host_key_fingerprint", c.Mattermost.SSH.HostKeyFingerprint); err != nil {
+		return err
+	}
+	if err := validateHostKeyFingerprint("matrix.ssh.host_key_fingerprint", c.Matrix.SSH.HostKeyFingerprint); err != nil {
+		return err
+	}
 	// Validate Mattermost config if SSH host is provided
 	if c.Mattermost.SSH.Host != "" {
 		if c.Mattermost.SSH.User == "" {
@@ -457,6 +529,11 @@ func (c *Config) Validate() error {
 		}
 	} else if c.Matrix.SSH.Host != "" {
 		return fmt.Errorf("matrix.homeserver is required")
+	}
+	// Direct mode only: over an SSH tunnel base_url is unused. Checked whether or not a
+	// homeserver is configured, since direct mode uses base_url either way.
+	if c.Matrix.SSH.Host == "" && !c.Matrix.AllowInsecureHTTP && isCleartextRemoteHTTP(c.Matrix.API.BaseURL) {
+		return insecureHTTPError("matrix.api.base_url")
 	}
 
 	// Validate public_room_join_rules
@@ -522,6 +599,9 @@ func (c *Config) Validate() error {
 	if c.Matrix.MAS.Enabled {
 		if c.Matrix.MAS.Endpoint == "" {
 			return fmt.Errorf("matrix.mas.endpoint is required when mas is enabled")
+		}
+		if !c.Matrix.AllowInsecureHTTP && isCleartextRemoteHTTP(c.Matrix.MAS.Endpoint) {
+			return insecureHTTPError("matrix.mas.endpoint")
 		}
 		if c.Matrix.MAS.ClientIDEnv == "" || c.Matrix.MAS.ClientSecretEnv == "" {
 			return fmt.Errorf("matrix.mas.client_id_env and matrix.mas.client_secret_env are required when mas is enabled")
@@ -662,14 +742,14 @@ func (c *Config) EnsureDataDirs() error {
 	dirs := []string{c.Data.AssetsDir, c.Data.MappingsDir}
 
 	for _, dir := range dirs {
-		if err := os.MkdirAll(dir, 0755); err != nil {
+		if err := os.MkdirAll(dir, 0700); err != nil {
 			return fmt.Errorf("failed to create directory %s: %w", dir, err)
 		}
 	}
 
 	// Ensure state file directory exists
 	stateDir := filepath.Dir(c.Data.StateFile)
-	if err := os.MkdirAll(stateDir, 0755); err != nil {
+	if err := os.MkdirAll(stateDir, 0700); err != nil {
 		return fmt.Errorf("failed to create state directory %s: %w", stateDir, err)
 	}
 

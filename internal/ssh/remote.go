@@ -23,23 +23,13 @@ func NewRemoteExecutor(cfg config.SSHConfig, passphrase string) (*RemoteExecutor
 
 // NewRemoteExecutorWithPassword creates a new remote executor with optional password auth
 func NewRemoteExecutorWithPassword(cfg config.SSHConfig, passphrase, password string) (*RemoteExecutor, error) {
-	// Build auth methods
-	authMethods, err := buildAuthMethods(cfg, passphrase, password)
+	sshConfig, err := newClientConfig(cfg, passphrase, password, 30*time.Second)
 	if err != nil {
-		return nil, fmt.Errorf("failed to build auth methods: %w", err)
-	}
-
-	// Create SSH client config
-	sshConfig := &ssh.ClientConfig{
-		User:            cfg.User,
-		Auth:            authMethods,
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-		Timeout:         30 * time.Second,
+		return nil, err
 	}
 
 	// Connect to SSH server
-	sshAddr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
-	client, err := ssh.Dial("tcp", sshAddr, sshConfig)
+	client, err := ssh.Dial("tcp", dialAddress(cfg), sshConfig)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to SSH server: %w", err)
 	}
@@ -55,7 +45,33 @@ func (r *RemoteExecutor) Close() error {
 	return nil
 }
 
-// ReadFile reads a file from the remote server
+// ReadFileAsUser reads a file from the remote server as the SSH user, without sudo.
+func (r *RemoteExecutor) ReadFileAsUser(path string) ([]byte, error) {
+	session, err := r.client.NewSession()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create session: %w", err)
+	}
+	defer session.Close()
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	session.Stdout = &stdout
+	session.Stderr = &stderr
+
+	if err := session.Run("cat " + shellQuote(path)); err != nil {
+		detail := strings.TrimSpace(stderr.String())
+		if detail == "" {
+			detail = err.Error()
+		}
+		return nil, fmt.Errorf("failed to read file %s as SSH user: %s", path, detail)
+	}
+
+	return stdout.Bytes(), nil
+}
+
+// ReadFile reads a file from the remote server, falling back to `sudo cat` when the SSH
+// user cannot read it. Used for Mattermost's config.json; attachments use ReadFileAsUser
+// unless mattermost.files.read_with_sudo is set.
 func (r *RemoteExecutor) ReadFile(path string) ([]byte, error) {
 	session, err := r.client.NewSession()
 	if err != nil {
@@ -93,27 +109,6 @@ func (r *RemoteExecutor) FileExists(path string) (bool, error) {
 	}
 
 	return bytes.Contains(output, []byte("exists")), nil
-}
-
-// ExecuteCommand executes a command on the remote server
-func (r *RemoteExecutor) ExecuteCommand(cmd string) (string, error) {
-	session, err := r.client.NewSession()
-	if err != nil {
-		return "", fmt.Errorf("failed to create session: %w", err)
-	}
-	defer session.Close()
-
-	output, err := session.Output(cmd)
-	if err != nil {
-		return "", fmt.Errorf("command failed: %w", err)
-	}
-
-	return string(output), nil
-}
-
-// GetClient returns the underlying SSH client (for creating tunnels)
-func (r *RemoteExecutor) GetClient() *ssh.Client {
-	return r.client
 }
 
 // shellQuote returns a POSIX shell-safe single-quoted string.

@@ -9,7 +9,9 @@
 # 3. Replace example.com with your homeserver domain in the namespace regexes below
 # 4. Add to homeserver.yaml: app_service_config_files: ["/etc/matrix-synapse/matrixmigrate.yaml"]
 # 5. Restart Synapse
-# 6. Add the as_token to your MatrixMigrate config.yaml
+# 6. Export the as_token in the environment variable named by matrix.appservice.as_token_env
+#    in your MatrixMigrate config.yaml (e.g. export MATRIX_AS_TOKEN=...); config.yaml holds
+#    only the variable name, never the token itself
 
 id: matrixmigrate
 url: null  # No callback URL needed - this is outbound-only

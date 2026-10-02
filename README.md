@@ -30,6 +30,8 @@ A CLI tool for migrating from Mattermost to Matrix Synapse with multi-step, resu
 
 ## Installation
 
+Requires Go 1.26 or newer.
+
 ```bash
 go install github.com/aligundogdu/matrixmigrate/cmd/matrixmigrate@latest
 ```
@@ -158,6 +160,46 @@ matrix:
    export MATRIX_ADMIN_PASSWORD="your-admin-password"
    ```
 
+### SSH host key verification
+
+Every SSH connection (database tunnel, Matrix API tunnel, reading `config.json` and
+attachments) verifies the server's host key before sending a password or forwarding
+credentials. Options under `mattermost.ssh` and `matrix.ssh`:
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `known_hosts_path` | `~/.ssh/known_hosts` | OpenSSH `known_hosts` file the host key is checked against. `~` and environment variables are expanded. |
+| `host_key_fingerprint` | — | Pin the server's key instead of using `known_hosts`: the `SHA256:...` value printed by `ssh-keygen -lf` (that field alone, not the whole line). Only a key with exactly this fingerprint is accepted. Ed25519 is requested first, so pin the server's Ed25519 key (`/etc/ssh/ssh_host_ed25519_key.pub`); for a server without one, pin the key of the type named in the error. |
+| `insecure_ignore_host_key` | `false` | Accept any host key. Anyone on the network path can then impersonate the server and capture the SSH password, the database credentials and the Matrix tokens. A warning naming the host is logged on every connection. Use only on a trusted, isolated network. |
+
+They are checked in this order: `insecure_ignore_host_key`, then `host_key_fingerprint`,
+then `known_hosts_path`.
+
+**First connection.** If the server is not in `known_hosts` yet, the connection fails and
+the error shows the type and fingerprint of the key the server presented (Ed25519 on a
+stock OpenSSH server, which is offered first). Compare it with the fingerprint of the key of
+that type on the server itself — `ssh-keygen -lf /etc/ssh/ssh_host_<type>_key.pub`, run
+there, for the key type shown in the error (the error names the exact file) — then either
+add the host:
+
+```bash
+ssh-keyscan -p 22 mattermost.example.com >> ~/.ssh/known_hosts
+```
+
+or put the fingerprint in the config:
+
+```yaml
+mattermost:
+  ssh:
+    host: "mattermost.example.com"
+    host_key_fingerprint: "SHA256:..."
+```
+
+Connecting once with `ssh -p 22 alice@mattermost.example.com` and accepting the key also
+adds it. If the error instead says the host key does **not** match the known one, do not
+work around it: either the server's key was replaced, or the connection is being
+intercepted. Confirm with the server's administrator before editing `known_hosts`.
+
 ### How It Works
 
 **Mattermost**: The tool connects via SSH and reads `/opt/mattermost/config/config.json` to get database credentials. No manual database configuration needed!
@@ -182,6 +224,15 @@ Under `mattermost.files` in `config.yaml`:
 | `local_data_path` | — | Path to the Mattermost file storage directory, as reachable from the machine running the tool (typically an NFS/SSHFS mount of Mattermost's `data/` directory). Required when `mode: "upload"`. |
 | `max_upload_size_mb` | `50` | Files larger than this are not uploaded. Must not exceed the Synapse `max_upload_size` setting, or uploads will be rejected by the homeserver. Rejected files are counted and reported at the end of the import. |
 | `fallback_to_link_on_upload_failure` | `false` | When `mode: "upload"` and an individual upload fails, fall back to linking that file instead of recording an error. Useful for a first pass over a large archive where a handful of files are unreadable. |
+| `read_with_sudo` | `false` | When `mode: "upload"` and an attachment is not under `local_data_path` on this machine, it is read from the Mattermost server over SSH as the SSH user. Set this to `true` to retry with `sudo cat` when that user cannot read it (requires passwordless sudo). Off by default so the migration does not run privileged commands on the Mattermost server unasked. |
+
+### Matrix connection options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `matrix.allow_insecure_http` | `false` | `matrix.api.base_url` (direct mode, no `matrix.ssh`) and `matrix.mas.endpoint` carry admin tokens and passwords, so `http://` to a host other than `localhost`, `127.0.0.1` or `::1` is rejected at startup. Set this to `true` to accept cleartext HTTP to a remote host anyway, for example on a trusted private network. |
+
+Attachment paths read from the Mattermost database must stay inside `local_data_path`; a path that is absolute or contains `..` is skipped and reported as an unsafe attachment path. A file whose real size exceeds `max_upload_size_mb` is treated as too large even if the export recorded a smaller size.
 
 ### Matrix import options
 
@@ -503,6 +554,55 @@ to repeat: an account already out of a room counts as already removed rather tha
 failure. Run it once at the end of a migration and check the summary lines for a non-zero
 failure count.
 
+### Interrupting and resuming
+
+Every import step can be stopped and run again; a second run picks up where the first one
+stopped instead of creating or sending anything twice.
+
+**Signals.** The first Ctrl+C, `SIGTERM` or `SIGHUP` (a dropped SSH session) asks the running
+step to stop: it finishes the item in flight, saves its progress and exits with a non-zero
+status and an "interrupted" error. A second signal aborts the process at once, losing whatever
+was done since the last save. Exports are not interruptible: after the first signal an export
+runs to the end and writes its file, then still exits non-zero, so a script running the steps
+in sequence (`set -e`) stops instead of starting the next one. In the TUI, Ctrl+C while a step
+runs asks it to stop the same way, and the screen stays until the step has returned.
+
+**What is saved.**
+
+- `import assets` checkpoints the asset mapping (`mappings/asset-mapping-<ts>.json`) after the
+  user pass and after every space and room it creates. A re-run merges the newest mapping on
+  disk with the one recorded in `state.json` and skips everything already in it. A mapping
+  file that exists but cannot be read stops the step instead of starting from nothing. A user
+  whose existence could not be checked is left untouched and unmapped; the step then saves
+  everything else and fails, asking for `import assets` to be run again before `import
+  messages`, which would otherwise post that user's messages as the Application Service bot.
+- `import messages` checkpoints the message mapping (`mappings/message-mapping-<ts>.json`)
+  every 500 messages and when it stops: sent messages, reactions and attachments. If that
+  final save fails, the step fails and the newest checkpoint is the last good record.
+- `import memberships`, `import leave-rooms` and `import enable-notifications` are safe to
+  repeat as they are.
+
+**Resuming.** Run the same command again. `matrixmigrate status` shows the interrupted step as
+failed with the reason.
+
+**Leftover memberships.** To replay history, `import messages` joins past authors (and the
+Application Service bot) to rooms they had left, and records each join in
+`mappings/history-joins.json` *before* making it. The step withdraws those memberships when it
+finishes; an interrupted run, or a withdrawal that failed, leaves them in that file, and
+`import leave-rooms` clears them. A join whose outcome is unknown (a timeout or a 5xx answer)
+stays in the file too, since the homeserver may have applied it. After an interrupt, these
+cleanup calls are not retried when the homeserver answers 429; whatever is left stays in the
+journal for `import leave-rooms`.
+
+**Attachments.** In `upload` mode each attachment is recorded in the message mapping once it
+is sent, and one that failed is sent by the next run. This only covers failures recorded by
+this version: a mapping written by an earlier version that did not track attachments is
+upgraded by taking every attachment of an already-imported post as sent, so attachments that
+failed under that version are not retried. Attachments in `link` mode are not tracked, so
+switching a migration from `link` to `upload` sends those posts' attachments again as uploads.
+
+Building from source needs Go 1.26 or newer.
+
 ## Architecture
 
 ```
@@ -781,7 +881,7 @@ matrix:
   # ... ssh, api, auth, homeserver ...
   mas:
     enabled: true
-    endpoint: "http://mas.example.com:8080"   # or http://localhost:8080 if you tunnel MAS
+    endpoint: "https://mas.example.com"   # or http://localhost:8080 if you tunnel MAS
     client_id_env: "MAS_CLIENT_ID"
     client_secret_env: "MAS_CLIENT_SECRET"
 ```
@@ -873,6 +973,7 @@ Use `./matrixmigrate test all` to identify exactly where the connection fails.
 - For key auth: Ensure SSH key is properly configured and has correct permissions
 - For password auth: Check that the password environment variable is set
 - Verify the SSH port is correct (default: 22)
+- Host key errors ("is not in ...known_hosts", "known_hosts file ... does not exist"): see [SSH host key verification](#ssh-host-key-verification)
 
 ### Mattermost Config Not Found
 - Check the `config_path` in your config.yaml

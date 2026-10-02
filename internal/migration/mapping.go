@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/aligundogdu/matrixmigrate/pkg/archive"
 )
 
 // Mapping represents the ID mappings between Mattermost and Matrix
@@ -95,7 +97,7 @@ type MappingStats struct {
 func SaveMapping(mapping *Mapping, filePath string) error {
 	// Ensure directory exists
 	dir := filepath.Dir(filePath)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0700); err != nil {
 		return fmt.Errorf("failed to create directory: %w", err)
 	}
 
@@ -104,7 +106,7 @@ func SaveMapping(mapping *Mapping, filePath string) error {
 		return fmt.Errorf("failed to marshal mapping: %w", err)
 	}
 
-	if err := os.WriteFile(filePath, data, 0644); err != nil {
+	if err := archive.WriteFileAtomic(filePath, data, 0600); err != nil {
 		return fmt.Errorf("failed to write mapping file: %w", err)
 	}
 
@@ -132,37 +134,26 @@ func MappingExists(filePath string) bool {
 	return err == nil
 }
 
-// GetLatestMappingFile finds the most recent mapping file in a directory
+// GetLatestMappingFile returns the newest asset-mapping file in dir, or "" when there is none.
+// Newest means the latest timestamp in the file name, not the latest mtime: a file copied or
+// restored later must not win over the mapping the last run actually wrote.
 func GetLatestMappingFile(dir string) (string, error) {
-	pattern := filepath.Join(dir, "asset-mapping-*.json")
+	return latestFileByName(filepath.Join(dir, "asset-mapping-*.json"))
+}
+
+// latestFileByName returns the match of pattern that sorts last, or "" when nothing matches.
+// The timestamped file names sort chronologically.
+func latestFileByName(pattern string) (string, error) {
 	matches, err := filepath.Glob(pattern)
 	if err != nil {
-		return "", fmt.Errorf("failed to glob mapping files: %w", err)
+		return "", fmt.Errorf("failed to glob %s: %w", pattern, err)
 	}
-
-	if len(matches) == 0 {
-		return "", fmt.Errorf("no mapping files found")
-	}
-
-	// Find the most recent file
-	var latest string
-	var latestTime time.Time
-
+	latest := ""
 	for _, match := range matches {
-		info, err := os.Stat(match)
-		if err != nil {
-			continue
-		}
-		if latest == "" || info.ModTime().After(latestTime) {
+		if match > latest {
 			latest = match
-			latestTime = info.ModTime()
 		}
 	}
-
-	if latest == "" {
-		return "", fmt.Errorf("no valid mapping files found")
-	}
-
 	return latest, nil
 }
 

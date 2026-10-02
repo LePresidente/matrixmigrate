@@ -33,6 +33,18 @@ mattermost:
     
     # Option 2: Password authentication
     # password_env: "MM_SSH_PASSWORD"  # Env var containing SSH password
+
+    # Host key verification (protects the SSH password, database credentials and tokens).
+    # Checked in this order; by default the key must already be in ~/.ssh/known_hosts.
+    # First connection: the error prints the type and fingerprint of the key the server
+    # presented (Ed25519 is requested first). Compare it with
+    #   ssh-keygen -lf /etc/ssh/ssh_host_<type>_key.pub   (run on the server)
+    # for the key type shown in the error, then add the host with
+    #   ssh-keyscan -p <port> <host> >> ~/.ssh/known_hosts
+    # or set host_key_fingerprint below.
+    # insecure_ignore_host_key: false           # true accepts ANY key - unsafe, logs a warning
+    # host_key_fingerprint: "SHA256:..."        # pin one key (ssh-keygen -lf of the server's ed25519 key)
+    # known_hosts_path: "~/.ssh/known_hosts"    # default when unset
   
   # Path to Mattermost config.json on remote server
   # Database credentials will be read from this file automatically!
@@ -88,6 +100,11 @@ mattermost:
     # If false (default), failed uploads are skipped and logged.
     fallback_to_link_on_upload_failure: false
 
+    # Upload mode reads attachments missing from this machine over mattermost.ssh, as the
+    # SSH user. Set true to retry with `sudo cat` when that user lacks permission
+    # (needs passwordless sudo on the Mattermost server). Default: false.
+    # read_with_sudo: false
+
 # Matrix Synapse server configuration
 matrix:
   # Leave `ssh` empty to use direct mode: the Matrix API is reached over `api.base_url`
@@ -107,7 +124,24 @@ matrix:
     
     # Option 2: Password authentication
     # password_env: "MX_SSH_PASSWORD"  # Env var containing SSH password
+
+    # Host key verification (protects the SSH password, database credentials and tokens).
+    # Checked in this order; by default the key must already be in ~/.ssh/known_hosts.
+    # First connection: the error prints the type and fingerprint of the key the server
+    # presented (Ed25519 is requested first). Compare it with
+    #   ssh-keygen -lf /etc/ssh/ssh_host_<type>_key.pub   (run on the server)
+    # for the key type shown in the error, then add the host with
+    #   ssh-keyscan -p <port> <host> >> ~/.ssh/known_hosts
+    # or set host_key_fingerprint below.
+    # insecure_ignore_host_key: false           # true accepts ANY key - unsafe, logs a warning
+    # host_key_fingerprint: "SHA256:..."        # pin one key (ssh-keygen -lf of the server's ed25519 key)
+    # known_hosts_path: "~/.ssh/known_hosts"    # default when unset
   
+  # Matrix API URLs (api.base_url in direct mode, mas.endpoint) must be https:// unless the
+  # host is loopback (localhost, 127.0.0.1, ::1): tokens and passwords are sent to them.
+  # Set true to allow cleartext http:// to a remote host anyway (e.g. a trusted private network).
+  # allow_insecure_http: false
+
   api:
     # After SSH tunnel, API will be available at localhost
     base_url: "http://localhost:8008"
@@ -239,8 +273,8 @@ matrix:
   mas:
     enabled: false
     
-    # MAS API base URL (e.g. http://mas.example.com:8080 or http://localhost:8080 if tunneled)
-    # endpoint: "http://mas.example.com:8080"
+    # MAS API base URL (e.g. https://mas.example.com or http://localhost:8080 if tunneled)
+    # endpoint: "https://mas.example.com"
     
     # OAuth client credentials - must be an admin client in MAS policy.data.admin_clients
     # client_id_env: "MAS_CLIENT_ID"
@@ -311,60 +345,60 @@ data:
 # ------------------------------------
 # mattermost:
 #   ssh:
-#     host: "mm.company.com"
+#     host: "mattermost.example.com"
 #     user: "admin"
 #     key_path: "~/.ssh/id_rsa"
 #   config_path: "/opt/mattermost/config/config.json"
 #
 # matrix:
 #   ssh:
-#     host: "matrix.company.com"
+#     host: "matrix.example.com"
 #     user: "admin"
 #     key_path: "~/.ssh/id_rsa"
 #   auth:
 #     username: "admin"
 #     password_env: "MATRIX_ADMIN_PASSWORD"
-#   homeserver: "company.com"
+#   homeserver: "example.com"
 
 
 # Example 2: Mattermost with root password, Matrix with key
 # ---------------------------------------------------------
 # mattermost:
 #   ssh:
-#     host: "mm.company.com"
+#     host: "mattermost.example.com"
 #     user: "root"
 #     password_env: "MM_SSH_PASSWORD"  # export MM_SSH_PASSWORD="rootpass"
 #   config_path: "/opt/mattermost/config/config.json"
 #
 # matrix:
 #   ssh:
-#     host: "matrix.company.com"
+#     host: "matrix.example.com"
 #     user: "admin"
 #     key_path: "~/.ssh/id_rsa"
 #   auth:
 #     username: "admin"
 #     password_env: "MATRIX_ADMIN_PASSWORD"
-#   homeserver: "company.com"
+#   homeserver: "example.com"
 
 
 # Example 3: Both with password auth
 # ----------------------------------
 # mattermost:
 #   ssh:
-#     host: "mm.company.com"
+#     host: "mattermost.example.com"
 #     user: "root"
 #     password_env: "MM_SSH_PASSWORD"
 #   config_path: "/opt/mattermost/config/config.json"
 #
 # matrix:
 #   ssh:
-#     host: "matrix.company.com"
+#     host: "matrix.example.com"
 #     user: "root"
 #     password_env: "MX_SSH_PASSWORD"
 #   auth:
 #     username: "admin"
 #     password_env: "MATRIX_ADMIN_PASSWORD"
-#   homeserver: "company.com"
+#   homeserver: "example.com"
 
 
 # Example 4: GitLab-bundled Mattermost -> Element Server Suite (no SSH on either side)
@@ -395,15 +429,15 @@ data:
 # matrix:
 #   ssh: {}                                  # direct mode
 #   api:
-#     base_url: "https://matrix.company.com"
+#     base_url: "https://matrix.example.com"
 #     admin_token_env: "MATRIX_ADMIN_TOKEN"
-#   homeserver: "company.com"
+#   homeserver: "example.com"
 #   appservice:
 #     enabled: true                          # needed for timestamps and DMs
 #     as_token_env: "MATRIX_AS_TOKEN"
 #   mas:
 #     enabled: true
-#     endpoint: "https://account.company.com"
+#     endpoint: "https://account.example.com"
 #     client_id_env: "MAS_CLIENT_ID"
 #     client_secret_env: "MAS_CLIENT_SECRET"
 #   import:

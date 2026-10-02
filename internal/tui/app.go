@@ -1,7 +1,10 @@
 package tui
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"os"
 
 	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
@@ -33,6 +36,7 @@ const (
 	ViewProgress
 	ViewError
 	ViewSuccess
+	ViewInterrupted
 )
 
 // Model is the main application model
@@ -67,11 +71,27 @@ type Model struct {
 	// Operation result for detailed stats
 	operationResult *migration.OperationResult
 
-	// Program reference for sending messages from goroutines
-	program *tea.Program
+	// ctx is the parent of every step's context; cancelling it stops a running step.
+	ctx context.Context
+
+	// step is the migration step running in the background, nil when none is. While it is
+	// set no other step can start and the progress view cannot be left.
+	step *runningStep
+
+	// stopping is set once ctrl+c asked the running step to stop.
+	stopping bool
 
 	// Quitting
 	quitting bool
+}
+
+// runningStep is a migration step running in the background. A pointer, so every copy of
+// the Model refers to the same one.
+type runningStep struct {
+	// cancel cancels the context the step runs under.
+	cancel context.CancelFunc
+	// done is closed when the step's command returns.
+	done chan struct{}
 }
 
 // MenuItem represents a menu item
@@ -106,6 +126,7 @@ func NewModel(cfg *config.Config) (Model, error) {
 		orchestrator: orchestrator,
 		view:         ViewMenu,
 		spinner:      s,
+		ctx:          context.Background(),
 		width:        80,
 		height:       24,
 	}
@@ -134,65 +155,65 @@ func (m *Model) createMenuItems() []MenuItem {
 	return []MenuItem{
 		{
 			Title:    locale.Menu.ExportAssets,
-			Desc:     "Export users, teams, and channels from Mattermost",
+			Desc:     i18n.T("menu.export_assets_desc"),
 			View:     ViewExportAssets,
 			Disabled: !canExportAssets,
 		},
 		{
 			Title:    locale.Menu.ImportAssets,
-			Desc:     "Import assets to Matrix",
+			Desc:     i18n.T("menu.import_assets_desc"),
 			View:     ViewImportAssets,
 			Disabled: !canImportAssets,
 		},
 		{
 			Title:    locale.Menu.ExportMemberships,
-			Desc:     "Export team and channel memberships",
+			Desc:     i18n.T("menu.export_memberships_desc"),
 			View:     ViewExportMemberships,
 			Disabled: !canExportMemberships,
 		},
 		{
 			Title:    locale.Menu.ImportMemberships,
-			Desc:     "Apply memberships in Matrix",
+			Desc:     i18n.T("menu.import_memberships_desc"),
 			View:     ViewImportMemberships,
 			Disabled: !canImportMemberships,
 		},
 		{
 			Title:    locale.Menu.ExportMessages,
-			Desc:     "Export all messages and files from Mattermost",
+			Desc:     i18n.T("menu.export_messages_desc"),
 			View:     ViewExportMessages,
 			Disabled: !canExportMessages,
 		},
 		{
 			Title:    locale.Menu.ImportMessages,
-			Desc:     "Import messages to Matrix rooms",
+			Desc:     i18n.T("menu.import_messages_desc"),
 			View:     ViewImportMessages,
 			Disabled: !canImportMessages,
 		},
 		{
 			Title:    locale.Menu.LeaveRooms,
-			Desc:     "Leave all migrated rooms and spaces (cleanup)",
+			Desc:     i18n.T("menu.leave_rooms_desc"),
 			View:     ViewLeaveRooms,
 			Disabled: !canLeaveRooms,
 		},
 		{
 			Title:    locale.Menu.EnableNotifs,
-			Desc:     "Turn on email notifications for migrated users (run after messages)",
+			Desc:     i18n.T("menu.enable_notifications_desc"),
 			View:     ViewEnableNotifications,
 			Disabled: !canEnableNotifications,
 		},
 		{
 			Title: locale.Menu.TestConnection,
-			Desc:  "Test Mattermost and Matrix connections",
+			Desc:  i18n.T("menu.test_connection_desc"),
 			View:  ViewTestConnection,
 		},
 		{
 			Title: locale.Menu.Status,
-			Desc:  "View migration status",
+			Desc:  i18n.T("menu.status_desc"),
 			View:  ViewStatus,
 		},
 		{
 			Title: locale.Menu.Quit,
-			Desc:  "Exit the application",
+			Desc:  i18n.T("menu.quit_desc"),
 			View:  ViewMenu,
 			Action: func() tea.Cmd {
 				return tea.Quit
@@ -225,7 +246,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case operationCompleteMsg:
-		if msg.err != nil {
+		if m.step != nil {
+			m.step.cancel() // releases the step's context
+			m.step = nil
+		}
+		m.stopping = false
+		if errors.Is(msg.err, migration.ErrInterrupted) {
+			m.errorMessage = msg.err.Error()
+			m.view = ViewInterrupted
+		} else if msg.err != nil {
 			m.errorMessage = msg.err.Error()
 			m.view = ViewError
 		} else {
@@ -240,7 +269,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case testCompleteMsg:
 		m.testResult = msg.result
 		m.testDone = true
-		m.view = ViewTestConnection
+		// Never pull the user off a running step's progress view.
+		if m.step == nil {
+			m.view = ViewTestConnection
+		}
 		return m, nil
 	}
 
@@ -251,6 +283,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "ctrl+c", "q":
+		if m.step != nil {
+			// While a step runs, ctrl+c asks it to stop after the item in flight and the
+			// view stays put until it returns; q does nothing.
+			if msg.String() == "ctrl+c" && !m.stopping {
+				m.step.cancel()
+				m.stopping = true
+			}
+			return m, nil
+		}
 		if m.view == ViewMenu {
 			m.quitting = true
 			return m, tea.Quit
@@ -278,6 +319,9 @@ func (m Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case "enter", " ":
+		if m.step != nil {
+			return m, nil
+		}
 		if m.view == ViewMenu {
 			item := m.menuItems[m.menuIndex]
 			if item.Disabled {
@@ -288,16 +332,19 @@ func (m Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			m.previousView = m.view
 			m.view = item.View
-			return m, m.handleViewChange(item.View)
+			// Call first, then return m: handleViewChange records the started step on m, and
+			// the order operands of one return statement are evaluated in is unspecified.
+			cmd := m.handleViewChange(item.View)
+			return m, cmd
 		}
-		if m.view == ViewError || m.view == ViewSuccess {
+		if m.view == ViewError || m.view == ViewSuccess || m.view == ViewInterrupted {
 			m.view = ViewMenu
 			return m, nil
 		}
 		return m, nil
 
 	case "esc":
-		if m.view != ViewMenu {
+		if m.step == nil && m.view != ViewMenu {
 			m.view = ViewMenu
 		}
 		return m, nil
@@ -310,21 +357,21 @@ func (m Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m *Model) handleViewChange(view View) tea.Cmd {
 	switch view {
 	case ViewExportAssets:
-		return m.runExportAssets()
+		return m.startStep(m.runExportAssets())
 	case ViewImportAssets:
-		return m.runImportAssets()
+		return m.startStep(m.runImportAssets())
 	case ViewExportMemberships:
-		return m.runExportMemberships()
+		return m.startStep(m.runExportMemberships())
 	case ViewImportMemberships:
-		return m.runImportMemberships()
+		return m.startStep(m.runImportMemberships())
 	case ViewLeaveRooms:
-		return m.runLeaveRooms()
+		return m.startStep(m.runLeaveRooms())
 	case ViewEnableNotifications:
-		return m.runEnableNotifications()
+		return m.startStep(m.runEnableNotifications())
 	case ViewExportMessages:
-		return m.runExportMessages()
+		return m.startStep(m.runExportMessages())
 	case ViewImportMessages:
-		return m.runImportMessages()
+		return m.startStep(m.runImportMessages())
 	case ViewTestConnection:
 		return m.runTestConnection()
 	case ViewStatus:
@@ -332,6 +379,22 @@ func (m *Model) handleViewChange(view View) tea.Cmd {
 		return nil
 	}
 	return nil
+}
+
+// startStep marks a step as running and gives it a fresh cancellable context, handed to the
+// orchestrator, so ctrl+c can stop it. The returned command runs cmd and then records that
+// the step has returned.
+func (m *Model) startStep(cmd tea.Cmd) tea.Cmd {
+	ctx, cancel := context.WithCancel(m.ctx)
+	m.orchestrator.SetContext(ctx)
+	run := &runningStep{cancel: cancel, done: make(chan struct{})}
+	m.step = run
+	m.stopping = false
+	m.progressStage, m.progressCurrent, m.progressTotal, m.progressItem = "", 0, 0, ""
+	return func() tea.Msg {
+		defer close(run.done)
+		return cmd()
+	}
 }
 
 // View renders the UI
@@ -351,6 +414,8 @@ func (m Model) View() string {
 		return m.renderError()
 	case ViewSuccess:
 		return m.renderSuccess()
+	case ViewInterrupted:
+		return m.renderInterrupted()
 	case ViewTestConnection:
 		return m.renderTestConnection()
 	case ViewExportAssets, ViewImportAssets, ViewExportMemberships, ViewImportMemberships, ViewExportMessages, ViewImportMessages, ViewLeaveRooms, ViewEnableNotifications:
@@ -466,16 +531,14 @@ func (m Model) renderProgress() string {
 		progressInfo = m.progressStage
 	}
 
-	content := BoxStyle.Render(
-		lipgloss.JoinVertical(
-			lipgloss.Left,
-			TitleStyle.Render(title),
-			"",
-			spinner+" "+progressInfo,
-		),
-	)
+	lines := []string{TitleStyle.Render(title), "", spinner + " " + progressInfo}
+	help := HelpStyle.Render(i18n.T("messages.step_stop_hint"))
+	if m.stopping {
+		lines = append(lines, "", WarningStyle.Render(i18n.T("messages.step_stopping")))
+		help = HelpStyle.Render("")
+	}
 
-	help := HelpStyle.Render("Please wait...")
+	content := BoxStyle.Render(lipgloss.JoinVertical(lipgloss.Left, lines...))
 
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center,
 		lipgloss.JoinVertical(lipgloss.Center, content, help))
@@ -563,6 +626,26 @@ func (m Model) renderError() string {
 		lipgloss.JoinVertical(lipgloss.Center, content, help))
 }
 
+// renderInterrupted renders the view for a step stopped by the user. Its progress was saved,
+// so this is not shown as a failure.
+func (m Model) renderInterrupted() string {
+	content := BoxStyle.Render(
+		lipgloss.JoinVertical(
+			lipgloss.Left,
+			WarningStyle.Render(i18n.T("messages.interrupted_title")),
+			"",
+			i18n.T("messages.step_interrupted"),
+			"",
+			DimStyle.Render(m.errorMessage),
+		),
+	)
+
+	help := HelpStyle.Render("Press enter to continue")
+
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center,
+		lipgloss.JoinVertical(lipgloss.Center, content, help))
+}
+
 // renderSuccess renders the success view with detailed stats
 func (m Model) renderSuccess() string {
 	var sections []string
@@ -638,7 +721,7 @@ func (m Model) renderSuccess() string {
 		}
 
 		// Import stats - Rooms
-		if r.RoomsCreated > 0 || r.RoomsSkipped > 0 || r.RoomsFailed > 0 || r.RoomsLinked > 0 {
+		if r.RoomsCreated > 0 || r.RoomsSkipped > 0 || r.RoomsFailed > 0 || r.RoomsLinked > 0 || r.RoomsLinkFailed > 0 {
 			sections = append(sections, SubtitleStyle.Render("💬 Rooms:"))
 			if r.RoomsCreated > 0 {
 				sections = append(sections, SuccessStyle.Render(fmt.Sprintf("   ✓ Created: %d", r.RoomsCreated)))
@@ -651,6 +734,9 @@ func (m Model) renderSuccess() string {
 			}
 			if r.RoomsFailed > 0 {
 				sections = append(sections, ErrorStyle.Render(fmt.Sprintf("   ✗ Failed: %d", r.RoomsFailed)))
+			}
+			if r.RoomsLinkFailed > 0 {
+				sections = append(sections, ErrorStyle.Render("   ✗ "+i18n.T("messages.rooms_link_failed", r.RoomsLinkFailed)))
 			}
 			sections = append(sections, "")
 		}
@@ -812,14 +898,14 @@ type operationCompleteMsg struct {
 // Run commands for various operations
 func (m *Model) runExportAssets() tea.Cmd {
 	return func() tea.Msg {
-		sendProgress("Connecting to Mattermost...", 0, 0, "")
+		sendProgress(i18n.T("progress.connecting", "Mattermost"), 0, 0, "")
 
 		// Connect to Mattermost
 		if err := m.orchestrator.ConnectMattermost(); err != nil {
 			return operationCompleteMsg{err: err}
 		}
 
-		sendProgress("Exporting assets...", 0, 0, "")
+		sendProgress(i18n.T("progress.stage_exporting_assets"), 0, 0, "")
 
 		// Run export with live progress updates
 		progress := func(stage string, current, total int, item string) {
@@ -831,20 +917,20 @@ func (m *Model) runExportAssets() tea.Cmd {
 			return operationCompleteMsg{err: err}
 		}
 
-		return operationCompleteMsg{message: "Assets exported successfully!", result: result}
+		return operationCompleteMsg{message: i18n.T("messages.assets_exported"), result: result}
 	}
 }
 
 func (m *Model) runImportAssets() tea.Cmd {
 	return func() tea.Msg {
-		sendProgress("Connecting to Matrix...", 0, 0, "")
+		sendProgress(i18n.T("progress.connecting", "Matrix"), 0, 0, "")
 
 		// Connect to Matrix
 		if err := m.orchestrator.ConnectMatrix(); err != nil {
 			return operationCompleteMsg{err: err}
 		}
 
-		sendProgress("Importing assets...", 0, 0, "")
+		sendProgress(i18n.T("progress.stage_importing_assets"), 0, 0, "")
 
 		// Run import with live progress updates
 		progress := func(stage string, current, total int, item string) {
@@ -856,20 +942,20 @@ func (m *Model) runImportAssets() tea.Cmd {
 			return operationCompleteMsg{err: err}
 		}
 
-		return operationCompleteMsg{message: "Assets imported successfully!", result: result}
+		return operationCompleteMsg{message: i18n.T("messages.assets_imported"), result: result}
 	}
 }
 
 func (m *Model) runExportMemberships() tea.Cmd {
 	return func() tea.Msg {
-		sendProgress("Connecting to Mattermost...", 0, 0, "")
+		sendProgress(i18n.T("progress.connecting", "Mattermost"), 0, 0, "")
 
 		// Connect if not already
 		if err := m.orchestrator.ConnectMattermost(); err != nil {
 			return operationCompleteMsg{err: err}
 		}
 
-		sendProgress("Exporting memberships...", 0, 0, "")
+		sendProgress(i18n.T("progress.stage_exporting_memberships"), 0, 0, "")
 
 		progress := func(stage string, current, total int, item string) {
 			sendProgress(stage, current, total, item)
@@ -880,20 +966,20 @@ func (m *Model) runExportMemberships() tea.Cmd {
 			return operationCompleteMsg{err: err}
 		}
 
-		return operationCompleteMsg{message: "Memberships exported successfully!", result: result}
+		return operationCompleteMsg{message: i18n.T("messages.memberships_exported"), result: result}
 	}
 }
 
 func (m *Model) runImportMemberships() tea.Cmd {
 	return func() tea.Msg {
-		sendProgress("Connecting to Matrix...", 0, 0, "")
+		sendProgress(i18n.T("progress.connecting", "Matrix"), 0, 0, "")
 
 		// Connect if not already
 		if err := m.orchestrator.ConnectMatrix(); err != nil {
 			return operationCompleteMsg{err: err}
 		}
 
-		sendProgress("Importing memberships...", 0, 0, "")
+		sendProgress(i18n.T("progress.stage_importing_memberships"), 0, 0, "")
 
 		progress := func(stage string, current, total int, item string) {
 			sendProgress(stage, current, total, item)
@@ -904,19 +990,19 @@ func (m *Model) runImportMemberships() tea.Cmd {
 			return operationCompleteMsg{err: err}
 		}
 
-		return operationCompleteMsg{message: "Memberships imported successfully!", result: result}
+		return operationCompleteMsg{message: i18n.T("messages.memberships_imported"), result: result}
 	}
 }
 
 func (m *Model) runEnableNotifications() tea.Cmd {
 	return func() tea.Msg {
-		sendProgress("Connecting to Matrix...", 0, 0, "")
+		sendProgress(i18n.T("progress.connecting", "Matrix"), 0, 0, "")
 
 		if err := m.orchestrator.ConnectMatrix(); err != nil {
 			return operationCompleteMsg{err: err}
 		}
 
-		sendProgress("Enabling email notifications...", 0, 0, "")
+		sendProgress(i18n.T("progress.enabling_notifications"), 0, 0, "")
 
 		progress := func(stage string, current, total int, item string) {
 			sendProgress(stage, current, total, item)
@@ -927,9 +1013,9 @@ func (m *Model) runEnableNotifications() tea.Cmd {
 			return operationCompleteMsg{err: err}
 		}
 
-		msg := fmt.Sprintf("Email notifications enabled for %d user(s).", result.UsersCreated)
+		msg := i18n.T("messages.notifications_enabled", result.UsersCreated)
 		if result.UsersFailed > 0 {
-			msg = fmt.Sprintf("Enabled for %d user(s), %d failed - see the log for the reasons.",
+			msg = i18n.T("messages.notifications_enabled_partial",
 				result.UsersCreated, result.UsersFailed)
 		}
 		return operationCompleteMsg{message: msg, result: result}
@@ -938,14 +1024,14 @@ func (m *Model) runEnableNotifications() tea.Cmd {
 
 func (m *Model) runLeaveRooms() tea.Cmd {
 	return func() tea.Msg {
-		sendProgress("Connecting to Matrix...", 0, 0, "")
+		sendProgress(i18n.T("progress.connecting", "Matrix"), 0, 0, "")
 
 		// Connect if not already
 		if err := m.orchestrator.ConnectMatrix(); err != nil {
 			return operationCompleteMsg{err: err}
 		}
 
-		sendProgress("Removing migration accounts from rooms...", 0, 0, "")
+		sendProgress(i18n.T("progress.stage_leaving_rooms"), 0, 0, "")
 
 		progress := func(stage string, current, total int, item string) {
 			sendProgress(stage, current, total, item)
@@ -956,10 +1042,10 @@ func (m *Model) runLeaveRooms() tea.Cmd {
 			return operationCompleteMsg{err: err}
 		}
 
-		msg := fmt.Sprintf("Cleanup done: admin left %d room(s), %d deactivated membership(s) and %d bot membership(s) removed.",
+		msg := i18n.T("messages.leave_rooms_done",
 			result.RoomsLeft, result.DeactivatedRoomsLeft, result.BotRoomsLeft)
 		if failed := result.RoomsLeaveFailed + result.DeactivatedRoomsFailed + result.BotRoomsFailed; failed > 0 {
-			msg = fmt.Sprintf("%s %d removal(s) failed - re-run this step or check the log.", msg, failed)
+			msg = msg + " " + i18n.T("messages.leave_rooms_failures", failed)
 		}
 		return operationCompleteMsg{message: msg, result: result}
 	}
@@ -967,14 +1053,14 @@ func (m *Model) runLeaveRooms() tea.Cmd {
 
 func (m *Model) runExportMessages() tea.Cmd {
 	return func() tea.Msg {
-		sendProgress("Connecting to Mattermost...", 0, 0, "")
+		sendProgress(i18n.T("progress.connecting", "Mattermost"), 0, 0, "")
 
 		// Connect if not already
 		if err := m.orchestrator.ConnectMattermost(); err != nil {
 			return operationCompleteMsg{err: err}
 		}
 
-		sendProgress("Exporting messages...", 0, 0, "")
+		sendProgress(i18n.T("progress.stage_exporting_messages"), 0, 0, "")
 
 		progress := func(stage string, current, total int, item string) {
 			sendProgress(stage, current, total, item)
@@ -985,30 +1071,30 @@ func (m *Model) runExportMessages() tea.Cmd {
 			return operationCompleteMsg{err: err}
 		}
 
-		msg := fmt.Sprintf("Messages exported: %d messages, %d files", result.MessagesExported, result.FilesExported)
+		msg := i18n.T("messages.messages_exported_done", result.MessagesExported, result.FilesExported)
 		return operationCompleteMsg{message: msg}
 	}
 }
 
 func (m *Model) runImportMessages() tea.Cmd {
 	return func() tea.Msg {
-		sendProgress("Connecting to Matrix...", 0, 0, "")
+		sendProgress(i18n.T("progress.connecting", "Matrix"), 0, 0, "")
 
 		// Connect if not already
 		if err := m.orchestrator.ConnectMatrix(); err != nil {
 			return operationCompleteMsg{err: err}
 		}
 
-		sendProgress("Importing messages...", 0, 0, "")
+		sendProgress(i18n.T("progress.stage_importing_messages"), 0, 0, "")
 
 		progress := func(current, total int, channelName, status string) {
 			// The reaction and pin passes share this callback but count their own items.
-			label := "Messages"
+			label := i18n.T("progress.label_messages")
 			switch channelName {
 			case matrix.ReactionProgressStage:
-				label = "Reactions"
+				label = i18n.T("progress.label_reactions")
 			case matrix.PinProgressStage:
-				label = "Pinned messages"
+				label = i18n.T("progress.label_pinned")
 			}
 			sendProgress(fmt.Sprintf("%s: %s", label, status), current, total, channelName)
 		}
@@ -1018,7 +1104,7 @@ func (m *Model) runImportMessages() tea.Cmd {
 			return operationCompleteMsg{err: err}
 		}
 
-		msg := fmt.Sprintf("Messages imported: %d imported, %d skipped, %d failed, files linked=%d uploaded=%d skipped=%d too_large=%d, reactions imported=%d skipped=%d failed=%d, pinned rooms_updated=%d events_added=%d failed=%d",
+		msg := i18n.T("messages.messages_imported_done",
 			result.MessagesImported, result.MessagesSkipped, result.MessagesFailed,
 			result.FilesLinked, result.FilesUploaded, result.FilesSkipped, result.FilesTooLarge,
 			result.ReactionsImported, result.ReactionsSkipped, result.ReactionsFailed,
@@ -1042,15 +1128,28 @@ func (m *Model) runTestConnection() tea.Cmd {
 // programInstance holds the running program for sending messages from goroutines
 var programInstance *tea.Program
 
-// Run starts the TUI application
-func Run(cfg *config.Config) error {
+// Run starts the TUI application. Cancelling ctx stops a running step the way ctrl+c does.
+// When the TUI ends the orchestrator is closed, after any step still running has stopped.
+func Run(ctx context.Context, cfg *config.Config) error {
 	model, err := NewModel(cfg)
 	if err != nil {
 		return err
 	}
+	if ctx != nil {
+		model.ctx = ctx
+	}
+	defer model.orchestrator.Close()
 
 	programInstance = tea.NewProgram(model, tea.WithAltScreen())
-	_, err = programInstance.Run()
+	final, err := programInstance.Run()
+
+	// The keys cannot quit while a step runs, but a signal can end the program. Let the step
+	// finish its item and save its progress before the connections close under it.
+	if fm, ok := final.(Model); ok && fm.step != nil {
+		fmt.Fprintf(os.Stderr, "⚠ %s\n", i18n.T("messages.step_stopping"))
+		fm.step.cancel()
+		<-fm.step.done
+	}
 	return err
 }
 

@@ -8,6 +8,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/aligundogdu/matrixmigrate/internal/mattermost"
+	"github.com/aligundogdu/matrixmigrate/pkg/archive"
 )
 
 // GenerateMessageErrorsFilename returns a timestamped path for the message-error log.
@@ -24,7 +27,7 @@ func WriteMessageErrors(dir string, errs []string) (string, error) {
 		b.WriteString(e)
 		b.WriteByte('\n')
 	}
-	if err := os.WriteFile(path, []byte(b.String()), 0o640); err != nil {
+	if err := archive.WriteFileAtomic(path, []byte(b.String()), 0o600); err != nil {
 		return "", err
 	}
 	return path, nil
@@ -66,7 +69,16 @@ type MessageMapping struct {
 	// and Matrix does not deduplicate annotations, so without this a second run would stack a
 	// duplicate of every reaction on top of the first.
 	Reactions map[string]string `json:"reactions,omitempty"`
-	mu        sync.RWMutex      `json:"-"`
+	// Files records which attachments have been sent: Mattermost file ID -> event ID of the
+	// event that carried it, or "" for a file taken as sent when this record was introduced
+	// (see adoptLegacyFileTracking). An attachment missing from it is sent by the next run.
+	//
+	// omitzero rather than omitempty: an empty map must still be written, because a mapping
+	// with no "files" key is read as one that predates file tracking.
+	Files map[string]string `json:"files,omitzero"`
+	// filesUntracked is set when the file this mapping was loaded from had no "files" key.
+	filesUntracked bool
+	mu             sync.RWMutex `json:"-"`
 }
 
 // MessageMapEntry represents a single message mapping
@@ -93,6 +105,7 @@ func NewMessageMapping(homeserver string) *MessageMapping {
 		Homeserver: homeserver,
 		Messages:   make(map[string]*MessageMapEntry),
 		Reactions:  make(map[string]string),
+		Files:      make(map[string]string),
 	}
 }
 
@@ -165,6 +178,78 @@ func (m *MessageMapping) ReactionKeys() map[string]string {
 	return out
 }
 
+// AddFile records a sent attachment under its Mattermost file ID.
+func (m *MessageMapping) AddFile(fileID, matrixEventID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.Files == nil {
+		m.Files = make(map[string]string)
+	}
+	m.Files[fileID] = matrixEventID
+	m.UpdatedAt = time.Now().UnixMilli()
+}
+
+// HasFile reports whether an attachment has already been sent.
+func (m *MessageMapping) HasFile(fileID string) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	_, exists := m.Files[fileID]
+	return exists
+}
+
+// FileCount returns the number of recorded attachments.
+func (m *MessageMapping) FileCount() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return len(m.Files)
+}
+
+// FileIDs returns a copy of the recorded attachments and their event IDs, for handing to an
+// import run as the set it should not send again.
+func (m *MessageMapping) FileIDs() map[string]string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	out := make(map[string]string, len(m.Files))
+	for k, v := range m.Files {
+		out[k] = v
+	}
+	return out
+}
+
+// adoptLegacyFileTracking brings a mapping written before attachments were tracked up to date:
+// every file whose post is already in the mapping is marked as sent, with no event ID. Nothing
+// is known about which of those attachments made it, and assuming none did would upload every
+// old attachment a second time. It returns how many files it marked; a mapping that already
+// tracks files is left alone, and so is one that has been adopted before.
+func adoptLegacyFileTracking(m *MessageMapping, files []mattermost.FileInfo) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if !m.filesUntracked {
+		return 0
+	}
+	m.filesUntracked = false
+	if m.Files == nil {
+		m.Files = make(map[string]string)
+	}
+	marked := 0
+	for idx := range files {
+		f := &files[idx]
+		if _, imported := m.Messages[f.PostID]; !imported {
+			continue
+		}
+		if _, known := m.Files[f.ID]; known {
+			continue
+		}
+		m.Files[f.ID] = ""
+		marked++
+	}
+	return marked
+}
+
 // GetMatrixEventID returns the Matrix event ID for a Mattermost post
 func (m *MessageMapping) GetMatrixEventID(mattermostID string) string {
 	m.mu.RLock()
@@ -215,8 +300,8 @@ type MessageMappingStats struct {
 
 // SaveMessageMapping saves the message mapping to a file
 func SaveMessageMapping(mapping *MessageMapping, filepath string) error {
-	mapping.mu.RLock()
-	defer mapping.mu.RUnlock()
+	mapping.mu.Lock()
+	defer mapping.mu.Unlock()
 	
 	mapping.UpdatedAt = time.Now().UnixMilli()
 	
@@ -225,11 +310,28 @@ func SaveMessageMapping(mapping *MessageMapping, filepath string) error {
 		return fmt.Errorf("failed to marshal message mapping: %w", err)
 	}
 	
-	if err := os.WriteFile(filepath, data, 0644); err != nil {
+	if err := archive.WriteFileAtomic(filepath, data, 0600); err != nil {
 		return fmt.Errorf("failed to write message mapping file: %w", err)
 	}
 	
 	return nil
+}
+
+// loadOrCreateMessageMapping returns a fresh mapping when no mapping file exists
+// (path is empty). If a file exists but cannot be loaded it fails rather than
+// starting empty: an empty mapping would make the import resend every message
+// that was already imported.
+func loadOrCreateMessageMapping(path, homeserver string) (*MessageMapping, error) {
+	if path == "" {
+		return NewMessageMapping(homeserver), nil
+	}
+	m, err := LoadMessageMapping(path)
+	if err != nil {
+		return nil, fmt.Errorf("message mapping file %s could not be loaded: %w; the import was NOT started, "+
+			"because starting without it would send every already-imported message a second time; "+
+			"restore the file, or move it away if a fresh import is really intended", path, err)
+	}
+	return m, nil
 }
 
 // LoadMessageMapping loads a message mapping from a file
@@ -251,6 +353,12 @@ func LoadMessageMapping(filepath string) (*MessageMapping, error) {
 	if mapping.Reactions == nil {
 		mapping.Reactions = make(map[string]string)
 	}
+	// Nor did files written before attachments were tracked - and there the absence means
+	// something: see adoptLegacyFileTracking.
+	if mapping.Files == nil {
+		mapping.filesUntracked = true
+		mapping.Files = make(map[string]string)
+	}
 	
 	return &mapping, nil
 }
@@ -261,25 +369,8 @@ func GenerateMessageMappingFilename(dir string) string {
 	return filepath.Join(dir, fmt.Sprintf("message-mapping-%s.json", timestamp))
 }
 
-// GetLatestMessageMappingFile finds the latest message mapping file in a directory
+// GetLatestMessageMappingFile returns the newest message-mapping file in dir by the timestamp
+// in its name, or "" when there is none.
 func GetLatestMessageMappingFile(dir string) (string, error) {
-	pattern := filepath.Join(dir, "message-mapping-*.json")
-	matches, err := filepath.Glob(pattern)
-	if err != nil {
-		return "", err
-	}
-	
-	if len(matches) == 0 {
-		return "", nil
-	}
-	
-	// Return the latest (last alphabetically due to timestamp format)
-	latest := matches[0]
-	for _, match := range matches[1:] {
-		if match > latest {
-			latest = match
-		}
-	}
-	
-	return latest, nil
+	return latestFileByName(filepath.Join(dir, "message-mapping-*.json"))
 }

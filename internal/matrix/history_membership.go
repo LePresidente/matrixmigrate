@@ -96,13 +96,18 @@ func (i *Importer) ensureHistoryAuthorsJoined(
 
 	var joined []HistoryMembership
 	failed := 0
-	for _, roomID := range rooms {
+	for idx, roomID := range rooms {
+		if i.stopForInterrupt("past-author membership", idx, len(rooms)) {
+			break
+		}
 		current, err := i.client.roomMemberIDs(roomID)
 		if err != nil {
-			// Better to attempt the joins than to skip the room: ForceJoinUser is idempotent,
-			// so the cost of a wrong guess is one redundant call per author.
-			logger.Warn("Could not list members of room %s (%v); joining all past authors instead", roomID, err)
-			current = nil
+			// Without the member list a past author cannot be told from a current member.
+			// Joining everyone would record real members as joined-by-us, and the cleanup
+			// would then remove them from their own room. Skip the room instead: the send path
+			// recovers genuinely absent authors one at a time, on the homeserver's word.
+			logger.Warn("Could not list members of room %s (%v); not joining past authors there, absent ones are joined on first refused send", roomID, err)
+			continue
 		}
 		member := make(map[string]struct{}, len(current))
 		for _, id := range current {
@@ -126,17 +131,23 @@ func (i *Importer) ensureHistoryAuthorsJoined(
 			continue
 		}
 		for _, mxid := range missing {
+			hm := HistoryMembership{RoomID: roomID, UserID: mxid}
+			i.recordHistoryJoin(hm)
 			if err := i.client.ForceJoinUser(roomID, mxid); err != nil {
 				logger.Warn("Could not join past author %s to room %s: %v", mxid, roomID, err)
 				failed++
+				if !isDefiniteRefusal(err) {
+					// The join may have been applied anyway: keep it tracked for the cleanup.
+					joined = append(joined, hm)
+				}
 				continue
 			}
-			joined = append(joined, HistoryMembership{RoomID: roomID, UserID: mxid})
+			joined = append(joined, hm)
 		}
 	}
 
 	if len(joined) > 0 || failed > 0 {
-		logger.Info("Past-author membership: joined %d (user,room) pair(s), %d could not be joined", len(joined), failed)
+		logger.Info("Past-author membership: %d (user,room) pair(s) tracked for cleanup, %d join(s) failed", len(joined), failed)
 	}
 	return joined
 }
@@ -192,11 +203,20 @@ func (i *Importer) ensureAdminCanActIn(roomID string, currentMembers []string) e
 
 // isRoomClosedErr reports whether err is a room refusing an uninvited join, as opposed to a
 // failure that arranging an invite would not fix.
+//
+// Synapse 1.159 and earlier refuse the plain join of a restricted room with 403 M_FORBIDDEN.
+// Synapse 1.162 answers the same request with 404 M_UNKNOWN "Can't join remote room because
+// no servers that are in the room have been provided" - the wording of its restricted-join
+// path, even though the room is local. That is why a 404 is in the list; it is matched on the
+// message, so other 404s (an unknown room, say) are still not treated as a closed room.
 func isRoomClosedErr(err error) bool {
 	if err == nil {
 		return false
 	}
 	msg := err.Error()
+	if strings.Contains(msg, "Can't join remote room") {
+		return true
+	}
 	if !strings.Contains(msg, "M_FORBIDDEN") {
 		return false
 	}
@@ -216,6 +236,12 @@ type LeaveRoomsResult struct {
 	Kept    int // memberships deliberately preserved because the account owns the room
 	Failed  int
 	Skipped int // nothing to do (no AS token, no recorded joins)
+
+	// Remaining lists the recorded history memberships that are still in place and should be
+	// withdrawn by a later run: the leave failed, ownership could not be checked, or there was
+	// no AS token to leave with. Memberships kept because the account owns the room are not
+	// listed - keeping them is the intended end state.
+	Remaining []HistoryMembership
 }
 
 // LeaveHistoryMemberships withdraws the memberships this migration created for its own
@@ -235,6 +261,7 @@ func (i *Importer) LeaveHistoryMemberships() *LeaveRoomsResult {
 	if !i.client.HasASToken() {
 		logger.Warn("No Application Service token: cannot withdraw memberships created for the import")
 		result.Skipped = len(i.historyJoins)
+		result.Remaining = uniqueHistoryMemberships(i.historyJoins)
 		return result
 	}
 
@@ -247,12 +274,17 @@ func (i *Importer) LeaveHistoryMemberships() *LeaveRoomsResult {
 	type membership struct{ roomID, userID string }
 	pending := make([]membership, 0, len(i.historyJoins))
 	seen := make(map[membership]struct{})
+	// recorded marks the history joins, as opposed to the admin's own memberships added
+	// below: only the former are reported back as Remaining. The admin's leftovers are swept
+	// from the asset mapping by 'import leave-rooms' and need no record of their own.
+	recorded := make(map[membership]bool)
 	for _, hm := range i.historyJoins {
 		m := membership{hm.RoomID, hm.UserID}
 		if _, dup := seen[m]; dup {
 			continue
 		}
 		seen[m] = struct{}{}
+		recorded[m] = true
 		pending = append(pending, m)
 	}
 	if adminID != "" {
@@ -277,6 +309,11 @@ func (i *Importer) LeaveHistoryMemberships() *LeaveRoomsResult {
 	// resolve each room once.
 	ownerCache := make(map[string]map[string]int)
 	unknownOwnership := make(map[string]bool)
+	stillInPlace := func(m membership) {
+		if recorded[m] {
+			result.Remaining = append(result.Remaining, HistoryMembership{RoomID: m.roomID, UserID: m.userID})
+		}
+	}
 	for _, m := range pending {
 		levels, cached := ownerCache[m.roomID]
 		if !cached {
@@ -297,7 +334,9 @@ func (i *Importer) LeaveHistoryMemberships() *LeaveRoomsResult {
 		}
 
 		if unknownOwnership[m.roomID] {
+			// Kept for now, not for good: a later run may be able to read the power levels.
 			result.Kept++
+			stillInPlace(m)
 			continue
 		}
 
@@ -316,6 +355,7 @@ func (i *Importer) LeaveHistoryMemberships() *LeaveRoomsResult {
 		if err != nil {
 			logger.Warn("Could not remove %s from room %s: %v", m.userID, m.roomID, err)
 			result.Failed++
+			stillInPlace(m)
 			continue
 		}
 		result.Left++
@@ -324,6 +364,21 @@ func (i *Importer) LeaveHistoryMemberships() *LeaveRoomsResult {
 	logger.Info("Post-import membership cleanup: left %d, kept %d owner membership(s), %d failed",
 		result.Left, result.Kept, result.Failed)
 	return result
+}
+
+// uniqueHistoryMemberships returns memberships with duplicates removed, first occurrence
+// first.
+func uniqueHistoryMemberships(memberships []HistoryMembership) []HistoryMembership {
+	out := make([]HistoryMembership, 0, len(memberships))
+	seen := make(map[HistoryMembership]struct{}, len(memberships))
+	for _, hm := range memberships {
+		if _, dup := seen[hm]; dup {
+			continue
+		}
+		seen[hm] = struct{}{}
+		out = append(out, hm)
+	}
+	return out
 }
 
 // ensureFallbackSenderInRoom joins the application service's own user to roomID.
@@ -335,6 +390,9 @@ func (i *Importer) LeaveHistoryMemberships() *LeaveRoomsResult {
 // failed, 766 of them.
 //
 // Rooms are remembered so a channel full of orphaned posts costs one join, not one per post.
+// A failure is remembered too, for the rest of the run: retrying a room that refused cost 535
+// requests in one live run and drew rate-limit responses. A failure while the run is being
+// interrupted says nothing about the room, so that one is not remembered.
 func (i *Importer) ensureFallbackSenderInRoom(roomID string) error {
 	if i.fallbackSenderRooms == nil {
 		i.fallbackSenderRooms = make(map[string]struct{})
@@ -342,6 +400,21 @@ func (i *Importer) ensureFallbackSenderInRoom(roomID string) error {
 	if _, done := i.fallbackSenderRooms[roomID]; done {
 		return nil
 	}
+	if i.fallbackSenderFailures == nil {
+		i.fallbackSenderFailures = make(map[string]error)
+	}
+	if prev, failed := i.fallbackSenderFailures[roomID]; failed {
+		return prev
+	}
+	err := i.joinFallbackSender(roomID)
+	if err != nil && !i.isInterrupted() {
+		i.fallbackSenderFailures[roomID] = err
+	}
+	return err
+}
+
+// joinFallbackSender does the work of ensureFallbackSenderInRoom for a room not yet seen.
+func (i *Importer) joinFallbackSender(roomID string) error {
 
 	botID, err := i.client.ASBotUserID()
 	if err != nil {
@@ -357,12 +430,18 @@ func (i *Importer) ensureFallbackSenderInRoom(roomID string) error {
 	if err := i.ensureAdminCanActIn(roomID, members); err != nil {
 		return fmt.Errorf("admin could not enter %s: %w", roomID, err)
 	}
+	hm := HistoryMembership{RoomID: roomID, UserID: botID}
+	i.recordHistoryJoin(hm)
 	if err := i.client.ForceJoinUser(roomID, botID); err != nil {
+		if !isDefiniteRefusal(err) {
+			// The join may have been applied anyway: keep it tracked for the cleanup.
+			i.historyJoins = append(i.historyJoins, hm)
+		}
 		return fmt.Errorf("could not join fallback sender %s to %s: %w", botID, roomID, err)
 	}
 
 	i.fallbackSenderRooms[roomID] = struct{}{}
-	i.historyJoins = append(i.historyJoins, HistoryMembership{RoomID: roomID, UserID: botID})
+	i.historyJoins = append(i.historyJoins, hm)
 	return nil
 }
 
@@ -377,8 +456,10 @@ func isNotInRoomErr(err error) bool {
 	return strings.Contains(msg, "M_FORBIDDEN") && strings.Contains(msg, "not in room")
 }
 
-// sendWithMembershipRecovery sends a message and, if the homeserver refuses it because the
-// sender is not in the room, repairs the membership and tries again.
+// sendWithMembershipRecovery sends a message through send and, if the homeserver refuses it
+// because the sender is not in the room, repairs the membership and tries again. send is
+// called with the sender to use - senderID first, then "" for the fallback sender - so the
+// same recovery serves root messages and thread replies alike.
 //
 // The membership pre-pass covers the authors known from the export, but it cannot cover
 // everything: a room's membership can change under a run that lasts days, and a post can name
@@ -386,8 +467,8 @@ func isNotInRoomErr(err error) bool {
 // refusal costs one join instead of one lost message.
 //
 // The returned note describes what recovery was needed, empty when the first attempt worked.
-func (i *Importer) sendWithMembershipRecovery(roomID, content string, timestamp int64, senderID string) (*SendMessageResponse, string, error) {
-	resp, err := i.client.SendMessageWithTimestamp(roomID, content, timestamp, senderID)
+func (i *Importer) sendWithMembershipRecovery(roomID, senderID string, send func(senderID string) (*SendMessageResponse, error)) (*SendMessageResponse, string, error) {
+	resp, err := send(senderID)
 	if err == nil || !isNotInRoomErr(err) {
 		return resp, "", err
 	}
@@ -396,11 +477,16 @@ func (i *Importer) sendWithMembershipRecovery(roomID, content string, timestamp 
 	if senderID != "" && i.client.HasAdminToken() {
 		members, _ := i.client.roomMemberIDs(roomID)
 		if jerr := i.ensureAdminCanActIn(roomID, members); jerr == nil {
+			hm := HistoryMembership{RoomID: roomID, UserID: senderID}
+			i.recordHistoryJoin(hm)
 			if jerr = i.client.ForceJoinUser(roomID, senderID); jerr == nil {
-				i.historyJoins = append(i.historyJoins, HistoryMembership{RoomID: roomID, UserID: senderID})
-				if resp, err = i.client.SendMessageWithTimestamp(roomID, content, timestamp, senderID); err == nil {
+				i.historyJoins = append(i.historyJoins, hm)
+				if resp, err = send(senderID); err == nil {
 					return resp, "recovered: joined sender to room", nil
 				}
+			} else if !isDefiniteRefusal(jerr) {
+				// The join may have been applied anyway: keep it tracked for the cleanup.
+				i.historyJoins = append(i.historyJoins, hm)
 			}
 		}
 	}
@@ -409,7 +495,7 @@ func (i *Importer) sendWithMembershipRecovery(roomID, content string, timestamp 
 	// the fallback sender -- but only after making sure it is itself in the room.
 	if senderID != "" {
 		if ferr := i.ensureFallbackSenderInRoom(roomID); ferr == nil {
-			if resp, berr := i.client.SendMessageWithTimestamp(roomID, content, timestamp, ""); berr == nil {
+			if resp, berr := send(""); berr == nil {
 				return resp, "recovered: sent as fallback sender, original author could not be joined", nil
 			}
 		}

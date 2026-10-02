@@ -1,6 +1,8 @@
 package matrix
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path"
@@ -55,12 +57,14 @@ type Importer struct {
 	// persist them. Empty when the policy generates no passwords.
 	generatedCredentials []UserCredential
 
-	// checkpointFn, when set, is called every checkpointEvery imported messages with the
-	// post ID -> event ID mapping so far. Message import runs for days on a large instance;
-	// without this, an interruption loses every message already sent, because the mapping is
-	// only written once the whole run finishes and a restart would re-import them as duplicates.
-	checkpointFn    func(map[string]string)
+	// checkpointFn, when set, is called every checkpointEvery recorded messages and attachments
+	// with the post ID -> event ID and file ID -> event ID mappings so far. Message import runs
+	// for days on a large instance; without this, an interruption loses every message already
+	// sent, because the mapping is only written once the whole run finishes and a restart would
+	// re-import them as duplicates. checkpointMark is the record count at the last checkpoint.
+	checkpointFn    func(messages, files map[string]string)
 	checkpointEvery int
+	checkpointMark  int
 
 	// reactionCheckpointFn mirrors checkpointFn for the reaction pass, which faces the same
 	// problem: a busy instance has thousands of reactions, each one an API call under the rate
@@ -68,6 +72,14 @@ type Importer struct {
 	// what was already sent means the next run stacks a second copy of every reaction.
 	reactionCheckpointFn    func(map[string]string)
 	reactionCheckpointEvery int
+
+	// assetCheckpointFn, when set, is told the user, space and room mappings as they grow
+	// during asset import, so a crash leaves a mapping file that a re-run resumes from instead of
+	// creating the same spaces and rooms again. The assets* maps are the running state it reports.
+	assetCheckpointFn func(users, spaces, rooms map[string]string)
+	assetUsers        map[string]string
+	assetSpaces       map[string]string
+	assetRooms        map[string]string
 
 	// knownMentionUsers holds the localparts of users this run knows exist, derived from the
 	// migration's user mapping. A nil map disables mention gating.
@@ -79,15 +91,25 @@ type Importer struct {
 	// historyJoins records memberships created purely so a past author could be
 	// impersonated while their messages were replayed. LeaveHistoryMemberships undoes them.
 	historyJoins []HistoryMembership
+	// historyJoinRecorder, when set, is told about each history membership before the
+	// force-join that creates it, so it can be persisted ahead of the change. See
+	// SetHistoryJoinRecorder.
+	historyJoinRecorder func(HistoryMembership)
 
 	// fallbackSenderRooms remembers rooms the AS bot has been joined to, so a channel full
 	// of posts by deleted accounts costs one join rather than one per post.
 	fallbackSenderRooms map[string]struct{}
+	// fallbackSenderFailures remembers why joining the AS bot to a room failed, so the same
+	// room is not retried for every later post.
+	fallbackSenderFailures map[string]error
 
 	// deletedUserMode decides what a Mattermost account with delete_at > 0 becomes in Matrix:
 	// DeletedUserModeDeactivated (the default) or DeletedUserModeLocked. It also decides
 	// whether those accounts are given room memberships at all - see ApplyChannelMemberships.
 	deletedUserMode string
+
+	// ctx is cancelled when the run is interrupted; every per-item loop checks it. See SetContext.
+	ctx context.Context
 }
 
 // Modes for Importer.deletedUserMode. They mirror the matrix.import.deleted_user_mode config
@@ -103,9 +125,53 @@ func (i *Importer) HistoryJoins() []HistoryMembership {
 	return i.historyJoins
 }
 
+// SetHistoryJoinRecorder installs fn to be called before every force-join made only to
+// replay history. The caller persists the membership, so that if the run dies before
+// LeaveHistoryMemberships the join can still be undone later; a crash between the record and
+// the join leaves at worst an entry for a membership that never existed, which the leave
+// treats as already gone.
+func (i *Importer) SetHistoryJoinRecorder(fn func(HistoryMembership)) {
+	i.historyJoinRecorder = fn
+}
+
+// AddHistoryJoins seeds the memberships LeaveHistoryMemberships will withdraw, typically with
+// the ones an earlier, interrupted run recorded but never undid.
+func (i *Importer) AddHistoryJoins(memberships ...HistoryMembership) {
+	i.historyJoins = append(i.historyJoins, memberships...)
+}
+
+// recordHistoryJoin reports m to the recorder, if one is installed. Call it before the join.
+func (i *Importer) recordHistoryJoin(m HistoryMembership) {
+	if i.historyJoinRecorder != nil {
+		i.historyJoinRecorder(m)
+	}
+}
+
 // NewImporter creates a new importer
 func NewImporter(client *Client) *Importer {
 	return &Importer{client: client, passwordPolicy: DefaultPasswordPolicy(), deletedUserMode: DeletedUserModeDeactivated}
+}
+
+// SetContext installs the context whose cancellation interrupts the import. Each per-item
+// loop checks it before starting the next item and stops cleanly, so the item in flight is
+// finished and recorded, and the function's own cleanup and summary still run.
+func (i *Importer) SetContext(ctx context.Context) {
+	i.ctx = ctx
+}
+
+// isInterrupted reports whether the context installed with SetContext has been cancelled.
+func (i *Importer) isInterrupted() bool {
+	return i.ctx != nil && i.ctx.Err() != nil
+}
+
+// stopForInterrupt is the check at the top of every per-item loop: it reports whether the run
+// has been interrupted and, if so, logs how far the loop got.
+func (i *Importer) stopForInterrupt(what string, done, total int) bool {
+	if !i.isInterrupted() {
+		return false
+	}
+	logger.Warn("Interrupted: %s stopped after %d of %d", what, done, total)
+	return true
 }
 
 // SetDeletedUserMode controls how Mattermost accounts with delete_at > 0 are represented.
@@ -338,6 +404,9 @@ func (i *Importer) ImportUsers(users []mattermost.User, existingMapping map[stri
 	logger.Info("Existing mappings copied: %d entries", len(existingMapping))
 
 	for idx, user := range users {
+		if i.stopForInterrupt("user import", idx, total) {
+			break
+		}
 		logger.Info("Processing user %d/%d: %s (ID: %s)", idx+1, total, user.Username, user.ID)
 
 		if progress != nil {
@@ -365,20 +434,15 @@ func (i *Importer) ImportUsers(users []mattermost.User, existingMapping map[stri
 			continue
 		}
 
-		// Try to check if user exists, but don't fail if check fails
-		// (some Matrix servers only allow checking local users)
-		exists := false
-		existsCheck, err := i.client.UserExists(user.Username)
+		// An account whose existence cannot be confirmed is left alone: on plain Synapse creating
+		// is an upsert that would replace its password and profile, and with MAS the profile
+		// write that follows a create would replace them on Synapse.
+		exists, err := i.client.UserExists(user.Username)
 		if err != nil {
-			// If check fails with "Can only look up local users", ignore it
-			// CreateUser is idempotent anyway, so we can just try to create
-			if strings.Contains(err.Error(), "Can only look up local users") {
-				logger.Info("UserExists check not available for '%s', will try to create", user.Username)
-			} else {
-				logger.Warn("UserExists check failed for '%s': %v, will try to create anyway", user.Username, err)
-			}
-		} else {
-			exists = existsCheck
+			logger.Error("Could not confirm whether user '%s' exists (%v); the account was left untouched - re-run import assets to pick it up", user.Username, err)
+			stats.UsersFailed++
+			stats.UsersUnconfirmed++
+			continue
 		}
 
 		// Display name from Mattermost, used both for accounts we create and for filling in
@@ -394,33 +458,7 @@ func (i *Importer) ImportUsers(users []mattermost.User, existingMapping map[stri
 		email := strings.ToLower(strings.TrimSpace(user.Email))
 
 		if exists {
-			// User already exists, add to mapping
-			mxID := i.client.FormatUserID(user.Username)
-			mapping[user.ID] = mxID
-			// Close the account off if it is deleted in Mattermost
-			if deactivated {
-				if err := i.client.SetUserDeactivated(mxID, true); err != nil {
-					logger.Warn("Failed to set existing user '%s' as deactivated: %v", user.Username, err)
-				} else {
-					logger.Info("User '%s' already exists; set deactivated to match Mattermost", user.Username)
-				}
-			}
-			if lockDeleted {
-				if err := i.client.SetUserLocked(mxID, true); err != nil {
-					logger.Warn("Failed to lock existing user '%s': %v", user.Username, err)
-				} else {
-					logger.Info("User '%s' already exists; set locked to match Mattermost", user.Username)
-				}
-			}
-			// Anyone who signed in through SSO before the migration lands here, and would
-			// otherwise keep an account with no email address - and so no email notifications.
-			// Additive: nothing already on the account is overwritten.
-			if err := i.client.EnsureUserProfile(mxID, displayName, email); err != nil {
-				logger.Warn("Failed to complete profile for existing user '%s': %v", user.Username, err)
-			}
-			if email != "" {
-				i.client.EnsureMASEmail(user.Username, email)
-			}
+			mapping[user.ID] = i.adoptExistingUser(user.Username, displayName, email, deactivated, lockDeleted)
 			logger.Info("User '%s' already exists, skipped", user.Username)
 			stats.UsersSkipped++
 			continue
@@ -454,10 +492,10 @@ func (i *Importer) ImportUsers(users []mattermost.User, existingMapping map[stri
 
 		resp, err := i.client.CreateUser(user.Username, req)
 		if err != nil {
-			// Check if error is because user already exists
-			if strings.Contains(err.Error(), "already exists") || strings.Contains(err.Error(), "M_USER_IN_USE") {
-				// User exists, add to mapping
-				mapping[user.ID] = i.client.FormatUserID(user.Username)
+			// The account exists after all: nothing was created and no password was set, so it
+			// is treated exactly like one found by the existence check.
+			if errors.Is(err, ErrUserAlreadyExists) || strings.Contains(err.Error(), "already exists") || strings.Contains(err.Error(), "M_USER_IN_USE") {
+				mapping[user.ID] = i.adoptExistingUser(user.Username, displayName, email, deactivated, lockDeleted)
 				logger.Info("User '%s' already exists (detected during create), skipped", user.Username)
 				stats.UsersSkipped++
 				continue
@@ -489,7 +527,42 @@ func (i *Importer) ImportUsers(users []mattermost.User, existingMapping map[stri
 		stats.UsersCreated++
 	}
 
+	i.assetUsers = copyMapping(mapping)
+	i.checkpointAssets()
+
 	return mapping, stats, nil
+}
+
+// adoptExistingUser brings an account that already exists in line with Mattermost without
+// overwriting anything on it, and returns its Matrix user ID: deleted users are deactivated or
+// locked per deleted_user_mode, and a missing display name or email address is filled in.
+func (i *Importer) adoptExistingUser(username, displayName, email string, deactivated, lockDeleted bool) string {
+	mxID := i.client.FormatUserID(username)
+	// Close the account off if it is deleted in Mattermost
+	if deactivated {
+		if err := i.client.SetUserDeactivated(mxID, true); err != nil {
+			logger.Warn("Failed to set existing user '%s' as deactivated: %v", username, err)
+		} else {
+			logger.Info("User '%s' already exists; set deactivated to match Mattermost", username)
+		}
+	}
+	if lockDeleted {
+		if err := i.client.SetUserLocked(mxID, true); err != nil {
+			logger.Warn("Failed to lock existing user '%s': %v", username, err)
+		} else {
+			logger.Info("User '%s' already exists; set locked to match Mattermost", username)
+		}
+	}
+	// Anyone who signed in through SSO before the migration lands here, and would
+	// otherwise keep an account with no email address - and so no email notifications.
+	// Additive: nothing already on the account is overwritten.
+	if err := i.client.EnsureUserProfile(mxID, displayName, email); err != nil {
+		logger.Warn("Failed to complete profile for existing user '%s': %v", username, err)
+	}
+	if email != "" {
+		i.client.EnsureMASEmail(username, email)
+	}
+	return mxID
 }
 
 // resolveRoomOwner returns the Matrix user ID to use as room/space owner.
@@ -537,8 +610,12 @@ func (i *Importer) ImportTeamsAsSpaces(teams []mattermost.Team, existingMapping 
 	for k, v := range existingMapping {
 		mapping[k] = v
 	}
+	i.assetSpaces = copyMapping(mapping)
 
 	for idx, team := range teams {
+		if i.stopForInterrupt("space import", idx, total) {
+			break
+		}
 		if progress != nil {
 			progress("spaces", idx+1, total, team.DisplayName)
 		}
@@ -584,6 +661,8 @@ func (i *Importer) ImportTeamsAsSpaces(teams []mattermost.Team, existingMapping 
 		logger.Success("Created space '%s' -> %s", team.DisplayName, resp.RoomID)
 		mapping[team.ID] = resp.RoomID
 		stats.SpacesCreated++
+		i.assetSpaces[team.ID] = resp.RoomID
+		i.checkpointAssets()
 	}
 
 	return mapping, stats, nil
@@ -708,8 +787,12 @@ func (i *Importer) ImportChannelsAsRooms(channels []mattermost.Channel, existing
 	for k, v := range existingMapping {
 		mapping[k] = v
 	}
+	i.assetRooms = copyMapping(mapping)
 
 	for idx, channel := range channels {
+		if i.stopForInterrupt("room import", idx, total) {
+			break
+		}
 		if progress != nil {
 			progress("rooms", idx+1, total, channel.DisplayName)
 		}
@@ -807,6 +890,8 @@ func (i *Importer) ImportChannelsAsRooms(channels []mattermost.Channel, existing
 		}
 		mapping[channel.ID] = resp.RoomID
 		stats.RoomsCreated++
+		i.assetRooms[channel.ID] = resp.RoomID
+		i.checkpointAssets()
 	}
 
 	return mapping, stats, nil
@@ -836,6 +921,9 @@ func (i *Importer) ApplyTeamMemberships(
 	logger.Info("Starting team membership import: %d memberships to process", total)
 
 	for idx, membership := range memberships {
+		if i.stopForInterrupt("team membership import", idx, total) {
+			break
+		}
 		if progress != nil {
 			progress("team_memberships", idx+1, total, "")
 		}
@@ -1055,6 +1143,9 @@ func (i *Importer) ApplyChannelMemberships(
 	logger.Info("Starting channel membership import: %d memberships to process (%d DM channels will be skipped)", total, len(directChannelIDs))
 
 	for idx, membership := range memberships {
+		if i.stopForInterrupt("channel membership import", idx, total) {
+			break
+		}
 		if progress != nil {
 			progress("channel_memberships", idx+1, total, "")
 		}
@@ -1421,6 +1512,17 @@ func (i *Importer) ImportDirectChannelsAsDMs(
 		mapping[k] = v
 	}
 
+	// The checkpoint reports every room, so it carries the regular rooms made earlier in this
+	// run as well as the DMs; the caller merges both into one room mapping.
+	if i.assetRooms == nil {
+		i.assetRooms = make(map[string]string)
+	}
+	for k, v := range existingMapping {
+		if _, ok := i.assetRooms[k]; !ok {
+			i.assetRooms[k] = v
+		}
+	}
+
 	if !i.client.HasASToken() {
 		logger.Warn("ImportDirectChannelsAsDMs: Application Service token not set; DMs will be created but m.direct (People list) cannot be set for users")
 	}
@@ -1438,6 +1540,9 @@ func (i *Importer) ImportDirectChannelsAsDMs(
 	skips := &skipTally{}
 
 	for idx, channel := range directChannels {
+		if i.stopForInterrupt("direct message import", idx, total) {
+			break
+		}
 		if progress != nil {
 			progress("dm_rooms", idx+1, total, channel.ID)
 		}
@@ -1527,6 +1632,8 @@ func (i *Importer) ImportDirectChannelsAsDMs(
 		}
 		mapping[channel.ID] = resp.RoomID
 		stats.RoomsCreated++
+		i.assetRooms[channel.ID] = resp.RoomID
+		i.checkpointAssets()
 	}
 
 	if breakdown := skips.String(); breakdown != "" {
@@ -1558,6 +1665,9 @@ func (i *Importer) LinkRoomsToSpaces(
 	ensuredSpaceIDs := make(map[string]struct{})
 
 	for idx, channel := range channels {
+		if i.stopForInterrupt("room linking", idx, total) {
+			break
+		}
 		if progress != nil {
 			progress("linking", idx+1, total, channel.DisplayName)
 		}
@@ -1649,28 +1759,57 @@ type ImportAssetsResult struct {
 	Stats        *ImportStats
 }
 
-// SetMessageCheckpoint installs fn, called every `every` imported messages with the
-// post ID -> event ID mapping accumulated so far. Passing a nil fn or every <= 0 disables
-// checkpointing. The mapping handed to fn is a copy, safe to persist without racing the import.
-func (i *Importer) SetMessageCheckpoint(every int, fn func(map[string]string)) {
+// SetMessageCheckpoint installs fn, called after every `every` recorded messages and
+// attachments with the post ID -> event ID and file ID -> event ID mappings accumulated so far.
+// Passing a nil fn or every <= 0 disables checkpointing. The mappings handed to fn are copies,
+// safe to persist without racing the import.
+func (i *Importer) SetMessageCheckpoint(every int, fn func(messages, files map[string]string)) {
 	i.checkpointEvery = every
 	i.checkpointFn = fn
 }
 
-// maybeCheckpoint hands the current mapping to the checkpoint callback every checkpointEvery
-// messages, so an interrupted import can resume from what it already sent.
-func (i *Importer) maybeCheckpoint(mapping map[string]string) {
+// recordCount is what checkpoint spacing is measured in: messages plus attachments recorded.
+func recordCount(result *ImportMessagesResult) int {
+	return len(result.Mapping) + len(result.FileMapping)
+}
+
+// maybeCheckpoint hands the current mappings to the checkpoint callback once checkpointEvery
+// more messages and attachments have been recorded since the last one, so an interrupted
+// import can resume from what it already sent. Call it between posts, never between a post's
+// attachments and its own mapping entry, so a checkpoint never holds one without the other.
+func (i *Importer) maybeCheckpoint(result *ImportMessagesResult) {
 	if i.checkpointFn == nil || i.checkpointEvery <= 0 {
 		return
 	}
-	if len(mapping)%i.checkpointEvery != 0 {
+	n := recordCount(result)
+	if n-i.checkpointMark < i.checkpointEvery {
 		return
 	}
-	snapshot := make(map[string]string, len(mapping))
-	for k, v := range mapping {
-		snapshot[k] = v
+	i.checkpointMark = n
+	i.checkpointFn(copyMapping(result.Mapping), copyMapping(result.FileMapping))
+}
+
+// SetAssetCheckpoint installs fn, called with the user, space and room mappings so far after
+// the users are imported and after every space, room and DM created. The maps handed to fn are
+// copies, safe to persist without racing the import. A nil fn disables it.
+func (i *Importer) SetAssetCheckpoint(fn func(users, spaces, rooms map[string]string)) {
+	i.assetCheckpointFn = fn
+}
+
+// checkpointAssets reports the running asset mappings to the checkpoint callback, if any.
+func (i *Importer) checkpointAssets() {
+	if i.assetCheckpointFn == nil {
+		return
 	}
-	i.checkpointFn(snapshot)
+	i.assetCheckpointFn(copyMapping(i.assetUsers), copyMapping(i.assetSpaces), copyMapping(i.assetRooms))
+}
+
+func copyMapping(m map[string]string) map[string]string {
+	out := make(map[string]string, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
 }
 
 // SetReactionCheckpoint installs fn, called every `every` sent reactions with the
@@ -1729,6 +1868,13 @@ func (i *Importer) ImportAssets(assets *mattermost.Assets, existingMappings *Exi
 			len(existingMappings.Users), len(existingMappings.Spaces), len(existingMappings.Rooms))
 	}
 
+	// Seed the checkpointed state with everything already mapped, so an early checkpoint of a
+	// re-run (after the users, before any space or room) never records a subset of what the
+	// previous run saved.
+	i.assetUsers = copyMapping(existingMappings.Users)
+	i.assetSpaces = copyMapping(existingMappings.Spaces)
+	i.assetRooms = copyMapping(existingMappings.Rooms)
+
 	// Import users
 	logger.Info("=== Starting User Import ===")
 	userMapping, userStats, err := i.ImportUsers(assets.Users, existingMappings.Users, progress)
@@ -1740,6 +1886,7 @@ func (i *Importer) ImportAssets(assets *mattermost.Assets, existingMappings *Exi
 	result.Stats.UsersCreated = userStats.UsersCreated
 	result.Stats.UsersSkipped = userStats.UsersSkipped
 	result.Stats.UsersFailed = userStats.UsersFailed
+	result.Stats.UsersUnconfirmed = userStats.UsersUnconfirmed
 	logger.Info("User import completed: created=%d, skipped=%d, failed=%d",
 		userStats.UsersCreated, userStats.UsersSkipped, userStats.UsersFailed)
 
@@ -1806,6 +1953,20 @@ type FileConfig struct {
 	MaxUploadSize        int64                             // Max file size for upload
 }
 
+// isSafeAttachmentPath reports whether a Mattermost fileinfo.path may be joined onto the
+// data directory. The path comes from the Mattermost database, so it is not trusted: after
+// trimming one leading "/" it must be non-empty and stay inside the directory it is joined
+// to (no ".." escape, not absolute).
+func isSafeAttachmentPath(p string) bool {
+	rel := strings.TrimPrefix(p, "/")
+	return rel != "" && filepath.IsLocal(filepath.FromSlash(rel))
+}
+
+func recordUnsafeAttachmentPath(result *ImportMessagesResult, file mattermost.FileInfo) {
+	result.Stats.FilesSkipped++
+	result.Errors = append(result.Errors, fmt.Sprintf("Skipped file %s for post %s: unsafe attachment path %q", file.Name, file.PostID, file.Path))
+}
+
 func buildPublicFileURL(baseURL, filePath string) string {
 	base := strings.TrimSuffix(baseURL, "/")
 	rel := strings.TrimPrefix(filePath, "/")
@@ -1832,27 +1993,41 @@ func (i *Importer) sendLinkOrSkip(
 	threadRootEventID string,
 	threadLatestEventID string,
 	reason string,
-) {
+) string {
 	if fileConfig.S3PublicURL == "" {
 		result.Stats.FilesSkipped++
 		result.Errors = append(result.Errors, fmt.Sprintf("Skipped file %s for post %s: %s", file.Name, file.PostID, reason))
-		return
+		return ""
+	}
+	if !isSafeAttachmentPath(file.Path) {
+		recordUnsafeAttachmentPath(result, file)
+		return ""
 	}
 	fileURL := buildPublicFileURL(fileConfig.S3PublicURL, file.Path)
-	var err error
-	if threadRootEventID != "" {
-		_, err = i.client.SendFileLinkAsReply(roomID, file.Name, fileURL, file.MimeType, file.Size, threadRootEventID, threadLatestEventID, timestamp, senderID)
-	} else {
-		_, err = i.client.SendFileLink(roomID, file.Name, fileURL, file.MimeType, file.Size, timestamp, senderID)
+	resp, recovery, err := i.sendWithMembershipRecovery(roomID, senderID, func(sender string) (*SendMessageResponse, error) {
+		if threadRootEventID != "" {
+			return i.client.SendFileLinkAsReply(roomID, file.Name, fileURL, file.MimeType, file.Size, threadRootEventID, threadLatestEventID, timestamp, sender)
+		}
+		return i.client.SendFileLink(roomID, file.Name, fileURL, file.MimeType, file.Size, timestamp, sender)
+	})
+	if recovery != "" {
+		logger.Info("File %s (post %s): %s", file.ID, file.PostID, recovery)
 	}
 	if err != nil {
 		result.Stats.FilesSkipped++
 		result.Errors = append(result.Errors, fmt.Sprintf("Failed to send file link for %s (post %s): %v", file.Name, file.PostID, err))
-		return
+		return ""
 	}
 	result.Stats.FilesLinked++
+	return resp.EventID
 }
 
+// importPostFiles sends a post's attachments in upload mode, falling back to link events where
+// configured. Each attachment that reaches the room is recorded in result.FileMapping as soon as
+// it is sent; one that does not is left out, so the next run tries it again. It returns the
+// number of files rejected as too large, the largest such size, and the event ID of the first
+// attachment event sent ("" when none was). Sends go through sendWithMembershipRecovery, since
+// for a post with no text the first attachment is the post itself.
 func (i *Importer) importPostFiles(
 	result *ImportMessagesResult,
 	roomID string,
@@ -1862,39 +2037,65 @@ func (i *Importer) importPostFiles(
 	senderID string,
 	threadRootEventID string,
 	threadLatestEventID string,
-) (int, int64) {
+) (int, int64, string) {
 	tooLargeCount := 0
 	var maxTooLargeSize int64
+	firstEventID := ""
+	sent := func(file mattermost.FileInfo, eventID string) {
+		if eventID == "" {
+			return
+		}
+		result.recordFile(file.ID, eventID)
+		if firstEventID == "" {
+			firstEventID = eventID
+		}
+	}
+	linkOrSkip := func(file mattermost.FileInfo, reason string) {
+		sent(file, i.sendLinkOrSkip(result, roomID, file, fileConfig, timestamp, senderID, threadRootEventID, threadLatestEventID, reason))
+	}
 	logger.Debug("importPostFiles: room=%s sender=%s files=%d mode=%s", roomID, senderID, len(files), fileConfig.Mode)
+	rejectTooLarge := func(file mattermost.FileInfo, size int64) {
+		logger.Debug("importPostFiles: file too large id=%s name=%s size=%d max=%d", file.ID, file.Name, size, fileConfig.MaxUploadSize)
+		result.Stats.FilesTooLarge++
+		tooLargeCount++
+		if size > maxTooLargeSize {
+			maxTooLargeSize = size
+		}
+		if fileConfig.UploadFallbackToLink {
+			linkOrSkip(file, "file exceeds max_upload_size_mb")
+		} else {
+			result.Stats.FilesSkipped++
+			result.Errors = append(result.Errors, fmt.Sprintf("Skipped file %s for post %s: file size %d exceeds max_upload_size_mb (%d bytes)", file.Name, file.PostID, size, fileConfig.MaxUploadSize))
+		}
+	}
 	for _, file := range files {
+		// An attachment left unsent by an interrupt is not recorded, so the next run sends it.
+		if i.isInterrupted() {
+			logger.Warn("Interrupted: attachments of post %s not yet sent are left for the next run", file.PostID)
+			break
+		}
 		if file.IsDeleted() {
 			logger.Debug("importPostFiles: skipping deleted file id=%s name=%s post=%s", file.ID, file.Name, file.PostID)
 			result.Stats.FilesSkipped++
 			continue
 		}
 		if file.Size > fileConfig.MaxUploadSize {
-			logger.Debug("importPostFiles: file too large id=%s name=%s size=%d max=%d", file.ID, file.Name, file.Size, fileConfig.MaxUploadSize)
-			result.Stats.FilesTooLarge++
-			tooLargeCount++
-			if file.Size > maxTooLargeSize {
-				maxTooLargeSize = file.Size
-			}
-			if fileConfig.UploadFallbackToLink {
-				i.sendLinkOrSkip(result, roomID, file, fileConfig, timestamp, senderID, threadRootEventID, threadLatestEventID, "file exceeds max_upload_size_mb")
-			} else {
-				result.Stats.FilesSkipped++
-				result.Errors = append(result.Errors, fmt.Sprintf("Skipped file %s for post %s: file size %d exceeds max_upload_size_mb (%d bytes)", file.Name, file.PostID, file.Size, fileConfig.MaxUploadSize))
-			}
+			rejectTooLarge(file, file.Size)
 			continue
 		}
 		if fileConfig.LocalDataPath == "" {
 			logger.Debug("importPostFiles: local_data_path empty for file id=%s name=%s", file.ID, file.Name)
 			if fileConfig.UploadFallbackToLink {
-				i.sendLinkOrSkip(result, roomID, file, fileConfig, timestamp, senderID, threadRootEventID, threadLatestEventID, "mattermost.files.local_data_path is empty")
+				linkOrSkip(file, "mattermost.files.local_data_path is empty")
 			} else {
 				result.Stats.FilesSkipped++
 				result.Errors = append(result.Errors, fmt.Sprintf("Skipped file %s for post %s: mattermost.files.local_data_path is empty", file.Name, file.PostID))
 			}
+			continue
+		}
+		if !isSafeAttachmentPath(file.Path) {
+			logger.Debug("importPostFiles: unsafe attachment path id=%s name=%s path=%q", file.ID, file.Name, file.Path)
+			recordUnsafeAttachmentPath(result, file)
 			continue
 		}
 		localPath := resolveLocalMattermostPath(fileConfig.LocalDataPath, file.Path)
@@ -1908,11 +2109,15 @@ func (i *Importer) importPostFiles(
 		if err != nil {
 			logger.Debug("importPostFiles: read failed id=%s name=%s err=%v", file.ID, file.Name, err)
 			if fileConfig.UploadFallbackToLink {
-				i.sendLinkOrSkip(result, roomID, file, fileConfig, timestamp, senderID, threadRootEventID, threadLatestEventID, fmt.Sprintf("cannot read attachment bytes from %s: %v", file.Path, err))
+				linkOrSkip(file, fmt.Sprintf("cannot read attachment bytes from %s: %v", file.Path, err))
 			} else {
 				result.Stats.FilesSkipped++
 				result.Errors = append(result.Errors, fmt.Sprintf("Skipped file %s for post %s: cannot read attachment bytes from %s: %v", file.Name, file.PostID, file.Path, err))
 			}
+			continue
+		}
+		if int64(len(data)) > fileConfig.MaxUploadSize {
+			rejectTooLarge(file, int64(len(data)))
 			continue
 		}
 		mimeType := strings.TrimSpace(file.MimeType)
@@ -1924,7 +2129,7 @@ func (i *Importer) importPostFiles(
 		if err != nil {
 			logger.Debug("importPostFiles: upload failed id=%s name=%s err=%v", file.ID, file.Name, err)
 			if fileConfig.UploadFallbackToLink {
-				i.sendLinkOrSkip(result, roomID, file, fileConfig, timestamp, senderID, threadRootEventID, threadLatestEventID, fmt.Sprintf("upload failed: %v", err))
+				linkOrSkip(file, fmt.Sprintf("upload failed: %v", err))
 			} else {
 				result.Stats.FilesSkipped++
 				result.Errors = append(result.Errors, fmt.Sprintf("Skipped file %s for post %s: upload failed: %v", file.Name, file.PostID, err))
@@ -1932,15 +2137,19 @@ func (i *Importer) importPostFiles(
 			continue
 		}
 		logger.Debug("importPostFiles: upload success id=%s name=%s mxc=%s", file.ID, file.Name, uploadResp.ContentURI)
-		if threadRootEventID != "" {
-			_, err = i.client.SendUploadedFileAsReply(roomID, uploadResp.ContentURI, file.Name, mimeType, file.Size, file.Width, file.Height, threadRootEventID, threadLatestEventID, timestamp, senderID)
-		} else {
-			_, err = i.client.SendUploadedFile(roomID, uploadResp.ContentURI, file.Name, mimeType, file.Size, file.Width, file.Height, timestamp, senderID)
+		resp, recovery, err := i.sendWithMembershipRecovery(roomID, senderID, func(sender string) (*SendMessageResponse, error) {
+			if threadRootEventID != "" {
+				return i.client.SendUploadedFileAsReply(roomID, uploadResp.ContentURI, file.Name, mimeType, file.Size, file.Width, file.Height, threadRootEventID, threadLatestEventID, timestamp, sender)
+			}
+			return i.client.SendUploadedFile(roomID, uploadResp.ContentURI, file.Name, mimeType, file.Size, file.Width, file.Height, timestamp, sender)
+		})
+		if recovery != "" {
+			logger.Info("File %s (post %s): %s", file.ID, file.PostID, recovery)
 		}
 		if err != nil {
 			logger.Debug("importPostFiles: send uploaded file failed id=%s name=%s err=%v", file.ID, file.Name, err)
 			if fileConfig.UploadFallbackToLink {
-				i.sendLinkOrSkip(result, roomID, file, fileConfig, timestamp, senderID, threadRootEventID, threadLatestEventID, fmt.Sprintf("send uploaded file failed: %v", err))
+				linkOrSkip(file, fmt.Sprintf("send uploaded file failed: %v", err))
 			} else {
 				result.Stats.FilesSkipped++
 				result.Errors = append(result.Errors, fmt.Sprintf("Skipped file %s for post %s: send uploaded file failed: %v", file.Name, file.PostID, err))
@@ -1949,8 +2158,9 @@ func (i *Importer) importPostFiles(
 		}
 		logger.Debug("importPostFiles: sent uploaded file event id=%s name=%s room=%s", file.ID, file.Name, roomID)
 		result.Stats.FilesUploaded++
+		sent(file, resp.EventID)
 	}
-	return tooLargeCount, maxTooLargeSize
+	return tooLargeCount, maxTooLargeSize, firstEventID
 }
 
 // MessageImportCallback is called for each message imported
@@ -1964,176 +2174,31 @@ type ImportMessagesResult struct {
 	// ReactionMapping records the reactions sent by this run, keyed by mattermost.Reaction.Key().
 	// Mattermost reactions have no ID of their own, so this is what makes a re-run idempotent.
 	ReactionMapping map[string]string
+	// FileMapping records every attachment known to be sent - the ones passed in as already
+	// sent plus the ones this run sent - as Mattermost file ID -> event ID. An attachment that
+	// failed is absent, so the next run sends it again.
+	FileMapping map[string]string
 }
 
-// ImportMessages imports messages from Mattermost posts to Matrix rooms
-// This requires Application Service token for timestamp support
-func (i *Importer) ImportMessages(
-	posts []mattermost.Post,
-	channelToRoom map[string]string, // Mattermost channel ID -> Matrix room ID
-	userMapping map[string]string, // Mattermost user ID -> Matrix user ID
-	existingMapping map[string]string, // Mattermost post ID -> Matrix event ID (for resume)
-	progress MessageImportCallback,
-) (*ImportMessagesResult, error) {
-	result := &ImportMessagesResult{
-		Stats:   &MessageImportStats{},
-		Mapping: make(map[string]string),
-		Errors:  []string{},
+// recordFile notes that an attachment has been sent as eventID.
+func (r *ImportMessagesResult) recordFile(fileID, eventID string) {
+	if r.FileMapping == nil {
+		r.FileMapping = make(map[string]string)
 	}
-
-	if !i.client.HasASToken() {
-		logger.Warn("No Application Service token configured - messages will be imported without original timestamps")
-	}
-
-	total := len(posts)
-	logger.Info("Starting message import: %d posts to process", total)
-
-	// Gate @name rewriting on users that actually exist.
-	i.SetKnownMentionUsers(userMapping)
-
-	// Past authors who have since left their channel are not room members, and the AS cannot
-	// send as a non-member. Same reasoning as the with-files path.
-	i.historyJoins = append(i.historyJoins, i.ensureHistoryAuthorsJoined(posts, channelToRoom, userMapping)...)
-
-	// Collect all existing mappings
-	for k, v := range existingMapping {
-		result.Mapping[k] = v
-	}
-
-	// Sort posts by timestamp (they should already be sorted, but just in case)
-	// This ensures parent messages are imported before replies
-
-	// Newest Matrix event per Mattermost thread root, so a thread's compatibility reply
-	// points at the previous message rather than always at the root. Posts arrive in
-	// chronological order, so this needs no sorting.
-	threadLatest := make(map[string]string)
-
-	// Process messages in order
-	for idx, post := range posts {
-		// Check if already imported
-		if _, exists := existingMapping[post.ID]; exists {
-			result.Stats.MessagesSkipped++
-			if progress != nil {
-				progress(idx+1, total, post.ChannelID, "skipped")
-			}
-			continue
-		}
-
-		// Skip Mattermost system messages (joins/leaves, header/purpose changes, etc.);
-		// they carry no user content and only pollute the room.
-		if post.IsSystemMessage() {
-			result.Stats.MessagesSkipped++
-			if progress != nil {
-				progress(idx+1, total, post.ChannelID, "skipped:system")
-			}
-			continue
-		}
-
-		// Get target room
-		roomID, roomExists := channelToRoom[post.ChannelID]
-		if !roomExists {
-			result.Stats.MessagesFailed++
-			result.Errors = append(result.Errors, fmt.Sprintf("No room mapping for channel %s (post %s)", post.ChannelID, post.ID))
-			if progress != nil {
-				progress(idx+1, total, post.ChannelID, "failed:no_room")
-			}
-			continue
-		}
-
-		// Get sender
-		senderID, userExists := userMapping[post.UserID]
-		if !userExists {
-			// Fall back to empty sender (will use AS bot)
-			senderID = ""
-			logger.Warn("No user mapping for user %s, message will be sent as AS bot", post.UserID)
-			// The bot is a sender like any other and must be in the room to post.
-			if err := i.ensureFallbackSenderInRoom(roomID); err != nil {
-				logger.Warn("Fallback sender cannot post to room %s: %v", roomID, err)
-			}
-		}
-
-		messageContent := i.normalizeMatrixMentions(post.Message)
-
-		// Handle reply
-		var eventID string
-
-		if post.IsReply() {
-			// This is a reply - find parent event ID
-			parentEventID, parentExists := result.Mapping[post.RootID]
-			if !parentExists {
-				// Parent not yet imported or doesn't exist
-				result.Stats.RepliesFailed++
-				result.Errors = append(result.Errors, fmt.Sprintf("Parent post %s not found for reply %s", post.RootID, post.ID))
-
-				// Import as regular message instead of failing
-				resp, sendErr := i.client.SendMessageWithTimestamp(roomID, messageContent, post.CreateAt, senderID)
-				if sendErr != nil {
-					result.Stats.MessagesFailed++
-					result.Errors = append(result.Errors, fmt.Sprintf("Failed to send message %s: %v", post.ID, sendErr))
-					if progress != nil {
-						progress(idx+1, total, post.ChannelID, "failed:send_error")
-					}
-					continue
-				}
-				eventID = resp.EventID
-			} else {
-				// Send into the thread rooted at the parent post
-				resp, sendErr := i.client.SendReplyWithTimestamp(roomID, messageContent, parentEventID, threadLatest[post.RootID], post.CreateAt, senderID)
-				if sendErr != nil {
-					result.Stats.RepliesFailed++
-					result.Errors = append(result.Errors, fmt.Sprintf("Failed to send reply %s: %v", post.ID, sendErr))
-					if progress != nil {
-						progress(idx+1, total, post.ChannelID, "failed:reply_error")
-					}
-					continue
-				}
-				eventID = resp.EventID
-				threadLatest[post.RootID] = eventID
-				result.Stats.RepliesImported++
-			}
-		} else {
-			// Regular message
-			resp, recovery, sendErr := i.sendWithMembershipRecovery(roomID, messageContent, post.CreateAt, senderID)
-			if recovery != "" {
-				logger.Info("Post %s: %s", post.ID, recovery)
-			}
-			if sendErr != nil {
-				result.Stats.MessagesFailed++
-				result.Errors = append(result.Errors, fmt.Sprintf("Failed to send message %s: %v", post.ID, sendErr))
-				if progress != nil {
-					progress(idx+1, total, post.ChannelID, "failed:send_error")
-				}
-				continue
-			}
-			eventID = resp.EventID
-		}
-
-		// Store mapping
-		result.Mapping[post.ID] = eventID
-		result.Stats.MessagesImported++
-		i.maybeCheckpoint(result.Mapping)
-
-		if progress != nil {
-			progress(idx+1, total, post.ChannelID, "imported")
-		}
-
-	}
-
-	logger.Info("Message import completed: imported=%d, skipped=%d, failed=%d, replies=%d",
-		result.Stats.MessagesImported, result.Stats.MessagesSkipped,
-		result.Stats.MessagesFailed, result.Stats.RepliesImported)
-
-	return result, nil
+	r.FileMapping[fileID] = eventID
 }
 
-// ImportMessagesWithFiles imports messages with file attachments
-// filesByPost maps post ID to list of file infos
+// ImportMessagesWithFiles imports messages with file attachments.
+// filesByPost maps post ID to list of file infos; existingFiles holds the attachments earlier
+// runs sent (file ID -> event ID). In upload mode an already-imported post still gets those of
+// its attachments that are not in existingFiles.
 func (i *Importer) ImportMessagesWithFiles(
 	posts []mattermost.Post,
 	channelToRoom map[string]string,
 	userMapping map[string]string,
 	existingMapping map[string]string,
 	filesByPost map[string][]mattermost.FileInfo,
+	existingFiles map[string]string,
 	fileConfig *FileConfig,
 	reactionImport *ReactionImport,
 	pinImport *PinImport,
@@ -2144,6 +2209,7 @@ func (i *Importer) ImportMessagesWithFiles(
 		Mapping:         make(map[string]string),
 		Errors:          []string{},
 		ReactionMapping: make(map[string]string),
+		FileMapping:     copyMapping(existingFiles),
 	}
 
 	if !i.client.HasASToken() {
@@ -2177,6 +2243,7 @@ func (i *Importer) ImportMessagesWithFiles(
 	for k, v := range existingMapping {
 		result.Mapping[k] = v
 	}
+	i.checkpointMark = recordCount(result)
 
 	// Newest Matrix event per Mattermost thread root, so a thread's compatibility reply
 	// points at the previous message rather than always at the root. Posts arrive in
@@ -2202,9 +2269,23 @@ func (i *Importer) ImportMessagesWithFiles(
 	totalTooLarge := 0
 	var largestTooLargeSize int64
 	for idx, post := range posts {
+		if i.stopForInterrupt("message import", idx, total) {
+			break
+		}
+		files := filesByPost[post.ID]
+
 		// Check if already imported
 		if _, exists := existingMapping[post.ID]; exists {
 			result.Stats.MessagesSkipped++
+			// An earlier run may have stopped before all of the post's attachments were sent.
+			if fileConfig.Mode == "upload" {
+				tooLargeCount, maxTooLargeSize := i.sendUnrecordedPostFiles(result, post, files, channelToRoom, userMapping, fileConfig)
+				totalTooLarge += tooLargeCount
+				if maxTooLargeSize > largestTooLargeSize {
+					largestTooLargeSize = maxTooLargeSize
+				}
+				i.maybeCheckpoint(result)
+			}
 			if progress != nil {
 				progress(idx+1, total, post.ChannelID, "skipped")
 			}
@@ -2232,27 +2313,50 @@ func (i *Importer) ImportMessagesWithFiles(
 			continue
 		}
 
-		// Get sender
-		senderID, userExists := userMapping[post.UserID]
-		if !userExists {
-			senderID = ""
-			logger.Warn("No user mapping for user %s, message will be sent as AS bot", post.UserID)
-			if err := i.ensureFallbackSenderInRoom(roomID); err != nil {
-				logger.Warn("Fallback sender cannot post to room %s: %v", roomID, err)
-			}
-		}
+		senderID := i.resolveSender(post, roomID, userMapping)
 
 		// Build message content with files
 		messageContent := i.normalizeMatrixMentions(post.Message)
-		files := filesByPost[post.ID]
 
 		// Append file links if mode is "link"
 		if fileConfig.Mode == "link" && len(files) > 0 && fileConfig.S3PublicURL != "" {
 			for _, file := range files {
+				if !isSafeAttachmentPath(file.Path) {
+					recordUnsafeAttachmentPath(result, file)
+					continue
+				}
 				fileURL := buildPublicFileURL(fileConfig.S3PublicURL, file.Path)
 				messageContent += fmt.Sprintf("\n\n📎 [%s](%s)", file.Name, fileURL)
 				result.Stats.FilesLinked++
 			}
+		}
+
+		// A post with no text of its own must not become a blank event, since that blank event is
+		// what replies, reactions and pins would then point at.
+		liveFiles := liveAttachments(files)
+		noText := strings.TrimSpace(messageContent) == "" && len(liveFiles) > 0
+		if noText && fileConfig.Mode == "upload" {
+			// The attachments are the post: the first one sent stands for it.
+			if !i.importAttachmentsAsPost(result, post, roomID, senderID, files, fileConfig, threadLatest, &totalTooLarge, &largestTooLargeSize) {
+				if i.isInterrupted() {
+					// Nothing was sent and nothing is recorded; the next run sends the post.
+					continue
+				}
+				result.Stats.MessagesFailed++
+				if progress != nil {
+					progress(idx+1, total, post.ChannelID, "failed:send_error")
+				}
+				continue
+			}
+			i.maybeCheckpoint(result)
+			if progress != nil {
+				progress(idx+1, total, post.ChannelID, "imported")
+			}
+			continue
+		}
+		if noText {
+			// No attachment event will carry it: name the files instead of sending nothing.
+			messageContent = attachmentNamesBody(liveFiles)
 		}
 
 		// Handle reply
@@ -2265,7 +2369,12 @@ func (i *Importer) ImportMessagesWithFiles(
 				result.Stats.RepliesFailed++
 				result.Errors = append(result.Errors, fmt.Sprintf("Parent post %s not found for reply %s", post.RootID, post.ID))
 
-				resp, sendErr := i.client.SendMessageWithTimestamp(roomID, messageContent, post.CreateAt, senderID)
+				resp, recovery, sendErr := i.sendWithMembershipRecovery(roomID, senderID, func(sender string) (*SendMessageResponse, error) {
+					return i.client.SendMessageWithTimestamp(roomID, messageContent, post.CreateAt, sender)
+				})
+				if recovery != "" {
+					logger.Info("Post %s: %s", post.ID, recovery)
+				}
 				if sendErr != nil {
 					result.Stats.MessagesFailed++
 					result.Errors = append(result.Errors, fmt.Sprintf("Failed to send message %s: %v", post.ID, sendErr))
@@ -2276,7 +2385,12 @@ func (i *Importer) ImportMessagesWithFiles(
 				}
 				eventID = resp.EventID
 			} else {
-				resp, sendErr := i.client.SendReplyWithTimestamp(roomID, messageContent, parentEventID, threadLatest[post.RootID], post.CreateAt, senderID)
+				resp, recovery, sendErr := i.sendWithMembershipRecovery(roomID, senderID, func(sender string) (*SendMessageResponse, error) {
+					return i.client.SendReplyWithTimestamp(roomID, messageContent, parentEventID, threadLatest[post.RootID], post.CreateAt, sender)
+				})
+				if recovery != "" {
+					logger.Info("Reply %s: %s", post.ID, recovery)
+				}
 				if sendErr != nil {
 					result.Stats.RepliesFailed++
 					result.Errors = append(result.Errors, fmt.Sprintf("Failed to send reply %s: %v", post.ID, sendErr))
@@ -2291,7 +2405,9 @@ func (i *Importer) ImportMessagesWithFiles(
 				attachmentReplyToEventID = parentEventID
 			}
 		} else {
-			resp, recovery, sendErr := i.sendWithMembershipRecovery(roomID, messageContent, post.CreateAt, senderID)
+			resp, recovery, sendErr := i.sendWithMembershipRecovery(roomID, senderID, func(sender string) (*SendMessageResponse, error) {
+				return i.client.SendMessageWithTimestamp(roomID, messageContent, post.CreateAt, sender)
+			})
 			if recovery != "" {
 				logger.Info("Post %s: %s", post.ID, recovery)
 			}
@@ -2309,33 +2425,39 @@ func (i *Importer) ImportMessagesWithFiles(
 		// Store mapping
 		result.Mapping[post.ID] = eventID
 		result.Stats.MessagesImported++
-		i.maybeCheckpoint(result.Mapping)
-
-		if progress != nil {
-			progress(idx+1, total, post.ChannelID, "imported")
-		}
 
 		// Upload or link files after the message event is imported.
 		// Matrix file attachments are sent as separate m.room.message events.
 		if fileConfig.Mode == "upload" && len(files) > 0 {
-			tooLargeCount, maxTooLargeSize := i.importPostFiles(result, roomID, files, fileConfig, post.CreateAt, senderID, attachmentReplyToEventID, threadLatest[post.RootID])
+			tooLargeCount, maxTooLargeSize, _ := i.importPostFiles(result, roomID, files, fileConfig, post.CreateAt, senderID, attachmentReplyToEventID, threadLatest[post.RootID])
 			totalTooLarge += tooLargeCount
 			if maxTooLargeSize > largestTooLargeSize {
 				largestTooLargeSize = maxTooLargeSize
 			}
 		}
+		i.maybeCheckpoint(result)
 
+		if progress != nil {
+			progress(idx+1, total, post.ChannelID, "imported")
+		}
+	}
+
+	// An interrupted run skips the reaction and pin passes: both are replayed from the saved
+	// mapping when the import is run again.
+	interrupted := i.isInterrupted()
+	if interrupted && (reactionImport != nil || pinImport != nil) {
+		logger.Warn("Interrupted: skipping the reaction and pin passes; they run when the import is resumed")
 	}
 
 	// Reactions come last: an annotation can only point at an event that already exists.
-	if reactionImport != nil && len(reactionImport.Reactions) > 0 {
+	if !interrupted && reactionImport != nil && len(reactionImport.Reactions) > 0 {
 		i.importReactions(result, reactionImport.Reactions, roomByPost, userMapping,
 			reactionImport.AlreadyImported, progress)
 	}
 
 	// Pins come after reactions: the state event names event IDs, so every message it points
 	// at must already have been sent.
-	if pinImport != nil {
+	if !interrupted && pinImport != nil {
 		i.importPins(result, posts, roomByPost, progress)
 	}
 
@@ -2348,6 +2470,146 @@ func (i *Importer) ImportMessagesWithFiles(
 	}
 
 	return result, nil
+}
+
+// resolveSender returns the Matrix user a post is sent as, or "" for the fallback sender when
+// its author has no mapping - in which case the fallback sender is joined to the room first.
+func (i *Importer) resolveSender(post mattermost.Post, roomID string, userMapping map[string]string) string {
+	if senderID, ok := userMapping[post.UserID]; ok {
+		return senderID
+	}
+	logger.Warn("No user mapping for user %s, message will be sent as AS bot", post.UserID)
+	if err := i.ensureFallbackSenderInRoom(roomID); err != nil {
+		logger.Warn("Fallback sender cannot post to room %s: %v", roomID, err)
+	}
+	return ""
+}
+
+// liveAttachments returns the files that have not been deleted in Mattermost.
+func liveAttachments(files []mattermost.FileInfo) []mattermost.FileInfo {
+	var live []mattermost.FileInfo
+	for _, f := range files {
+		if !f.IsDeleted() {
+			live = append(live, f)
+		}
+	}
+	return live
+}
+
+// attachmentNamesBody is the text sent for a post that has attachments but no text, when no
+// attachment event will exist to stand for it.
+func attachmentNamesBody(files []mattermost.FileInfo) string {
+	names := make([]string, len(files))
+	for idx, f := range files {
+		names[idx] = f.Name
+	}
+	return "📎 " + strings.Join(names, ", ")
+}
+
+// importAttachmentsAsPost sends the attachments of a post that has no text, in place of a text
+// event. The first attachment event sent becomes the post's event, so replies, reactions and
+// pins resolve to it, and a reply's thread advances to it. When no attachment could be sent, a
+// text event naming them stands for the post instead, and the attachments stay unrecorded for
+// the next run. It reports whether the post was mapped; when it was not (an interrupt, or the
+// text failed too), nothing about the post is recorded and a later run retries it.
+func (i *Importer) importAttachmentsAsPost(
+	result *ImportMessagesResult,
+	post mattermost.Post,
+	roomID, senderID string,
+	files []mattermost.FileInfo,
+	fileConfig *FileConfig,
+	threadLatest map[string]string,
+	totalTooLarge *int,
+	largestTooLargeSize *int64,
+) bool {
+	threadRoot := ""
+	if post.IsReply() {
+		if parentEventID, ok := result.Mapping[post.RootID]; ok {
+			threadRoot = parentEventID
+		} else {
+			result.Stats.RepliesFailed++
+			result.Errors = append(result.Errors, fmt.Sprintf("Parent post %s not found for reply %s", post.RootID, post.ID))
+		}
+	}
+
+	tooLargeCount, maxTooLargeSize, eventID := i.importPostFiles(result, roomID, files, fileConfig, post.CreateAt, senderID, threadRoot, threadLatest[post.RootID])
+	*totalTooLarge += tooLargeCount
+	if maxTooLargeSize > *largestTooLargeSize {
+		*largestTooLargeSize = maxTooLargeSize
+	}
+	if eventID == "" {
+		// An interrupt leaves the post unsent; the next run sends it with its attachments.
+		if i.isInterrupted() {
+			return false
+		}
+		// No attachment event stands for the post: send the text naming its files instead, so
+		// replies, reactions and pins have an event to point at. The files stay unrecorded and
+		// the next run sends them onto this event.
+		body := attachmentNamesBody(liveAttachments(files))
+		resp, recovery, err := i.sendWithMembershipRecovery(roomID, senderID, func(sender string) (*SendMessageResponse, error) {
+			if threadRoot != "" {
+				return i.client.SendReplyWithTimestamp(roomID, body, threadRoot, threadLatest[post.RootID], post.CreateAt, sender)
+			}
+			return i.client.SendMessageWithTimestamp(roomID, body, post.CreateAt, sender)
+		})
+		if recovery != "" {
+			logger.Info("Post %s: %s", post.ID, recovery)
+		}
+		if err != nil {
+			result.Errors = append(result.Errors, fmt.Sprintf("Failed to send message %s: none of its attachments could be sent, nor the text naming them: %v", post.ID, err))
+			return false
+		}
+		logger.Warn("Post %s has no text and none of its attachments could be sent; sent a text naming them, the attachments are retried on the next run", post.ID)
+		eventID = resp.EventID
+	}
+
+	result.Mapping[post.ID] = eventID
+	result.Stats.MessagesImported++
+	if threadRoot != "" {
+		threadLatest[post.RootID] = eventID
+		result.Stats.RepliesImported++
+	}
+	return true
+}
+
+// sendUnrecordedPostFiles sends the attachments of an already-imported post that no earlier run
+// recorded as sent - because its upload failed, or the run stopped before reaching it. They go
+// out exactly as on a first run: same room, sender and timestamp, and in the post's thread when
+// it is a reply, with the post's own event as the reply fallback.
+func (i *Importer) sendUnrecordedPostFiles(
+	result *ImportMessagesResult,
+	post mattermost.Post,
+	files []mattermost.FileInfo,
+	channelToRoom map[string]string,
+	userMapping map[string]string,
+	fileConfig *FileConfig,
+) (int, int64) {
+	var pending []mattermost.FileInfo
+	for _, f := range liveAttachments(files) {
+		if _, sent := result.FileMapping[f.ID]; !sent {
+			pending = append(pending, f)
+		}
+	}
+	if len(pending) == 0 {
+		return 0, 0
+	}
+	roomID, ok := channelToRoom[post.ChannelID]
+	if !ok {
+		return 0, 0
+	}
+	senderID := i.resolveSender(post, roomID, userMapping)
+
+	threadRoot, threadLatestEventID := "", ""
+	if post.IsReply() {
+		if parentEventID, ok := result.Mapping[post.RootID]; ok {
+			threadRoot = parentEventID
+			threadLatestEventID = result.Mapping[post.ID]
+		}
+	}
+
+	logger.Info("Post %s was imported earlier; sending %d attachment(s) not yet recorded as sent", post.ID, len(pending))
+	tooLargeCount, maxTooLargeSize, _ := i.importPostFiles(result, roomID, pending, fileConfig, post.CreateAt, senderID, threadRoot, threadLatestEventID)
+	return tooLargeCount, maxTooLargeSize
 }
 
 // ReactionProgressStage is passed in the channel slot of MessageImportCallback while the
@@ -2404,6 +2666,9 @@ func (i *Importer) importReactions(
 	tally := &skipTally{}
 
 	for idx, reaction := range reactions {
+		if i.stopForInterrupt("reaction import", idx, total) {
+			break
+		}
 		key := reaction.Key()
 
 		if _, done := alreadyImported[key]; done {
@@ -2514,6 +2779,9 @@ func (i *Importer) EnableEmailNotifications(
 	serverSideMissing := false
 
 	for idx, user := range users {
+		if i.stopForInterrupt("email notification setup", idx, total) {
+			break
+		}
 		if progress != nil {
 			progress("enable_notifications", idx+1, total, user.Username)
 		}
@@ -2590,6 +2858,9 @@ func (i *Importer) LeaveMigratedRooms(roomIDs []string, progress ImportProgressC
 	processed := 0
 
 	for _, roomID := range roomIDs {
+		if i.stopForInterrupt("leaving migrated rooms", processed, total) {
+			break
+		}
 		if roomID == "" {
 			continue
 		}

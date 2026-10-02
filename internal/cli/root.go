@@ -1,13 +1,19 @@
 ﻿package cli
 
 import (
+	"context"
 	"fmt"
+	"io"
 	"os"
+	"os/signal"
+	"sync/atomic"
+	"syscall"
 
 	"github.com/spf13/cobra"
 
 	"github.com/aligundogdu/matrixmigrate/internal/config"
 	"github.com/aligundogdu/matrixmigrate/internal/i18n"
+	"github.com/aligundogdu/matrixmigrate/internal/migration"
 	"github.com/aligundogdu/matrixmigrate/internal/tui"
 	"github.com/aligundogdu/matrixmigrate/internal/version"
 )
@@ -50,14 +56,11 @@ Examples:
 	},
 	RunE: func(cmd *cobra.Command, args []string) error {
 		// Load config
+		// A missing config.yaml already falls back to defaults inside config.Load, so an
+		// error here is a file that exists but does not parse or validate: report it in
+		// both modes rather than exit successfully.
 		cfg, err := config.Load(cfgFile)
 		if err != nil {
-			// If no config and we're in TUI mode, show a message
-			if !batch {
-				fmt.Println(i18n.T("messages.no_config"))
-				fmt.Println("Please create a config.yaml file. See config.example.yaml for reference.")
-				return nil
-			}
 			return err
 		}
 
@@ -78,14 +81,71 @@ Examples:
 			return cmd.Help()
 		}
 
-		// Start TUI
-		return tui.Run(cfg)
+		// Start TUI. It shows its own stopping notice, so the CLI one stays quiet.
+		tuiRunning.Store(true)
+		defer tuiRunning.Store(false)
+		return tui.Run(cmd.Context(), cfg)
 	},
 }
 
-// Execute runs the root command
+// Execute runs the root command.
+//
+// SIGINT, SIGTERM and SIGHUP (a dropped SSH session) cancel the context the commands run
+// under: an import step then finishes the item in flight, saves its progress and returns
+// migration.ErrInterrupted. A second signal gets the default behaviour and kills the process at
+// once. A command that runs to the end regardless, such as an export, still exits non-zero
+// after a signal, so a calling script stops rather than starting the next step.
 func Execute() error {
-	return rootCmd.Execute()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+	defer stop()
+
+	// Closed before the deferred stop() runs, so the cancellation stop() causes on a normal
+	// exit is not mistaken for an interrupt.
+	finished := make(chan struct{})
+	defer close(finished)
+	go announceInterrupt(ctx, stop, finished, os.Stderr)
+
+	err := rootCmd.ExecuteContext(ctx)
+	// Only a signal cancels ctx before this point: stop() runs on the first signal or on return.
+	result := interruptedExit(ctx.Err() != nil, err)
+	if err == nil && result != nil {
+		fmt.Fprintf(os.Stderr, "⚠ %s\n", i18n.T("messages.interrupted_exit"))
+	}
+	return result
+}
+
+// interruptedExit is the result of a run: err unchanged, except that a command that returned
+// nil after a signal reports ErrInterrupted.
+func interruptedExit(signalled bool, err error) error {
+	if err != nil || !signalled {
+		return err
+	}
+	return fmt.Errorf("stopped by a signal: %w", migration.ErrInterrupted)
+}
+
+// tuiRunning is set while the TUI owns the terminal. The TUI reports an interrupt itself;
+// a line written to stderr then would land in the middle of its screen.
+var tuiRunning atomic.Bool
+
+// announceInterrupt waits for the first interrupt, then restores the default signal handling
+// (so a second Ctrl+C kills the process) and tells the user what is happening. It returns
+// without a word once finished is closed, and prints nothing while the TUI is running.
+func announceInterrupt(ctx context.Context, stop func(), finished <-chan struct{}, out io.Writer) {
+	select {
+	case <-finished:
+		return
+	case <-ctx.Done():
+	}
+	select {
+	case <-finished:
+		return
+	default:
+	}
+	stop()
+	if tuiRunning.Load() {
+		return
+	}
+	fmt.Fprintf(out, "⚠ %s\n", i18n.T("messages.interrupt_received"))
 }
 
 func init() {
@@ -126,11 +186,6 @@ func loadConfig() (*config.Config, error) {
 	}
 
 	return cfg, nil
-}
-
-// printError prints an error message
-func printError(format string, args ...interface{}) {
-	fmt.Fprintf(os.Stderr, "Error: "+format+"\n", args...)
 }
 
 // printSuccess prints a success message

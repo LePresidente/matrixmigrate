@@ -1,7 +1,10 @@
 package migration
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"io/fs"
 	"net/http"
 	"strings"
 	"time"
@@ -23,17 +26,48 @@ type Orchestrator struct {
 	mmClient  *mattermost.Client
 	mxClient  *matrix.Client
 	masClient *matrix.MASClient // set only when MAS is enabled
-	mxToken   string            // Matrix access token (from login or config)
 
-	// forceMembershipReplay re-applies channel/team memberships even when the step already
-	// completed, so members who joined after the first run get added on a later run.
-	forceMembershipReplay bool
+	// mxToken is the access token of a session this tool opened with a username/password
+	// login, and mxLoginBaseURL the API address the login used. Close revokes it. Both stay
+	// empty when the token is the configured admin token.
+	mxToken        string
+	mxLoginBaseURL string
+
+	// ctx is cancelled when the user interrupts the run. See SetContext.
+	ctx context.Context
 }
 
-// SetForceMembershipReplay controls whether a completed membership step is re-applied on
-// re-run (to pick up members added since the first run). Force-join is idempotent.
-func (o *Orchestrator) SetForceMembershipReplay(force bool) {
-	o.forceMembershipReplay = force
+// ErrInterrupted marks a step that stopped early because the run was interrupted. The work
+// done up to that point has been saved, so running the same step again resumes it.
+var ErrInterrupted = errors.New("interrupted")
+
+// SetContext installs the context whose cancellation interrupts the running step. Import
+// steps stop after the item in flight, save their progress, and return an error wrapping
+// ErrInterrupted. Without a call the context is context.Background() and nothing interrupts.
+func (o *Orchestrator) SetContext(ctx context.Context) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	o.ctx = ctx
+	if o.mxClient != nil {
+		o.mxClient.SetContext(ctx)
+	}
+}
+
+// interrupted reports whether the context installed with SetContext has been cancelled.
+func (o *Orchestrator) interrupted() bool {
+	return o.ctx != nil && o.ctx.Err() != nil
+}
+
+// failInterrupted records step as failed with err, which must wrap ErrInterrupted, and returns
+// err for the caller to hand back.
+func (o *Orchestrator) failInterrupted(step StepName, err error) error {
+	logger.Warn("%v", err)
+	o.state.FailStep(step, err)
+	if serr := o.SaveState(); serr != nil {
+		logger.Error("Failed to save state after interrupt: %v", serr)
+	}
+	return err
 }
 
 // NewOrchestrator creates a new migration orchestrator
@@ -57,16 +91,65 @@ func NewOrchestrator(cfg *config.Config) (*Orchestrator, error) {
 		config:        cfg,
 		state:         state,
 		tunnelManager: ssh.NewTunnelManager(),
+		ctx:           context.Background(),
 	}, nil
 }
 
-// Close closes all connections
+// Close ends the session: it logs out a Matrix session this tool opened with a password
+// login, then closes the database connection and every SSH tunnel. Calling it again is safe.
 func (o *Orchestrator) Close() error {
-	logger.Close()
+	// The logout has to go out before the tunnel it may travel through is closed.
+	o.endLoginSession()
 	if o.mmClient != nil {
 		o.mmClient.Close()
+		o.mmClient = nil
 	}
-	return o.tunnelManager.CloseAll()
+	o.mxClient = nil
+	err := o.tunnelManager.CloseAll()
+	logger.Close()
+	return err
+}
+
+// setLoginSession records a session opened by a password login so Close can revoke it.
+func (o *Orchestrator) setLoginSession(baseURL, token string) {
+	o.mxLoginBaseURL = baseURL
+	o.mxToken = token
+}
+
+// endLoginSession revokes the session recorded by setLoginSession, if any. A failure is
+// logged, not returned: the session expires on its own and nothing else depends on it.
+func (o *Orchestrator) endLoginSession() {
+	if o.mxToken == "" {
+		return
+	}
+	if err := matrix.Logout(o.mxLoginBaseURL, o.mxToken); err != nil {
+		logger.Warn("Could not log out the Matrix session: %v", err)
+	} else {
+		logger.Info("Logged out the Matrix session")
+	}
+	o.mxToken = ""
+	o.mxLoginBaseURL = ""
+}
+
+// connectionState is what a Connect call finds already in place.
+type connectionState int
+
+const (
+	connAbsent connectionState = iota // no client: connect from scratch
+	connLive                          // a client that still answers: reuse it
+	connStale                         // a client that no longer answers: discard and reconnect
+)
+
+// classifyConnection decides what to do with an existing client. ping is called only when
+// there is a client.
+func classifyConnection(hasClient bool, ping func() error) connectionState {
+	if !hasClient {
+		return connAbsent
+	}
+	if err := ping(); err != nil {
+		return connStale
+	}
+	return connLive
 }
 
 // waitForTunnel waits for the SSH tunnel to be ready by making HTTP requests
@@ -125,6 +208,9 @@ type OperationResult struct {
 	RoomsFailed   int
 	RoomsLinked   int
 
+	// RoomsLinkFailed counts rooms that could not be added to their parent space.
+	RoomsLinkFailed int
+
 	// Membership stats
 	TeamMembershipsExported    int
 	ChannelMembershipsExported int
@@ -155,11 +241,23 @@ type OperationResult struct {
 func (o *Orchestrator) newImporter() *matrix.Importer {
 	importer := matrix.NewImporter(o.mxClient)
 	importer.SetDeletedUserMode(o.config.GetDeletedUserMode())
+	importer.SetContext(o.ctx)
 	return importer
 }
 
-// ConnectMattermost establishes connection to Mattermost
+// ConnectMattermost establishes connection to Mattermost. It is idempotent: a connection
+// that still answers is kept, and one that does not is closed, with its tunnel, and replaced.
 func (o *Orchestrator) ConnectMattermost() error {
+	switch classifyConnection(o.mmClient != nil, func() error { return o.mmClient.Ping() }) {
+	case connLive:
+		return nil
+	case connStale:
+		logger.Warn("Mattermost database connection no longer answers; reconnecting")
+		o.mmClient.Close()
+		o.mmClient = nil
+		o.tunnelManager.CloseTunnel("mattermost")
+	}
+
 	cfg := o.config.Mattermost
 	passphrase := o.config.GetSSHKeyPassphrase("mattermost")
 	sshPassword := o.config.GetSSHPassword("mattermost")
@@ -220,28 +318,23 @@ func (o *Orchestrator) ConnectMattermost() error {
 	if direct {
 		logger.Info("Connecting directly to Mattermost database at %s:%d", dbHost, dbPort)
 	} else {
-		// Get an available local port for the tunnel
-		localPort, err := ssh.GetLocalPort()
-		if err != nil {
-			return fmt.Errorf("failed to get local port: %w", err)
-		}
-
-		// Create SSH tunnel to database
+		// Create SSH tunnel to database. LocalPort 0 lets the tunnel bind a free port itself;
+		// the address comes from the tunnel returned, which may be an existing one.
 		tunnelCfg := ssh.TunnelConfig{
 			SSHConfig:  cfg.SSH,
-			LocalPort:  localPort,
+			LocalPort:  0,
 			RemoteHost: dbHost,
 			RemotePort: dbPort,
 			Passphrase: passphrase,
 			Password:   sshPassword,
 		}
 
-		_, err = o.tunnelManager.CreateTunnel("mattermost", tunnelCfg)
+		tunnel, err := o.tunnelManager.CreateTunnel("mattermost", tunnelCfg)
 		if err != nil {
 			return fmt.Errorf("failed to create SSH tunnel: %w", err)
 		}
 
-		connHost, connPort = "127.0.0.1", localPort
+		connHost, connPort = "127.0.0.1", tunnel.LocalPort()
 	}
 
 	sslMode := config.ResolveDBSSLMode(cfg.Database.SSLMode, dbSSLMode, connHost)
@@ -269,8 +362,14 @@ func (o *Orchestrator) ConnectMattermost() error {
 	return nil
 }
 
-// ConnectMatrix establishes connection to Matrix
-func (o *Orchestrator) ConnectMatrix() error {
+// ConnectMatrix establishes connection to Matrix. It is idempotent: once a client is set,
+// later calls return at once rather than open another tunnel, log in again or re-verify. A
+// call that fails part-way closes the tunnel it opened and revokes a session it logged in.
+func (o *Orchestrator) ConnectMatrix() (err error) {
+	if o.mxClient != nil {
+		return nil
+	}
+
 	cfg := o.config.Matrix
 
 	// Direct mode: no ssh.host means the Matrix API is reachable from here, so talk to
@@ -280,6 +379,19 @@ func (o *Orchestrator) ConnectMatrix() error {
 
 	var baseURL string
 
+	// A connect that fails part-way leaves nothing behind: the session it logged in is
+	// revoked while the tunnel it travels through is still open, then the tunnel is closed.
+	defer func() {
+		if err == nil {
+			return
+		}
+		o.endLoginSession()
+		o.masClient = nil
+		if !direct {
+			o.tunnelManager.CloseTunnel("matrix")
+		}
+	}()
+
 	if direct {
 		baseURL = o.config.MatrixAPIURL()
 		logger.Info("Connecting directly to Matrix API at %s", baseURL)
@@ -287,44 +399,37 @@ func (o *Orchestrator) ConnectMatrix() error {
 		passphrase := o.config.GetSSHKeyPassphrase("matrix")
 		sshPassword := o.config.GetSSHPassword("matrix")
 
-		// Get an available local port for the tunnel
-		localPort, err := ssh.GetLocalPort()
-		if err != nil {
-			return fmt.Errorf("failed to get local port: %w", err)
-		}
-
 		// Get remote API port from config (default: 8008)
 		remotePort := cfg.API.Port
 		if remotePort == 0 {
 			remotePort = 8008
 		}
 
-		// Create SSH tunnel to Matrix API
+		// Create SSH tunnel to Matrix API. LocalPort 0 lets the tunnel bind a free port
+		// itself; the address comes from the tunnel returned, which may be an existing one.
 		tunnelCfg := ssh.TunnelConfig{
 			SSHConfig:  cfg.SSH,
-			LocalPort:  localPort,
+			LocalPort:  0,
 			RemoteHost: "127.0.0.1",
 			RemotePort: remotePort,
 			Passphrase: passphrase,
 			Password:   sshPassword,
 		}
 
-		logger.Info("Creating SSH tunnel to Matrix API (local:%d -> remote:127.0.0.1:%d)", localPort, remotePort)
-
-		_, err = o.tunnelManager.CreateTunnel("matrix", tunnelCfg)
+		tunnel, err := o.tunnelManager.CreateTunnel("matrix", tunnelCfg)
 		if err != nil {
 			return fmt.Errorf("failed to create SSH tunnel: %w", err)
 		}
+		logger.Info("SSH tunnel to Matrix API: %s -> remote:127.0.0.1:%d", tunnel.LocalAddr(), remotePort)
 
 		// Use local tunnel URL
-		baseURL = fmt.Sprintf("http://127.0.0.1:%d", localPort)
+		baseURL = "http://" + tunnel.LocalAddr()
 
 		// Wait a moment for the tunnel to be ready
 		time.Sleep(500 * time.Millisecond)
 
 		// Verify tunnel is working by attempting a simple HTTP request
 		if err := o.waitForTunnel(baseURL, 5*time.Second); err != nil {
-			o.tunnelManager.CloseTunnel("matrix")
 			return fmt.Errorf("SSH tunnel to Matrix API is not responding on port %d: %w (is Synapse running and listening on port %d?)", remotePort, err, remotePort)
 		}
 	}
@@ -339,17 +444,15 @@ func (o *Orchestrator) ConnectMatrix() error {
 		// Login with username/password
 		password := o.config.GetMatrixPassword()
 		if password == "" {
-			o.tunnelManager.CloseTunnel("matrix")
 			return fmt.Errorf("Matrix password not found in environment variable %s", cfg.Auth.PasswordEnv)
 		}
 
 		loginResp, err := matrix.Login(baseURL, cfg.Auth.Username, password)
 		if err != nil {
-			o.tunnelManager.CloseTunnel("matrix")
 			return fmt.Errorf("failed to login to Matrix: %w", err)
 		}
 		accessToken = loginResp.AccessToken
-		o.mxToken = accessToken
+		o.setLoginSession(baseURL, accessToken)
 	}
 
 	// Create Matrix client with rate limiting from config
@@ -359,10 +462,10 @@ func (o *Orchestrator) ConnectMatrix() error {
 		RetryBaseDelay:    time.Duration(cfg.RateLimit.RetryBaseDelay) * time.Millisecond,
 	}
 	client := matrix.NewClientWithRateLimit(baseURL, accessToken, cfg.Homeserver, rlConfig)
+	client.SetContext(o.ctx)
 
 	// Test connection
 	if err := client.TestConnection(); err != nil {
-		o.tunnelManager.CloseTunnel("matrix")
 		return fmt.Errorf("failed to connect to Matrix API: %w", err)
 	}
 
@@ -381,7 +484,6 @@ func (o *Orchestrator) ConnectMatrix() error {
 		clientID := o.config.GetMASClientID()
 		clientSecret := o.config.GetMASClientSecret()
 		if clientID == "" || clientSecret == "" {
-			o.tunnelManager.CloseTunnel("matrix")
 			return fmt.Errorf("matrix.mas is enabled but %s and/or %s are not set",
 				o.config.Matrix.MAS.ClientIDEnv, o.config.Matrix.MAS.ClientSecretEnv)
 		}
@@ -408,7 +510,6 @@ func (o *Orchestrator) ConnectMatrix() error {
 	// creation degrades to the admin user, and a room's creator cannot be changed
 	// afterwards, so a partial run leaves permanently mis-owned rooms behind.
 	if err := o.verifyCredentials(client); err != nil {
-		o.tunnelManager.CloseTunnel("matrix")
 		return err
 	}
 
@@ -543,6 +644,58 @@ func (o *Orchestrator) ExportAssets(progress ProgressCallback) (*OperationResult
 	return result, o.SaveState()
 }
 
+// loadExistingAssetMappings returns the union of the mapping file recorded in state (may be
+// empty) and the newest asset-mapping file in dir, the newer one winning on conflict. It
+// returns nil when there is neither. A file that exists but cannot be loaded is an error naming
+// it: importing as if nothing had been created would create every space and room again.
+func loadExistingAssetMappings(recordedFile, dir string) (*matrix.ExistingMappings, error) {
+	var sources []*Mapping
+	recorded := ""
+	if recordedFile != "" {
+		m, err := LoadMapping(recordedFile)
+		switch {
+		case err == nil:
+			sources = append(sources, m)
+			recorded = recordedFile
+		case errors.Is(err, fs.ErrNotExist):
+			logger.Warn("Asset mapping %s recorded in state no longer exists; using the newest mapping on disk", recordedFile)
+		default:
+			return nil, fmt.Errorf("cannot load asset mapping %s: %w (repair or restore the file; importing without it would create every space and room again)", recordedFile, err)
+		}
+	}
+	latest, err := GetLatestMappingFile(dir)
+	if err != nil {
+		return nil, fmt.Errorf("cannot look for asset mappings in %s: %w", dir, err)
+	}
+	if latest != "" && latest != recorded {
+		m, err := LoadMapping(latest)
+		if err != nil {
+			return nil, fmt.Errorf("cannot load asset mapping %s: %w (repair or restore the file; importing without it would create every space and room again)", latest, err)
+		}
+		sources = append(sources, m)
+	}
+	if len(sources) == 0 {
+		return nil, nil
+	}
+	out := &matrix.ExistingMappings{
+		Users:  make(map[string]string),
+		Spaces: make(map[string]string),
+		Rooms:  make(map[string]string),
+	}
+	for _, m := range sources {
+		for k, v := range m.Users {
+			out.Users[k] = v
+		}
+		for k, v := range m.Teams {
+			out.Spaces[k] = v
+		}
+		for k, v := range m.Channels {
+			out.Rooms[k] = v
+		}
+	}
+	return out, nil
+}
+
 // ImportAssets imports assets to Matrix
 func (o *Orchestrator) ImportAssets(progress ProgressCallback) (*OperationResult, error) {
 	result := &OperationResult{}
@@ -588,33 +741,26 @@ func (o *Orchestrator) ImportAssets(progress ProgressCallback) (*OperationResult
 		}
 	}
 
-	// Try to load existing mapping to skip already imported items
-	var existingMappings *matrix.ExistingMappings
-	existingMappingFile := o.state.GetStepOutputFile(StepImportAssets)
-	if existingMappingFile != "" {
-		existingMapping, err := LoadMapping(existingMappingFile)
-		if err == nil {
-			existingMappings = &matrix.ExistingMappings{
-				Users:  existingMapping.Users,
-				Spaces: existingMapping.Teams,
-				Rooms:  existingMapping.Channels,
-			}
-		}
+	// Existing mappings let a re-run skip what was already created: the union of the file the
+	// last completed run recorded and the newest mapping on disk, which may be a checkpoint
+	// from an interrupted run that never reached the state file.
+	existingMappings, err := loadExistingAssetMappings(o.state.GetStepOutputFile(StepImportAssets), o.config.Data.MappingsDir)
+	if err != nil {
+		o.state.FailStep(StepImportAssets, err)
+		o.SaveState()
+		return nil, err
 	}
 
-	// Also check for latest mapping file in mappings directory
-	if existingMappings == nil {
-		latestMapping, _ := GetLatestMappingFile(o.config.Data.MappingsDir)
-		if latestMapping != "" {
-			existingMapping, err := LoadMapping(latestMapping)
-			if err == nil {
-				existingMappings = &matrix.ExistingMappings{
-					Users:  existingMapping.Users,
-					Spaces: existingMapping.Teams,
-					Rooms:  existingMapping.Channels,
-				}
-			}
-		}
+	// One file name for the whole run: the checkpoints and the final save all write it, so a
+	// crash leaves the latest state in the newest asset-mapping file.
+	mappingFile := GenerateMappingFilename(o.config.Data.MappingsDir)
+	homeserver := o.mxClient.GetHomeserver()
+	saveAssetMapping := func(users, spaces, rooms map[string]string) error {
+		m := NewMapping(homeserver)
+		m.MergeUsers(users)
+		m.MergeTeams(spaces)
+		m.MergeChannels(rooms)
+		return SaveMapping(m, mappingFile)
 	}
 
 	// Build room import options from config.
@@ -678,6 +824,12 @@ func (o *Orchestrator) ImportAssets(progress ProgressCallback) (*OperationResult
 		logger.Info("User import: generating a random %d-character password per user", o.config.GetUserPasswordLength())
 	}
 
+	importer.SetAssetCheckpoint(func(users, spaces, rooms map[string]string) {
+		if err := saveAssetMapping(users, spaces, rooms); err != nil {
+			logger.Warn("Could not checkpoint the asset mapping to %s: %v", mappingFile, err)
+		}
+	})
+
 	// Import callback
 	var importProgress matrix.ImportProgressCallback
 	if progress != nil {
@@ -707,8 +859,11 @@ func (o *Orchestrator) ImportAssets(progress ProgressCallback) (*OperationResult
 		}
 	}
 
-	// Import direct message channels as Matrix DMs when enabled
-	if o.config.Matrix.Import.ImportDirectMessages && len(assets.DirectChannels) > 0 {
+	// Import direct message channels as Matrix DMs when enabled. An interrupted run goes
+	// straight to saving what it has.
+	if o.interrupted() {
+		logger.Warn("Import assets interrupted: skipping direct message import and room linking")
+	} else if o.config.Matrix.Import.ImportDirectMessages && len(assets.DirectChannels) > 0 {
 		logger.Info("Import direct messages: processing %d direct channels as DMs", len(assets.DirectChannels))
 		existingRoomMapping := make(map[string]string)
 		if existingMappings != nil {
@@ -741,18 +896,25 @@ func (o *Orchestrator) ImportAssets(progress ProgressCallback) (*OperationResult
 	result.RoomsSkipped = importResult.Stats.RoomsSkipped
 	result.RoomsFailed = importResult.Stats.RoomsFailed
 
-	// Create mapping
-	mapping := NewMapping(o.config.Matrix.Homeserver)
-	mapping.MergeUsers(importResult.UserMapping)
-	mapping.MergeTeams(importResult.SpaceMapping)
-	mapping.MergeChannels(importResult.RoomMapping)
-
-	// Save mapping
-	mappingFile := GenerateMappingFilename(o.config.Data.MappingsDir)
-	if err := SaveMapping(mapping, mappingFile); err != nil {
+	// Save mapping (the same file the checkpoints wrote). It records the homeserver the client
+	// actually talked to, which may differ from the configured one after detection.
+	if err := saveAssetMapping(importResult.UserMapping, importResult.SpaceMapping, importResult.RoomMapping); err != nil {
+		if o.interrupted() {
+			return nil, o.failInterrupted(StepImportAssets,
+				fmt.Errorf("asset import %w, and saving what was created so far failed: %v", ErrInterrupted, err))
+		}
 		o.state.FailStep(StepImportAssets, err)
 		o.SaveState()
 		return nil, fmt.Errorf("failed to save mapping: %w", err)
+	}
+
+	// Checked again after linking, which an interrupt can also cut short.
+	interruptedAfterSave := func() error {
+		return o.failInterrupted(StepImportAssets,
+			fmt.Errorf("asset import %w: everything created so far is recorded in %s; run the same command again to resume", ErrInterrupted, mappingFile))
+	}
+	if o.interrupted() {
+		return nil, interruptedAfterSave()
 	}
 
 	// Link rooms to spaces (pass userMapping and defaultSpaceOwnerID so admin can be invited into spaces/rooms before linking)
@@ -773,6 +935,23 @@ func (o *Orchestrator) ImportAssets(progress ProgressCallback) (*OperationResult
 	linkResult, err := importer.LinkRoomsToSpaces(assets.Channels, importResult.SpaceMapping, importResult.RoomMapping, importResult.UserMapping, defaultSpaceOwnerID, o.config.GetPublicRoomJoinRules(), importProgress)
 	if err == nil && linkResult != nil {
 		result.RoomsLinked = linkResult.RoomsLinked
+		result.RoomsLinkFailed = linkResult.RoomsLinkFailed
+		if linkResult.RoomsLinkFailed > 0 {
+			logger.Warn("Import assets: %d rooms could not be linked to their space; re-run import assets to retry them", linkResult.RoomsLinkFailed)
+		}
+	}
+	if o.interrupted() {
+		return nil, interruptedAfterSave()
+	}
+
+	// A user left untouched because their existence could not be confirmed has no mapping, so
+	// the message import would send their posts as the fallback sender, for good. Everything
+	// else is saved; the step stays failed until a re-run has confirmed them.
+	if n := importResult.Stats.UsersUnconfirmed; n > 0 {
+		err := fmt.Errorf("%d user(s) could not be confirmed to exist and were left untouched (see the log); everything else is saved to %s - run import assets again before importing messages, or their posts would be sent as the fallback sender", n, mappingFile)
+		o.state.FailStep(StepImportAssets, err)
+		o.SaveState()
+		return nil, err
 	}
 
 	// Complete step
@@ -863,12 +1042,10 @@ func (o *Orchestrator) ImportMemberships(progress ProgressCallback) (*OperationR
 		logger.Error("Cannot run step: %s", reason)
 		return nil, fmt.Errorf("cannot run step: %s", reason)
 	}
-	// If memberships were already imported successfully, skip expensive replays by default.
-	// This keeps reruns fast and avoids reissuing force-join operations. When replay is
-	// forced, re-apply so members who joined after the first run get added (idempotent).
-	if step := o.state.GetStep(StepImportMemberships); step.Status == StatusCompleted && !o.forceMembershipReplay {
-		logger.Info("ImportMemberships: step already completed, skipping membership replay")
-		return result, nil
+	// A completed step is re-applied, not skipped, so members who joined after the first run
+	// get added. Force-join treats a user already in the room as success, so this is safe.
+	if step := o.state.GetStep(StepImportMemberships); step.Status == StatusCompleted {
+		logger.Info("ImportMemberships: step already completed, re-applying to pick up new members")
 	}
 
 	// Get the membership file and mapping file from previous steps
@@ -1012,6 +1189,11 @@ func (o *Orchestrator) ImportMemberships(progress ProgressCallback) (*OperationR
 	logger.Info("Import memberships cleanup: admin left spaces=%d leave_failures=%d attempted=%d",
 		leftSpaces, failedLeaveSpaces, len(spacesToLeaveAfterMembershipImport))
 
+	if o.interrupted() {
+		return nil, o.failInterrupted(StepImportMemberships,
+			fmt.Errorf("membership import %w; memberships are safe to re-apply, run the same command again to finish", ErrInterrupted))
+	}
+
 	// Fill result stats
 	result.MembersAdded = teamStats.MembersAdded + channelStats.MembersAdded
 	result.MembersSkipped = teamStats.MembersSkipped + channelStats.MembersSkipped
@@ -1032,7 +1214,8 @@ func (o *Orchestrator) ImportMemberships(progress ProgressCallback) (*OperationR
 // This is a cleanup sweep, not part of the import chain: the import steps already leave
 // rooms inline after force-joining members, but they only log a warning when that fails,
 // which leaves the admin account inside private rooms and other people's DMs. Running this
-// at the end of a migration clears those leftovers, and it is safe to repeat.
+// at the end of a migration clears those leftovers, and it is safe to repeat. It also
+// withdraws the history joins a message import recorded in its journal but never undid.
 func (o *Orchestrator) LeaveRooms(progress ProgressCallback) (*OperationResult, error) {
 	result := &OperationResult{}
 
@@ -1067,6 +1250,14 @@ func (o *Orchestrator) LeaveRooms(progress ProgressCallback) (*OperationResult, 
 		o.state.FailStep(StepLeaveRooms, err)
 		o.SaveState()
 		return nil, fmt.Errorf("failed to load mapping: %w", err)
+	}
+
+	historyJournal, err := LoadHistoryJoinJournal(HistoryJoinJournalPath(o.config.Data.MappingsDir))
+	if err != nil {
+		logger.Error("%v", err)
+		o.state.FailStep(StepLeaveRooms, err)
+		o.SaveState()
+		return nil, err
 	}
 
 	// Rooms first, then spaces: a space is only left once its rooms are done, so a run
@@ -1113,12 +1304,22 @@ func (o *Orchestrator) LeaveRooms(progress ProgressCallback) (*OperationResult, 
 	result.BotRoomsKept = botRemoval.Kept
 	result.BotRoomsFailed = botRemoval.Failed
 
+	// Past authors joined only to replay history by a message import that did not get as far
+	// as its own cleanup - an interrupted or failed run - recorded in the history-join journal.
+	attachHistoryJoinJournal(importer, historyJournal)
+	historyCleanup := withdrawHistoryJoins(importer, historyJournal)
+
 	stats, err := importer.LeaveMigratedRooms(roomIDs, importProgress)
 	if err != nil {
 		logger.Error("Failed to leave rooms: %v", err)
 		o.state.FailStep(StepLeaveRooms, err)
 		o.SaveState()
 		return nil, fmt.Errorf("failed to leave rooms: %w", err)
+	}
+
+	if o.interrupted() {
+		return nil, o.failInterrupted(StepLeaveRooms,
+			fmt.Errorf("leaving rooms %w; run the same command again to finish", ErrInterrupted))
 	}
 
 	result.RoomsLeft = stats.RoomsLeft
@@ -1132,6 +1333,8 @@ func (o *Orchestrator) LeaveRooms(progress ProgressCallback) (*OperationResult, 
 		result.DeactivatedAccounts, result.DeactivatedRoomsLeft, result.DeactivatedRoomsKept, result.DeactivatedRoomsFailed)
 	logger.Info("Migration bot: rooms_left=%d, kept_as_owner=%d, failed=%d",
 		result.BotRoomsLeft, result.BotRoomsKept, result.BotRoomsFailed)
+	logger.Info("History joins: left=%d, kept_owners=%d, failed=%d, still_recorded=%d",
+		historyCleanup.Left, historyCleanup.Kept, historyCleanup.Failed, len(historyCleanup.Remaining))
 	if result.RoomsLeaveFailed > 0 {
 		logger.Warn("The migration admin is still in %d room(s); re-run 'import leave-rooms' or remove it manually", result.RoomsLeaveFailed)
 	} else {
@@ -1231,6 +1434,11 @@ func (o *Orchestrator) EnableEmailNotifications(progress ProgressCallback) (*Ope
 		o.state.FailStep(StepEnableNotifications, err)
 		o.SaveState()
 		return nil, err
+	}
+
+	if o.interrupted() {
+		return nil, o.failInterrupted(StepEnableNotifications,
+			fmt.Errorf("enabling email notifications %w; run the same command again to finish", ErrInterrupted))
 	}
 
 	result.UsersCreated = stats.UsersCreated
@@ -1475,19 +1683,30 @@ func (o *Orchestrator) ImportMessages(progress matrix.MessageImportCallback) (*I
 	logger.Info("Loaded asset mapping: %d rooms, %d users", len(assetMapping.Channels), len(assetMapping.Users))
 
 	// Load or create message mapping for resume support
-	msgMappingFile, _ := GetLatestMessageMappingFile(o.config.Data.MappingsDir)
-	var msgMapping *MessageMapping
-
+	msgMappingFile, err := GetLatestMessageMappingFile(o.config.Data.MappingsDir)
+	if err != nil {
+		err = fmt.Errorf("cannot look for an existing message mapping: %w", err)
+		o.state.FailStep(StepImportMessages, err)
+		o.SaveState()
+		return nil, err
+	}
+	msgMapping, err := loadOrCreateMessageMapping(msgMappingFile, o.config.Matrix.Homeserver)
+	if err != nil {
+		o.state.FailStep(StepImportMessages, err)
+		o.SaveState()
+		return nil, err
+	}
 	if msgMappingFile != "" {
-		msgMapping, err = LoadMessageMapping(msgMappingFile)
-		if err != nil {
-			logger.Warn("Failed to load existing message mapping, starting fresh: %v", err)
-			msgMapping = NewMessageMapping(o.config.Matrix.Homeserver)
-		} else {
-			logger.Info("Resuming from existing mapping with %d messages", msgMapping.Count())
-		}
-	} else {
-		msgMapping = NewMessageMapping(o.config.Matrix.Homeserver)
+		logger.Info("Resuming from existing mapping with %d messages", msgMapping.Count())
+	}
+
+	// Memberships made only to replay history are journalled before they are made, so an
+	// interrupted run's are still withdrawn - by this run's cleanup or by 'import leave-rooms'.
+	historyJournal, err := LoadHistoryJoinJournal(HistoryJoinJournalPath(o.config.Data.MappingsDir))
+	if err != nil {
+		o.state.FailStep(StepImportMessages, err)
+		o.SaveState()
+		return nil, err
 	}
 
 	// Set up AS token if configured
@@ -1500,6 +1719,7 @@ func (o *Orchestrator) ImportMessages(progress matrix.MessageImportCallback) (*I
 
 	// Create importer
 	importer := o.newImporter()
+	attachHistoryJoinJournal(importer, historyJournal)
 
 	// Convert existing mapping to simple map
 	existingMapping := make(map[string]string)
@@ -1527,8 +1747,9 @@ func (o *Orchestrator) ImportMessages(progress matrix.MessageImportCallback) (*I
 					logger.Warn("Upload mode: failed to close Mattermost SSH file reader: %v", closeErr)
 				}
 			}()
-			fileConfig.RemoteReadFile = remoteExecutor.ReadFile
-			logger.Info("Upload mode: Mattermost SSH file reader enabled for remote local_data_path")
+			readWithSudo := o.config.Mattermost.Files.ReadWithSudo
+			fileConfig.RemoteReadFile = attachmentReader(remoteExecutor.ReadFileAsUser, remoteExecutor.ReadFile, readWithSudo)
+			logger.Info("Upload mode: Mattermost SSH file reader enabled for remote local_data_path (read_with_sudo: %t)", readWithSudo)
 		}
 	}
 	logger.Info("File mode: %s, S3 URL: %s", fileConfig.Mode, fileConfig.S3PublicURL)
@@ -1543,13 +1764,27 @@ func (o *Orchestrator) ImportMessages(progress matrix.MessageImportCallback) (*I
 	// this the mapping only lands when the whole run finishes: any interruption would leave
 	// every sent message unrecorded, so a restart would import them a second time.
 	mappingFile := GenerateMessageMappingFilename(o.config.Data.MappingsDir)
-	importer.SetMessageCheckpoint(messageCheckpointInterval, func(partial map[string]string) {
+
+	// A mapping written before attachments were tracked says nothing about which of them were
+	// sent. Take every attachment of an already-imported post as sent, or this run would upload
+	// all of them a second time, and save that before anything else happens.
+	if marked := adoptLegacyFileTracking(msgMapping, messages.Files); marked > 0 {
+		logger.Info("Message mapping predates attachment tracking: %d attachment(s) of already-imported posts taken as sent", marked)
+		if err := SaveMessageMapping(msgMapping, mappingFile); err != nil {
+			logger.Warn("Failed to save message mapping: %v", err)
+		}
+	}
+
+	importer.SetMessageCheckpoint(messageCheckpointInterval, func(partial, files map[string]string) {
 		addMessageEntries(msgMapping, partial, postByID, assetMapping)
+		for fileID, eventID := range files {
+			msgMapping.AddFile(fileID, eventID)
+		}
 		if err := SaveMessageMapping(msgMapping, mappingFile); err != nil {
 			logger.Warn("Checkpoint: failed to save message mapping: %v", err)
 			return
 		}
-		logger.Info("Checkpoint: message mapping saved with %d entries to %s", len(msgMapping.Messages), mappingFile)
+		logger.Info("Checkpoint: message mapping saved with %d entries and %d attachments to %s", len(msgMapping.Messages), msgMapping.FileCount(), mappingFile)
 	})
 
 	// Reactions ride along with the message import: they need the event IDs it produces.
@@ -1611,6 +1846,7 @@ func (o *Orchestrator) ImportMessages(progress matrix.MessageImportCallback) (*I
 		assetMapping.Users,    // userID -> matrixUserID
 		existingMapping,       // existing message mapping
 		filesByPost,           // post ID -> files
+		msgMapping.FileIDs(),  // attachments already sent
 		fileConfig,            // file migration settings
 		reactionImport,        // reactions, or nil to skip them
 		pinImport,             // pinned messages, or nil to skip them
@@ -1641,9 +1877,13 @@ func (o *Orchestrator) ImportMessages(progress matrix.MessageImportCallback) (*I
 	for key, eventID := range result.ReactionMapping {
 		msgMapping.AddReaction(key, eventID)
 	}
+	for fileID, eventID := range result.FileMapping {
+		msgMapping.AddFile(fileID, eventID)
+	}
 
-	if err := SaveMessageMapping(msgMapping, mappingFile); err != nil {
-		logger.Warn("Failed to save message mapping: %v", err)
+	mappingErr := SaveMessageMapping(msgMapping, mappingFile)
+	if mappingErr != nil {
+		logger.Error("Failed to save message mapping to %s: %v", mappingFile, mappingErr)
 	} else {
 		logger.Info("Message mapping saved to %s", mappingFile)
 	}
@@ -1661,10 +1901,27 @@ func (o *Orchestrator) ImportMessages(progress matrix.MessageImportCallback) (*I
 			result.Stats.ReactionsFailed, result.Stats.ReactionsCustomEmoji)
 	}
 	// Withdraw the memberships the import created for itself. Owners installed in place of a
-	// locked or missing creator are kept - see LeaveHistoryMemberships.
-	if cleanup := importer.LeaveHistoryMemberships(); cleanup != nil && (cleanup.Left > 0 || cleanup.Kept > 0 || cleanup.Failed > 0) {
+	// locked or missing creator are kept - see LeaveHistoryMemberships. Whatever cannot be
+	// withdrawn stays in the journal for 'import leave-rooms'.
+	if cleanup := withdrawHistoryJoins(importer, historyJournal); cleanup.Left > 0 || cleanup.Kept > 0 || cleanup.Failed > 0 {
 		logger.Info("Membership cleanup: left=%d, kept_owners=%d, failed=%d",
 			cleanup.Left, cleanup.Kept, cleanup.Failed)
+	}
+
+	if o.interrupted() {
+		if mappingErr != nil {
+			return nil, o.failInterrupted(StepImportMessages,
+				fmt.Errorf("message import %w, and saving the message mapping failed (%v); a re-run resumes from the last checkpoint in %s, if one was written", ErrInterrupted, mappingErr, mappingFile))
+		}
+		return nil, o.failInterrupted(StepImportMessages,
+			fmt.Errorf("message import %w: progress saved to %s (%d messages); run the same command again to resume", ErrInterrupted, mappingFile, len(msgMapping.Messages)))
+	}
+
+	if mappingErr != nil {
+		err := messageMappingSaveFailure(mappingFile, mappingErr)
+		o.state.FailStep(StepImportMessages, err)
+		o.SaveState()
+		return nil, err
 	}
 
 	logger.Success("Message import completed successfully")
@@ -1699,4 +1956,26 @@ func (o *Orchestrator) ImportMessages(progress matrix.MessageImportCallback) (*I
 
 		MappingFile: mappingFile,
 	}, nil
+}
+
+// attachmentReader picks how attachments are read over SSH: as the SSH user by default, or
+// with the `sudo cat` fallback when mattermost.files.read_with_sudo is set. A failed plain
+// read names that option, since a permission error is the usual cause.
+func attachmentReader(asUser, withSudo func(string) ([]byte, error), useSudo bool) func(string) ([]byte, error) {
+	if useSudo {
+		return withSudo
+	}
+	return func(path string) ([]byte, error) {
+		data, err := asUser(path)
+		if err != nil {
+			return nil, fmt.Errorf("%w (if the SSH user lacks permission, set mattermost.files.read_with_sudo: true to retry with sudo)", err)
+		}
+		return data, nil
+	}
+}
+
+// messageMappingSaveFailure is the error for a final message-mapping save that failed. The
+// file is replaced atomically, so it still holds the newest checkpoint written to it.
+func messageMappingSaveFailure(mappingFile string, err error) error {
+	return fmt.Errorf("could not write the message mapping to %s: %w; the newest checkpoint in that file (if one was written) is the last good record, so a re-run sends again what was sent after it", mappingFile, err)
 }

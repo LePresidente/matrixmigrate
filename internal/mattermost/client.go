@@ -410,49 +410,6 @@ func (c *Client) GetPosts() ([]Post, error) {
 	return posts, nil
 }
 
-// GetPostsByChannel retrieves posts for a specific channel
-func (c *Client) GetPostsByChannel(channelID string) ([]Post, error) {
-	schema, err := c.inspectPosts()
-	if err != nil {
-		return nil, err
-	}
-
-	query := `
-		SELECT ` + postColumns(schema.hasIsPinned) + `
-		FROM posts
-		WHERE channelid = $1
-		AND deleteat = 0
-		AND (type = '' OR type IS NULL)
-		ORDER BY createat ASC
-	`
-
-	rows, err := c.db.Query(query, channelID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to query posts for channel %s: %w", channelID, err)
-	}
-	defer rows.Close()
-
-	var posts []Post
-	for rows.Next() {
-		var p Post
-		err := rows.Scan(
-			&p.ID, &p.CreateAt, &p.UpdateAt, &p.DeleteAt,
-			&p.UserID, &p.ChannelID, &p.RootID, &p.OriginalID,
-			&p.Message, &p.Type, &p.Props, &p.FileIDs, &p.IsPinned,
-		)
-		if err != nil {
-			return nil, fmt.Errorf("failed to scan post: %w", err)
-		}
-		posts = append(posts, p)
-	}
-
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("error iterating posts: %w", err)
-	}
-
-	return posts, nil
-}
-
 // GetPostCount returns the total number of active posts
 func (c *Client) GetPostCount() (int, error) {
 	var count int
@@ -540,54 +497,6 @@ func (c *Client) GetFileInfos() ([]FileInfo, error) {
 
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("error iterating file infos: %w", err)
-	}
-
-	return files, nil
-}
-
-// GetFileInfosByPost retrieves file infos for a specific post
-func (c *Client) GetFileInfosByPost(postID string) ([]FileInfo, error) {
-	query := `
-		SELECT 
-			id, 
-			COALESCE(creatorid, '') as creatorid,
-			COALESCE(postid, '') as postid,
-			createat, updateat, deleteat,
-			COALESCE(path, '') as path,
-			COALESCE(thumbnailpath, '') as thumbnailpath,
-			COALESCE(previewpath, '') as previewpath,
-			COALESCE(name, '') as name,
-			COALESCE(extension, '') as extension,
-			COALESCE(size, 0) as size,
-			COALESCE(mimetype, 'application/octet-stream') as mimetype,
-			COALESCE(width, 0) as width,
-			COALESCE(height, 0) as height,
-			COALESCE(haspreviewimage, false) as haspreviewimage
-		FROM fileinfo
-		WHERE postid = $1 AND deleteat = 0
-		ORDER BY createat ASC
-	`
-
-	rows, err := c.db.Query(query, postID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to query file infos for post %s: %w", postID, err)
-	}
-	defer rows.Close()
-
-	var files []FileInfo
-	for rows.Next() {
-		var f FileInfo
-		err := rows.Scan(
-			&f.ID, &f.CreatorID, &f.PostID,
-			&f.CreateAt, &f.UpdateAt, &f.DeleteAt,
-			&f.Path, &f.ThumbnailPath, &f.PreviewPath,
-			&f.Name, &f.Extension, &f.Size, &f.MimeType,
-			&f.Width, &f.Height, &f.HasPreviewImage,
-		)
-		if err != nil {
-			return nil, fmt.Errorf("failed to scan file info: %w", err)
-		}
-		files = append(files, f)
 	}
 
 	return files, nil
