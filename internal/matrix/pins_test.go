@@ -607,3 +607,28 @@ func TestImportPinsFailsARoomWhosePinnedContentIsUnreadable(t *testing.T) {
 		t.Fatalf("pin writes attempted = %v, want none", f.attempts)
 	}
 }
+
+func TestImportPinsCountsOnlyTheEventsItAdded(t *testing.T) {
+	// The room carries a duplicate. Rewriting it collapses the duplicate, so the list does
+	// not grow by one even though one event was added.
+	state := pinRoomState(pinTestAdmin,
+		map[string]any{"users": map[string]any{pinTestAdmin: 100}},
+		[]string{pinTestAdmin}, map[string]any{"pinned": []string{"$old", "$old"}})
+	f, c := newFakePinServer(t, state)
+
+	result := runPinPass(c)
+
+	if want := []pinWrite{{asUser: "", pinned: []string{"$old", "$new"}}}; !reflect.DeepEqual(f.writes, want) {
+		t.Fatalf("writes = %+v, want %+v", f.writes, want)
+	}
+	if result.Stats.PinnedEventsAdded != 1 {
+		t.Fatalf("PinnedEventsAdded = %d, want 1", result.Stats.PinnedEventsAdded)
+	}
+}
+
+func TestNewPinCountIgnoresDuplicatesAndExistingPins(t *testing.T) {
+	got := newPinCount([]string{"$a", "$a", "$b"}, []string{"$b", "$c", "$c", "", "$d"})
+	if got != 2 {
+		t.Fatalf("newPinCount = %d, want 2 ($c and $d)", got)
+	}
+}

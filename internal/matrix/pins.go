@@ -603,6 +603,28 @@ func unionPinned(current, migrated []string) ([]string, bool) {
 	return merged, changed
 }
 
+// newPinCount reports how many distinct migrated event IDs the room did not already have
+// pinned. It cannot be read off the list lengths: a rewrite also drops blanks and duplicates
+// from the current list, which shrinks it by as much as the migrated IDs grow it.
+func newPinCount(current, migrated []string) int {
+	seen := make(map[string]struct{}, len(current)+len(migrated))
+	for _, id := range current {
+		seen[id] = struct{}{}
+	}
+	added := 0
+	for _, id := range migrated {
+		if id == "" {
+			continue
+		}
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		added++
+	}
+	return added
+}
+
 // PinProgressStage is passed in the channel slot of MessageImportCallback while the pin pass
 // runs, so a front end can label the progress instead of reporting rooms as messages.
 const PinProgressStage = "pins"
@@ -726,9 +748,7 @@ func (i *Importer) importPins(
 		}
 
 		result.Stats.PinnedRoomsUpdated++
-		if added := len(merged) - len(current); added > 0 {
-			result.Stats.PinnedEventsAdded += added
-		}
+		result.Stats.PinnedEventsAdded += newPinCount(current, byRoom[roomID])
 		if progress != nil {
 			progress(idx+1, total, PinProgressStage, "imported")
 		}
