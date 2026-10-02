@@ -369,25 +369,8 @@ func GenerateMessageMappingFilename(dir string) string {
 	return filepath.Join(dir, fmt.Sprintf("message-mapping-%s.json", timestamp))
 }
 
-// GetLatestMessageMappingFile finds the latest message mapping file in a directory
+// GetLatestMessageMappingFile returns the newest message-mapping file in dir by the timestamp
+// in its name, or "" when there is none.
 func GetLatestMessageMappingFile(dir string) (string, error) {
-	pattern := filepath.Join(dir, "message-mapping-*.json")
-	matches, err := filepath.Glob(pattern)
-	if err != nil {
-		return "", err
-	}
-	
-	if len(matches) == 0 {
-		return "", nil
-	}
-	
-	// Return the latest (last alphabetically due to timestamp format)
-	latest := matches[0]
-	for _, match := range matches[1:] {
-		if match > latest {
-			latest = match
-		}
-	}
-	
-	return latest, nil
+	return latestFileByName(filepath.Join(dir, "message-mapping-*.json"))
 }

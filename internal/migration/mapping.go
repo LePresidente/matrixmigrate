@@ -134,37 +134,26 @@ func MappingExists(filePath string) bool {
 	return err == nil
 }
 
-// GetLatestMappingFile finds the most recent mapping file in a directory
+// GetLatestMappingFile returns the newest asset-mapping file in dir, or "" when there is none.
+// Newest means the latest timestamp in the file name, not the latest mtime: a file copied or
+// restored later must not win over the mapping the last run actually wrote.
 func GetLatestMappingFile(dir string) (string, error) {
-	pattern := filepath.Join(dir, "asset-mapping-*.json")
+	return latestFileByName(filepath.Join(dir, "asset-mapping-*.json"))
+}
+
+// latestFileByName returns the match of pattern that sorts last, or "" when nothing matches.
+// The timestamped file names sort chronologically.
+func latestFileByName(pattern string) (string, error) {
 	matches, err := filepath.Glob(pattern)
 	if err != nil {
-		return "", fmt.Errorf("failed to glob mapping files: %w", err)
+		return "", fmt.Errorf("failed to glob %s: %w", pattern, err)
 	}
-
-	if len(matches) == 0 {
-		return "", fmt.Errorf("no mapping files found")
-	}
-
-	// Find the most recent file
-	var latest string
-	var latestTime time.Time
-
+	latest := ""
 	for _, match := range matches {
-		info, err := os.Stat(match)
-		if err != nil {
-			continue
-		}
-		if latest == "" || info.ModTime().After(latestTime) {
+		if match > latest {
 			latest = match
-			latestTime = info.ModTime()
 		}
 	}
-
-	if latest == "" {
-		return "", fmt.Errorf("no valid mapping files found")
-	}
-
 	return latest, nil
 }
 

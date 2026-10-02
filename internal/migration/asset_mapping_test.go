@@ -121,3 +121,29 @@ func TestImportAssetsSavesOneMappingWithDetectedHomeserver(t *testing.T) {
 		t.Errorf("channels = %v", m.Channels)
 	}
 }
+
+// The newest asset mapping is the one with the latest timestamp in its name, as for message
+// mappings: a file copied or restored later has a newer mtime but is not newer.
+func TestGetLatestMappingFilePicksByName(t *testing.T) {
+	dir := t.TempDir()
+	older := filepath.Join(dir, "asset-mapping-20260101-120000.json")
+	newer := filepath.Join(dir, "asset-mapping-20260102-120000.json")
+	for _, f := range []string{newer, older} {
+		if err := SaveMapping(NewMapping("example.com"), f); err != nil {
+			t.Fatal(err)
+		}
+	}
+	touched := time.Now().Add(time.Hour)
+	if err := os.Chtimes(older, touched, touched); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := GetLatestMappingFile(dir)
+	if err != nil || got != newer {
+		t.Errorf("GetLatestMappingFile = %q, %v; want %q", got, err, newer)
+	}
+
+	if got, err := GetLatestMappingFile(t.TempDir()); got != "" || err != nil {
+		t.Errorf("empty dir: got %q, %v; want no file and no error", got, err)
+	}
+}
