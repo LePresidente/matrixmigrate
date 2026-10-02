@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"unicode"
 
 	"github.com/spf13/viper"
 )
@@ -469,8 +470,28 @@ func expandPath(path string) string {
 	return path
 }
 
+// validateHostKeyFingerprint checks a pinned host key is written the way the SSH layer
+// compares it: the SHA256 fingerprint alone, as ssh-keygen -lf prints it in its second field.
+// Anything else - the whole ssh-keygen line, an MD5 fingerprint - could never match, and the
+// connection would then be refused as if the host key had changed.
+func validateHostKeyFingerprint(key, fp string) error {
+	if fp == "" {
+		return nil
+	}
+	if !strings.HasPrefix(fp, "SHA256:") || strings.ContainsFunc(fp, unicode.IsSpace) {
+		return fmt.Errorf("%s must be the SHA256 fingerprint alone, in the form \"SHA256:<base64>\" with no spaces - the second field printed by `ssh-keygen -lf <host key file>` - got %q", key, fp)
+	}
+	return nil
+}
+
 // Validate validates the configuration
 func (c *Config) Validate() error {
+	if err := validateHostKeyFingerprint("mattermost.ssh.host_key_fingerprint", c.Mattermost.SSH.HostKeyFingerprint); err != nil {
+		return err
+	}
+	if err := validateHostKeyFingerprint("matrix.ssh.host_key_fingerprint", c.Matrix.SSH.HostKeyFingerprint); err != nil {
+		return err
+	}
 	// Validate Mattermost config if SSH host is provided
 	if c.Mattermost.SSH.Host != "" {
 		if c.Mattermost.SSH.User == "" {

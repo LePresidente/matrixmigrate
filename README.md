@@ -167,7 +167,7 @@ credentials. Options under `mattermost.ssh` and `matrix.ssh`:
 | Option | Default | Description |
 |--------|---------|-------------|
 | `known_hosts_path` | `~/.ssh/known_hosts` | OpenSSH `known_hosts` file the host key is checked against. `~` and environment variables are expanded. |
-| `host_key_fingerprint` | — | Pin the server's key instead of using `known_hosts`: the `SHA256:...` value printed by `ssh-keygen -lf`. Only a key with exactly this fingerprint is accepted. Ed25519 is requested first, so pin the server's Ed25519 key (`/etc/ssh/ssh_host_ed25519_key.pub`); for a server without one, pin the key of the type named in the error. |
+| `host_key_fingerprint` | — | Pin the server's key instead of using `known_hosts`: the `SHA256:...` value printed by `ssh-keygen -lf` (that field alone, not the whole line). Only a key with exactly this fingerprint is accepted. Ed25519 is requested first, so pin the server's Ed25519 key (`/etc/ssh/ssh_host_ed25519_key.pub`); for a server without one, pin the key of the type named in the error. |
 | `insecure_ignore_host_key` | `false` | Accept any host key. Anyone on the network path can then impersonate the server and capture the SSH password, the database credentials and the Matrix tokens. A warning naming the host is logged on every connection. Use only on a trusted, isolated network. |
 
 They are checked in this order: `insecure_ignore_host_key`, then `host_key_fingerprint`,
