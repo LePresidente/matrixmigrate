@@ -142,14 +142,19 @@ type pinRoomView struct {
 	joined  map[string]struct{}
 }
 
-// pinRoomViewFromState derives a pinRoomView from an admin API state dump.
-func pinRoomViewFromState(state []adminStateEvent) pinRoomView {
+// pinRoomViewFromState derives a pinRoomView from an admin API state dump. It fails when the
+// room's pinned content does not parse.
+func pinRoomViewFromState(state []adminStateEvent) (pinRoomView, error) {
+	pinned, err := pinnedFromState(state)
+	if err != nil {
+		return pinRoomView{}, err
+	}
 	return pinRoomView{
-		pinned:  pinnedFromState(state),
+		pinned:  pinned,
 		levels:  powerLevelsFromState(state),
 		creator: creatorFromState(state),
 		joined:  joinedFromState(state),
-	}
+	}, nil
 }
 
 // readRoomPins returns the room's current pins and, when the admin API could read the room,
@@ -162,7 +167,10 @@ func (c *Client) readRoomPins(roomID string) ([]string, *pinRoomView, error) {
 		current, getErr := c.GetPinnedEvents(roomID)
 		return current, nil, getErr
 	}
-	view := pinRoomViewFromState(state)
+	view, err := pinRoomViewFromState(state)
+	if err != nil {
+		return nil, nil, err
+	}
 	return view.pinned, &view, nil
 }
 
@@ -316,7 +324,11 @@ func (c *Client) pinnedEventsViaAdminAPI(roomID string, cause error) ([]string, 
 	if err != nil {
 		return nil, fmt.Errorf("admin cannot read room %s (%v) and the admin API refused too: %w", roomID, cause, err)
 	}
-	return pinnedFromState(state), nil
+	pinned, err := pinnedFromState(state)
+	if err != nil {
+		return nil, fmt.Errorf("room %s: %w", roomID, err)
+	}
+	return pinned, nil
 }
 
 // pinAuthority reports what decides who may pin in a room: its power levels, its creator —
@@ -373,18 +385,20 @@ func joinedFromState(state []adminStateEvent) map[string]struct{} {
 
 // pinnedFromState picks the pinned event IDs out of an admin API state dump. A room with no
 // m.room.pinned_events has never been pinned to, which is an empty list rather than an error.
-func pinnedFromState(state []adminStateEvent) []string {
+// Content that does not parse is an error: treating it as "no pins" would let the migrated
+// list overwrite whatever it holds.
+func pinnedFromState(state []adminStateEvent) ([]string, error) {
 	for _, event := range state {
 		if event.Type != EventTypePinnedEvents || event.StateKey != "" {
 			continue
 		}
 		var content PinnedEventsContent
-		if json.Unmarshal(event.Content, &content) != nil {
-			return nil
+		if err := json.Unmarshal(event.Content, &content); err != nil {
+			return nil, fmt.Errorf("unparseable %s content: %w", EventTypePinnedEvents, err)
 		}
-		return content.Pinned
+		return content.Pinned, nil
 	}
-	return nil
+	return nil, nil
 }
 
 // powerLevelsFromState picks the power levels out of an admin API state dump. A room without

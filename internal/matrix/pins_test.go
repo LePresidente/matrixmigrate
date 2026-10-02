@@ -188,16 +188,27 @@ func TestPinnedFromStateReadsTheAdminAPIDump(t *testing.T) {
 		{Type: "m.room.create", Content: []byte(`{"room_version":"12"}`)},
 		{Type: EventTypePinnedEvents, Content: []byte(`{"pinned":["$a","$b"]}`)},
 	}
-	if want := []string{"$a", "$b"}; !reflect.DeepEqual(pinnedFromState(state), want) {
-		t.Fatalf("pinnedFromState = %v, want %v", pinnedFromState(state), want)
+	got, err := pinnedFromState(state)
+	if err != nil {
+		t.Fatalf("pinnedFromState returned %v", err)
+	}
+	if want := []string{"$a", "$b"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("pinnedFromState = %v, want %v", got, want)
+	}
+}
+
+func TestPinnedFromStateRejectsUnparseableContent(t *testing.T) {
+	state := []adminStateEvent{{Type: EventTypePinnedEvents, Content: []byte(`{"pinned":"not-a-list"}`)}}
+	if got, err := pinnedFromState(state); err == nil {
+		t.Fatalf("pinnedFromState = %v with no error, want an error for unparseable content", got)
 	}
 }
 
 func TestPinnedFromStateReturnsNothingForAnUnpinnedRoom(t *testing.T) {
 	// No m.room.pinned_events means nobody has ever pinned here - an empty list, not a failure.
 	state := []adminStateEvent{{Type: "m.room.create", Content: []byte(`{"room_version":"12"}`)}}
-	if got := pinnedFromState(state); len(got) != 0 {
-		t.Fatalf("pinnedFromState = %v, want empty", got)
+	if got, err := pinnedFromState(state); err != nil || len(got) != 0 {
+		t.Fatalf("pinnedFromState = %v, %v; want empty and no error", got, err)
 	}
 }
 
@@ -575,5 +586,24 @@ func TestImportPinsWritesAsAnUnlistedMemberWhenUsersDefaultIsEnough(t *testing.T
 	}
 	if want := []string{"@alice:example.com"}; !reflect.DeepEqual(f.attempts, want) {
 		t.Fatalf("attempts = %v, want %v", f.attempts, want)
+	}
+}
+
+func TestImportPinsFailsARoomWhosePinnedContentIsUnreadable(t *testing.T) {
+	// Content that cannot be parsed is not "no pins": writing the migrated list over it could
+	// throw away pins nobody can see any more.
+	state := pinRoomState(pinTestAdmin,
+		map[string]any{"users": map[string]any{pinTestAdmin: 100}},
+		[]string{pinTestAdmin}, map[string]any{"pinned": "not-a-list"})
+	f, c := newFakePinServer(t, state)
+	c.SetASToken("as-token")
+
+	result := runPinPass(c)
+
+	if result.Stats.PinsFailed != 1 || result.Stats.PinnedRoomsUpdated != 0 {
+		t.Fatalf("stats = %+v, want the room counted as failed", result.Stats)
+	}
+	if len(f.attempts) != 0 {
+		t.Fatalf("pin writes attempted = %v, want none", f.attempts)
 	}
 }
