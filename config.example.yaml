@@ -285,6 +285,12 @@ data:
   assets_dir: "./data/assets"
   mappings_dir: "./data/mappings"
   state_file: "./data/state.json"
+  # How many asset-mapping and message-mapping files to keep in mappings_dir, per kind,
+  # newest first. Each run writes a new one, and a message mapping grows with the instance
+  # (hundreds of MB on a large one), so a scheduled sync fills the disk unless this is set.
+  # Older files are deleted only after the step that writes them has completed; the newest
+  # file is never deleted. 0 (default) keeps everything.
+  # keep_mappings: 14
 
 
 # ========================================

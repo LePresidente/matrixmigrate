@@ -78,7 +78,9 @@ Artifacts under `data/` (paths from `DataConfig`):
 | `assets/message-errors-<ts>.log` | `import_messages`, on failures |
 | `state.json` | every step |
 
-Timestamped files are resolved by newest-glob, not by exact name.
+Timestamped files are resolved by newest-glob, not by exact name. With `data.keep_mappings`
+set, each import step deletes all but the newest N mapping files of its kind once it has
+completed (`internal/migration/prune.go`); the default keeps everything.
 
 ### Three separate Matrix identities
 

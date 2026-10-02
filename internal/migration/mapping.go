@@ -138,7 +138,7 @@ func MappingExists(filePath string) bool {
 // Newest means the latest timestamp in the file name, not the latest mtime: a file copied or
 // restored later must not win over the mapping the last run actually wrote.
 func GetLatestMappingFile(dir string) (string, error) {
-	return latestFileByName(filepath.Join(dir, "asset-mapping-*.json"))
+	return latestFileByName(filepath.Join(dir, assetMappingKind+"-*.json"))
 }
 
 // latestFileByName returns the match of pattern that sorts last, or "" when nothing matches.
@@ -160,7 +160,7 @@ func latestFileByName(pattern string) (string, error) {
 // GenerateMappingFilename generates a filename for a new mapping file
 func GenerateMappingFilename(dir string) string {
 	timestamp := time.Now().Format("20060102-150405")
-	return filepath.Join(dir, fmt.Sprintf("asset-mapping-%s.json", timestamp))
+	return filepath.Join(dir, fmt.Sprintf("%s-%s.json", assetMappingKind, timestamp))
 }
 
 

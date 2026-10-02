@@ -366,11 +366,11 @@ func LoadMessageMapping(filepath string) (*MessageMapping, error) {
 // GenerateMessageMappingFilename generates a filename for message mapping
 func GenerateMessageMappingFilename(dir string) string {
 	timestamp := time.Now().Format("20060102-150405")
-	return filepath.Join(dir, fmt.Sprintf("message-mapping-%s.json", timestamp))
+	return filepath.Join(dir, fmt.Sprintf("%s-%s.json", messageMappingKind, timestamp))
 }
 
 // GetLatestMessageMappingFile returns the newest message-mapping file in dir by the timestamp
 // in its name, or "" when there is none.
 func GetLatestMessageMappingFile(dir string) (string, error) {
-	return latestFileByName(filepath.Join(dir, "message-mapping-*.json"))
+	return latestFileByName(filepath.Join(dir, messageMappingKind+"-*.json"))
 }

@@ -603,6 +603,30 @@ switching a migration from `link` to `upload` sends those posts' attachments aga
 
 Building from source needs Go 1.26 or newer.
 
+### Pruning old mapping files
+
+Every `import assets` and `import messages` run writes a new mapping file to
+`data.mappings_dir`. A message mapping holds one entry per imported post, so on a large instance
+it is hundreds of megabytes, and a sync that runs on a schedule adds one per run. Nothing is
+deleted by default.
+
+Set `data.keep_mappings` to keep only the newest files:
+
+```yaml
+data:
+  keep_mappings: 14   # per kind: 14 asset mappings and 14 message mappings
+```
+
+- Files are counted per kind and ordered by the timestamp in their name.
+- Pruning happens only after the step that writes that kind has completed. A failed or
+  interrupted step deletes nothing, so the older files stay available to fall back on.
+- The file the step just wrote is always kept, and only files named
+  `asset-mapping-<timestamp>.json` or `message-mapping-<timestamp>.json` are ever considered:
+  `history-joins.json`, renamed copies and anything else in the directory are left alone.
+- A file that cannot be deleted is logged as a warning and tried again on the next run.
+
+Exports and logs in `data.assets_dir` are not pruned.
+
 ## Architecture
 
 ```

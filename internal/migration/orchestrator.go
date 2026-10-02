@@ -957,7 +957,11 @@ func (o *Orchestrator) ImportAssets(progress ProgressCallback) (*OperationResult
 	// Complete step
 	o.state.CompleteStep(StepImportAssets, mappingFile)
 	result.OutputFile = mappingFile
-	return result, o.SaveState()
+	if err := o.SaveState(); err != nil {
+		return result, err
+	}
+	o.pruneMappings(assetMappingKind, mappingFile)
+	return result, nil
 }
 
 // ExportMemberships exports memberships from Mattermost
@@ -1931,6 +1935,7 @@ func (o *Orchestrator) ImportMessages(progress matrix.MessageImportCallback) (*I
 	if err := o.SaveState(); err != nil {
 		return nil, err
 	}
+	o.pruneMappings(messageMappingKind, mappingFile)
 
 	return &ImportMessagesResult{
 		MessagesImported: result.Stats.MessagesImported,
