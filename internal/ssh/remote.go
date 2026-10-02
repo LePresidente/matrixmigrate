@@ -111,27 +111,6 @@ func (r *RemoteExecutor) FileExists(path string) (bool, error) {
 	return bytes.Contains(output, []byte("exists")), nil
 }
 
-// ExecuteCommand executes a command on the remote server
-func (r *RemoteExecutor) ExecuteCommand(cmd string) (string, error) {
-	session, err := r.client.NewSession()
-	if err != nil {
-		return "", fmt.Errorf("failed to create session: %w", err)
-	}
-	defer session.Close()
-
-	output, err := session.Output(cmd)
-	if err != nil {
-		return "", fmt.Errorf("command failed: %w", err)
-	}
-
-	return string(output), nil
-}
-
-// GetClient returns the underlying SSH client (for creating tunnels)
-func (r *RemoteExecutor) GetClient() *ssh.Client {
-	return r.client
-}
-
 // shellQuote returns a POSIX shell-safe single-quoted string.
 func shellQuote(s string) string {
 	if s == "" {
