@@ -1097,7 +1097,8 @@ func (o *Orchestrator) ImportMemberships(progress ProgressCallback) (*OperationR
 // This is a cleanup sweep, not part of the import chain: the import steps already leave
 // rooms inline after force-joining members, but they only log a warning when that fails,
 // which leaves the admin account inside private rooms and other people's DMs. Running this
-// at the end of a migration clears those leftovers, and it is safe to repeat.
+// at the end of a migration clears those leftovers, and it is safe to repeat. It also
+// withdraws the history joins a message import recorded in its journal but never undid.
 func (o *Orchestrator) LeaveRooms(progress ProgressCallback) (*OperationResult, error) {
 	result := &OperationResult{}
 
@@ -1132,6 +1133,14 @@ func (o *Orchestrator) LeaveRooms(progress ProgressCallback) (*OperationResult, 
 		o.state.FailStep(StepLeaveRooms, err)
 		o.SaveState()
 		return nil, fmt.Errorf("failed to load mapping: %w", err)
+	}
+
+	historyJournal, err := LoadHistoryJoinJournal(HistoryJoinJournalPath(o.config.Data.MappingsDir))
+	if err != nil {
+		logger.Error("%v", err)
+		o.state.FailStep(StepLeaveRooms, err)
+		o.SaveState()
+		return nil, err
 	}
 
 	// Rooms first, then spaces: a space is only left once its rooms are done, so a run
@@ -1178,6 +1187,11 @@ func (o *Orchestrator) LeaveRooms(progress ProgressCallback) (*OperationResult, 
 	result.BotRoomsKept = botRemoval.Kept
 	result.BotRoomsFailed = botRemoval.Failed
 
+	// Past authors joined only to replay history by a message import that did not get as far
+	// as its own cleanup - an interrupted or failed run - recorded in the history-join journal.
+	attachHistoryJoinJournal(importer, historyJournal)
+	historyCleanup := withdrawHistoryJoins(importer, historyJournal)
+
 	stats, err := importer.LeaveMigratedRooms(roomIDs, importProgress)
 	if err != nil {
 		logger.Error("Failed to leave rooms: %v", err)
@@ -1202,6 +1216,8 @@ func (o *Orchestrator) LeaveRooms(progress ProgressCallback) (*OperationResult, 
 		result.DeactivatedAccounts, result.DeactivatedRoomsLeft, result.DeactivatedRoomsKept, result.DeactivatedRoomsFailed)
 	logger.Info("Migration bot: rooms_left=%d, kept_as_owner=%d, failed=%d",
 		result.BotRoomsLeft, result.BotRoomsKept, result.BotRoomsFailed)
+	logger.Info("History joins: left=%d, kept_owners=%d, failed=%d, still_recorded=%d",
+		historyCleanup.Left, historyCleanup.Kept, historyCleanup.Failed, len(historyCleanup.Remaining))
 	if result.RoomsLeaveFailed > 0 {
 		logger.Warn("The migration admin is still in %d room(s); re-run 'import leave-rooms' or remove it manually", result.RoomsLeaveFailed)
 	} else {
@@ -1561,6 +1577,15 @@ func (o *Orchestrator) ImportMessages(progress matrix.MessageImportCallback) (*I
 		logger.Info("Resuming from existing mapping with %d messages", msgMapping.Count())
 	}
 
+	// Memberships made only to replay history are journalled before they are made, so an
+	// interrupted run's are still withdrawn - by this run's cleanup or by 'import leave-rooms'.
+	historyJournal, err := LoadHistoryJoinJournal(HistoryJoinJournalPath(o.config.Data.MappingsDir))
+	if err != nil {
+		o.state.FailStep(StepImportMessages, err)
+		o.SaveState()
+		return nil, err
+	}
+
 	// Set up AS token if configured
 	if o.config.UseAppService() {
 		o.mxClient.SetASToken(o.config.GetASToken())
@@ -1571,6 +1596,7 @@ func (o *Orchestrator) ImportMessages(progress matrix.MessageImportCallback) (*I
 
 	// Create importer
 	importer := o.newImporter()
+	attachHistoryJoinJournal(importer, historyJournal)
 
 	// Convert existing mapping to simple map
 	existingMapping := make(map[string]string)
@@ -1733,8 +1759,9 @@ func (o *Orchestrator) ImportMessages(progress matrix.MessageImportCallback) (*I
 			result.Stats.ReactionsFailed, result.Stats.ReactionsCustomEmoji)
 	}
 	// Withdraw the memberships the import created for itself. Owners installed in place of a
-	// locked or missing creator are kept - see LeaveHistoryMemberships.
-	if cleanup := importer.LeaveHistoryMemberships(); cleanup != nil && (cleanup.Left > 0 || cleanup.Kept > 0 || cleanup.Failed > 0) {
+	// locked or missing creator are kept - see LeaveHistoryMemberships. Whatever cannot be
+	// withdrawn stays in the journal for 'import leave-rooms'.
+	if cleanup := withdrawHistoryJoins(importer, historyJournal); cleanup.Left > 0 || cleanup.Kept > 0 || cleanup.Failed > 0 {
 		logger.Info("Membership cleanup: left=%d, kept_owners=%d, failed=%d",
 			cleanup.Left, cleanup.Kept, cleanup.Failed)
 	}
