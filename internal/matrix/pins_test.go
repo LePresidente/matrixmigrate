@@ -423,3 +423,99 @@ func TestPinAsCandidatesStopsOnATransportFailure(t *testing.T) {
 		t.Fatalf("attempts = %v, want %v (bob_dev must not be tried)", f.attempts, want)
 	}
 }
+
+// pinRoomState builds an admin API state dump for pinTestRoom: created by creator, with the
+// given power levels content, joined members and pinned content (nil for no pin event).
+func pinRoomState(creator string, levels map[string]any, joined []string, pinned any) []map[string]any {
+	state := []map[string]any{
+		{"type": EventTypeRoomCreate, "state_key": "", "sender": creator, "content": map[string]any{"room_version": "11"}},
+		{"type": EventTypePowerLevels, "state_key": "", "sender": creator, "content": levels},
+	}
+	for _, user := range joined {
+		state = append(state, map[string]any{
+			"type": EventTypeRoomMember, "state_key": user, "sender": user,
+			"content": map[string]any{"membership": "join"},
+		})
+	}
+	if pinned != nil {
+		state = append(state, map[string]any{"type": EventTypePinnedEvents, "state_key": "", "sender": creator, "content": pinned})
+	}
+	return state
+}
+
+// runPinPass runs the pin pass for one pinned post, mapped to event $new in pinTestRoom.
+func runPinPass(c *Client) *ImportMessagesResult {
+	result := &ImportMessagesResult{
+		Stats:   &MessageImportStats{},
+		Mapping: map[string]string{"p1": "$new"},
+	}
+	posts := []mattermost.Post{{ID: "p1", ChannelID: "c1", CreateAt: 100, IsPinned: true}}
+	NewImporter(c).importPins(result, posts, map[string]string{"p1": pinTestRoom}, nil)
+	return result
+}
+
+func TestImportPinsWritesAsAMemberWithoutJoiningTheAdmin(t *testing.T) {
+	// After leave-rooms the admin is in none of the migrated rooms. Reading the room and
+	// writing as a member through the Application Service needs no join at all.
+	state := pinRoomState("@alice:example.com",
+		map[string]any{"users": map[string]any{"@alice:example.com": 100}},
+		[]string{"@alice:example.com"}, map[string]any{"pinned": []string{"$old"}})
+	f, c := newFakePinServer(t, state)
+	c.SetASToken("as-token")
+
+	result := runPinPass(c)
+
+	if result.Stats.PinnedRoomsUpdated != 1 || result.Stats.PinsFailed != 0 {
+		t.Fatalf("stats = %+v, errors = %v; want one room updated", result.Stats, result.Errors)
+	}
+	if f.joins != 0 {
+		t.Fatalf("the admin was joined %d time(s), want none", f.joins)
+	}
+	if f.stateReads != 1 {
+		t.Fatalf("room state was read %d time(s), want once", f.stateReads)
+	}
+	want := []pinWrite{{asUser: "@alice:example.com", pinned: []string{"$old", "$new"}}}
+	if !reflect.DeepEqual(f.writes, want) {
+		t.Fatalf("writes = %+v, want %+v", f.writes, want)
+	}
+}
+
+func TestImportPinsWritesAsTheAdminWhenItIsJoinedAndPowerful(t *testing.T) {
+	state := pinRoomState(pinTestAdmin,
+		map[string]any{"users": map[string]any{pinTestAdmin: 100, "@alice:example.com": 100}},
+		[]string{pinTestAdmin, "@alice:example.com"}, nil)
+	f, c := newFakePinServer(t, state)
+	c.SetASToken("as-token")
+
+	result := runPinPass(c)
+
+	if result.Stats.PinnedRoomsUpdated != 1 {
+		t.Fatalf("stats = %+v, errors = %v; want one room updated", result.Stats, result.Errors)
+	}
+	if f.joins != 0 || f.stateReads != 1 {
+		t.Fatalf("joins = %d, state reads = %d; want 0 and 1", f.joins, f.stateReads)
+	}
+	if want := []pinWrite{{asUser: "", pinned: []string{"$new"}}}; !reflect.DeepEqual(f.writes, want) {
+		t.Fatalf("writes = %+v, want one write as the admin", f.writes)
+	}
+}
+
+func TestImportPinsFallsBackToJoiningWithoutAnASToken(t *testing.T) {
+	// No AS token is the deployment that worked before: join the admin, write as the admin.
+	state := pinRoomState(pinTestAdmin,
+		map[string]any{"users": map[string]any{pinTestAdmin: 100}},
+		[]string{"@alice:example.com"}, nil)
+	f, c := newFakePinServer(t, state)
+
+	result := runPinPass(c)
+
+	if result.Stats.PinnedRoomsUpdated != 1 {
+		t.Fatalf("stats = %+v, errors = %v; want one room updated", result.Stats, result.Errors)
+	}
+	if f.joins == 0 {
+		t.Fatal("the admin was never joined, but without an AS token joining is the only way in")
+	}
+	if want := []pinWrite{{asUser: "", pinned: []string{"$new"}}}; !reflect.DeepEqual(f.writes, want) {
+		t.Fatalf("writes = %+v, want one write as the admin", f.writes)
+	}
+}

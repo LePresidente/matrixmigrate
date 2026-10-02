@@ -101,10 +101,7 @@ func (c *Client) PinEvents(roomID string, eventIDs []string) error {
 	}
 
 	required := requiredPinPowerLevel(pl)
-	candidates := pinCapableUsers(pl, c.homeserver, required, creator)
-	if joined != nil {
-		candidates = onlyJoined(candidates, joined)
-	}
+	candidates := pinCandidates(pl, c.homeserver, required, creator, joined)
 	if len(candidates) == 0 {
 		return fmt.Errorf("admin lacks power to pin in %s and no joined local member has power level %d: %w", roomID, required, err)
 	}
@@ -135,6 +132,114 @@ func (c *Client) pinAsCandidates(roomID string, eventIDs, candidates []string) e
 		logger.Debug("pinAsCandidates: %s could not pin in room=%s (%v); trying the next candidate", sender, roomID, asErr)
 	}
 	return lastErr
+}
+
+// pinRoomView is what one read of a room's state through the Synapse admin API says about
+// pinning in it. The pin pass reads each room once and decides everything from this.
+type pinRoomView struct {
+	pinned  []string
+	levels  *PowerLevelsContent // nil when the room has no power levels
+	creator string
+	joined  map[string]struct{}
+}
+
+// pinRoomViewFromState derives a pinRoomView from an admin API state dump.
+func pinRoomViewFromState(state []adminStateEvent) pinRoomView {
+	return pinRoomView{
+		pinned:  pinnedFromState(state),
+		levels:  powerLevelsFromState(state),
+		creator: creatorFromState(state),
+		joined:  joinedFromState(state),
+	}
+}
+
+// readRoomPins returns the room's current pins and, when the admin API could read the room,
+// the view a later writeRoomPins decides from. A nil view means the admin API refused, and
+// the pins came from GetPinnedEvents instead.
+func (c *Client) readRoomPins(roomID string) ([]string, *pinRoomView, error) {
+	state, err := c.adminRoomState(roomID)
+	if err != nil {
+		logger.Debug("readRoomPins: admin API refused room=%s (%v); reading pins as the admin", roomID, err)
+		current, getErr := c.GetPinnedEvents(roomID)
+		return current, nil, getErr
+	}
+	view := pinRoomViewFromState(state)
+	return view.pinned, &view, nil
+}
+
+// writeRoomPins writes the room's pin list using what readRoomPins learned about the room.
+//
+// The admin writes when the room's state shows it joined with the power to pin. Otherwise the
+// Application Service writes as a joined local member who has that power. Only when neither
+// can work — no AS token, or every candidate refused — is the admin joined to the room and
+// made to write, which is what a deployment without an AS token has always done.
+//
+// adminID is the admin's own user ID, "" when it is not known; the admin is then never
+// assumed to be in the room.
+func (c *Client) writeRoomPins(roomID string, eventIDs []string, view *pinRoomView, adminID string) error {
+	if view == nil {
+		return c.PinEvents(roomID, eventIDs)
+	}
+
+	required := requiredPinPowerLevel(view.levels)
+	if adminCanPin(*view, adminID, required) {
+		endpoint := fmt.Sprintf("/_matrix/client/v3/rooms/%s/state/%s",
+			url.PathEscape(roomID), EventTypePinnedEvents)
+		err := c.putPinnedEvents(endpoint, eventIDs, "")
+		if err == nil || !isPinRefusal(err) {
+			return err
+		}
+		logger.Debug("writeRoomPins: admin refused in room=%s (%v); trying the Application Service", roomID, err)
+	}
+
+	var asErr error
+	if c.asToken != "" {
+		candidates := pinCandidates(view.levels, c.homeserver, required, view.creator, view.joined)
+		if len(candidates) > 0 {
+			asErr = c.pinAsCandidates(roomID, eventIDs, candidates)
+			if asErr == nil || !isPinRefusal(asErr) {
+				return asErr
+			}
+		}
+		logger.Debug("writeRoomPins: no joined member could pin in room=%s (candidates %v, last error %v); joining the admin",
+			roomID, candidates, asErr)
+	}
+
+	err := c.setPinnedEvents(roomID, eventIDs)
+	if err != nil && asErr != nil {
+		return fmt.Errorf("%w (application service attempt: %v)", err, asErr)
+	}
+	return err
+}
+
+// adminCanPin reports whether the room's state shows the admin joined with enough power to
+// pin. A creator absent from content.users is the room version 12 shape, where creators hold
+// implicit power.
+func adminCanPin(view pinRoomView, adminID string, required int) bool {
+	if adminID == "" || view.levels == nil {
+		return false
+	}
+	if _, in := view.joined[adminID]; !in {
+		return false
+	}
+	level, listed := view.levels.Users[adminID]
+	if !listed {
+		if adminID == view.creator {
+			return true
+		}
+		level = view.levels.UsersDefault
+	}
+	return level >= required
+}
+
+// pinCandidates returns the local members the Application Service may pin as, in the order to
+// try them. A nil joined set means membership is unknown: every candidate is then kept.
+func pinCandidates(pl *PowerLevelsContent, homeserver string, required int, creator string, joined map[string]struct{}) []string {
+	candidates := pinCapableUsers(pl, homeserver, required, creator)
+	if joined == nil {
+		return candidates
+	}
+	return onlyJoined(candidates, joined)
 }
 
 // onlyJoined keeps the candidates who are currently in the room, in order.
@@ -515,7 +620,9 @@ func pinnedByRoom(posts []mattermost.Post, eventByPost, roomByPost map[string]st
 // point at an event that already exists.
 //
 // A room is the unit of work here, not a post: Matrix holds the whole pin list in one state
-// event, so a room with forty pinned posts costs one read and one write.
+// event, so a room with forty pinned posts costs one read and one write. The read goes through
+// the Synapse admin API, which needs no membership, so a room the admin has left is not joined
+// just to be looked at.
 func (i *Importer) importPins(
 	result *ImportMessagesResult,
 	posts []mattermost.Post,
@@ -539,8 +646,17 @@ func (i *Importer) importPins(
 	total := len(rooms)
 	logger.Info("Starting pinned message import: %d room(s) with pins, %d pinned post(s) unusable", total, len(skips))
 
+	var adminID string
+	if total > 0 {
+		if me, err := i.client.WhoAmI(); err == nil {
+			adminID = me.UserID
+		} else {
+			logger.Debug("importPins: cannot tell who the admin is (%v); it will not write without joining first", err)
+		}
+	}
+
 	for idx, roomID := range rooms {
-		current, err := i.client.GetPinnedEvents(roomID)
+		current, view, err := i.client.readRoomPins(roomID)
 		if err != nil {
 			result.Stats.PinsFailed++
 			result.Errors = append(result.Errors,
@@ -560,7 +676,7 @@ func (i *Importer) importPins(
 			continue
 		}
 
-		if err := i.client.PinEvents(roomID, merged); err != nil {
+		if err := i.client.writeRoomPins(roomID, merged, view, adminID); err != nil {
 			result.Stats.PinsFailed++
 			result.Errors = append(result.Errors,
 				fmt.Sprintf("Failed to pin messages in room %s: %v", roomID, err))
