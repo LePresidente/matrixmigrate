@@ -335,7 +335,10 @@ func (m Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			m.previousView = m.view
 			m.view = item.View
-			return m, m.handleViewChange(item.View)
+			// Call first, then return m: handleViewChange records the started step on m, and
+			// the order operands of one return statement are evaluated in is unspecified.
+			cmd := m.handleViewChange(item.View)
+			return m, cmd
 		}
 		if m.view == ViewError || m.view == ViewSuccess || m.view == ViewInterrupted {
 			m.view = ViewMenu

@@ -188,3 +188,30 @@ func TestSuccessViewShowsRoomsNotLinked(t *testing.T) {
 		t.Errorf("success view does not show %q", want)
 	}
 }
+
+// Pressing enter on a step's menu item must hand back a Model that knows the step is
+// running; every guard above depends on it. The command is returned, not run.
+func TestEnterOnStepMenuItemMarksStepRunning(t *testing.T) {
+	m := newTestModel(t)
+	m.menuIndex = -1
+	for i, item := range m.menuItems {
+		if item.View == ViewExportAssets {
+			m.menuIndex = i
+		}
+	}
+	if m.menuIndex < 0 || m.menuItems[m.menuIndex].Disabled {
+		t.Fatal("export assets menu item missing or disabled on a fresh state")
+	}
+
+	next, cmd := press(t, m, keyEnter)
+	if cmd == nil {
+		t.Fatal("enter on export assets returned no command")
+	}
+	if next.step == nil {
+		t.Fatal("returned Model does not record the running step")
+	}
+	if next.view != ViewExportAssets {
+		t.Errorf("view = %v, want ViewExportAssets", next.view)
+	}
+	next.step.cancel()
+}
