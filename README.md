@@ -30,6 +30,8 @@ A CLI tool for migrating from Mattermost to Matrix Synapse with multi-step, resu
 
 ## Installation
 
+Requires Go 1.26 or newer.
+
 ```bash
 go install github.com/aligundogdu/matrixmigrate/cmd/matrixmigrate@latest
 ```
@@ -551,6 +553,55 @@ The step needs `import_assets` to have completed but has no other dependency, an
 to repeat: an account already out of a room counts as already removed rather than as a
 failure. Run it once at the end of a migration and check the summary lines for a non-zero
 failure count.
+
+### Interrupting and resuming
+
+Every import step can be stopped and run again; a second run picks up where the first one
+stopped instead of creating or sending anything twice.
+
+**Signals.** The first Ctrl+C, `SIGTERM` or `SIGHUP` (a dropped SSH session) asks the running
+step to stop: it finishes the item in flight, saves its progress and exits with a non-zero
+status and an "interrupted" error. A second signal aborts the process at once, losing whatever
+was done since the last save. Exports are not interruptible: after the first signal an export
+runs to the end and writes its file, then still exits non-zero, so a script running the steps
+in sequence (`set -e`) stops instead of starting the next one. In the TUI, Ctrl+C while a step
+runs asks it to stop the same way, and the screen stays until the step has returned.
+
+**What is saved.**
+
+- `import assets` checkpoints the asset mapping (`mappings/asset-mapping-<ts>.json`) after the
+  user pass and after every space and room it creates. A re-run merges the newest mapping on
+  disk with the one recorded in `state.json` and skips everything already in it. A mapping
+  file that exists but cannot be read stops the step instead of starting from nothing. A user
+  whose existence could not be checked is left untouched and unmapped; the step then saves
+  everything else and fails, asking for `import assets` to be run again before `import
+  messages`, which would otherwise post that user's messages as the Application Service bot.
+- `import messages` checkpoints the message mapping (`mappings/message-mapping-<ts>.json`)
+  every 500 messages and when it stops: sent messages, reactions and attachments. If that
+  final save fails, the step fails and the newest checkpoint is the last good record.
+- `import memberships`, `import leave-rooms` and `import enable-notifications` are safe to
+  repeat as they are.
+
+**Resuming.** Run the same command again. `matrixmigrate status` shows the interrupted step as
+failed with the reason.
+
+**Leftover memberships.** To replay history, `import messages` joins past authors (and the
+Application Service bot) to rooms they had left, and records each join in
+`mappings/history-joins.json` *before* making it. The step withdraws those memberships when it
+finishes; an interrupted run, or a withdrawal that failed, leaves them in that file, and
+`import leave-rooms` clears them. A join whose outcome is unknown (a timeout or a 5xx answer)
+stays in the file too, since the homeserver may have applied it. After an interrupt, these
+cleanup calls are not retried when the homeserver answers 429; whatever is left stays in the
+journal for `import leave-rooms`.
+
+**Attachments.** In `upload` mode each attachment is recorded in the message mapping once it
+is sent, and one that failed is sent by the next run. This only covers failures recorded by
+this version: a mapping written by an earlier version that did not track attachments is
+upgraded by taking every attachment of an already-imported post as sent, so attachments that
+failed under that version are not retried. Attachments in `link` mode are not tracked, so
+switching a migration from `link` to `upload` sends those posts' attachments again as uploads.
+
+Building from source needs Go 1.26 or newer.
 
 ## Architecture
 
