@@ -158,65 +158,65 @@ func (m *Model) createMenuItems() []MenuItem {
 	return []MenuItem{
 		{
 			Title:    locale.Menu.ExportAssets,
-			Desc:     "Export users, teams, and channels from Mattermost",
+			Desc:     i18n.T("menu.export_assets_desc"),
 			View:     ViewExportAssets,
 			Disabled: !canExportAssets,
 		},
 		{
 			Title:    locale.Menu.ImportAssets,
-			Desc:     "Import assets to Matrix",
+			Desc:     i18n.T("menu.import_assets_desc"),
 			View:     ViewImportAssets,
 			Disabled: !canImportAssets,
 		},
 		{
 			Title:    locale.Menu.ExportMemberships,
-			Desc:     "Export team and channel memberships",
+			Desc:     i18n.T("menu.export_memberships_desc"),
 			View:     ViewExportMemberships,
 			Disabled: !canExportMemberships,
 		},
 		{
 			Title:    locale.Menu.ImportMemberships,
-			Desc:     "Apply memberships in Matrix",
+			Desc:     i18n.T("menu.import_memberships_desc"),
 			View:     ViewImportMemberships,
 			Disabled: !canImportMemberships,
 		},
 		{
 			Title:    locale.Menu.ExportMessages,
-			Desc:     "Export all messages and files from Mattermost",
+			Desc:     i18n.T("menu.export_messages_desc"),
 			View:     ViewExportMessages,
 			Disabled: !canExportMessages,
 		},
 		{
 			Title:    locale.Menu.ImportMessages,
-			Desc:     "Import messages to Matrix rooms",
+			Desc:     i18n.T("menu.import_messages_desc"),
 			View:     ViewImportMessages,
 			Disabled: !canImportMessages,
 		},
 		{
 			Title:    locale.Menu.LeaveRooms,
-			Desc:     "Leave all migrated rooms and spaces (cleanup)",
+			Desc:     i18n.T("menu.leave_rooms_desc"),
 			View:     ViewLeaveRooms,
 			Disabled: !canLeaveRooms,
 		},
 		{
 			Title:    locale.Menu.EnableNotifs,
-			Desc:     "Turn on email notifications for migrated users (run after messages)",
+			Desc:     i18n.T("menu.enable_notifications_desc"),
 			View:     ViewEnableNotifications,
 			Disabled: !canEnableNotifications,
 		},
 		{
 			Title: locale.Menu.TestConnection,
-			Desc:  "Test Mattermost and Matrix connections",
+			Desc:  i18n.T("menu.test_connection_desc"),
 			View:  ViewTestConnection,
 		},
 		{
 			Title: locale.Menu.Status,
-			Desc:  "View migration status",
+			Desc:  i18n.T("menu.status_desc"),
 			View:  ViewStatus,
 		},
 		{
 			Title: locale.Menu.Quit,
-			Desc:  "Exit the application",
+			Desc:  i18n.T("menu.quit_desc"),
 			View:  ViewMenu,
 			Action: func() tea.Cmd {
 				return tea.Quit
@@ -901,14 +901,14 @@ type operationCompleteMsg struct {
 // Run commands for various operations
 func (m *Model) runExportAssets() tea.Cmd {
 	return func() tea.Msg {
-		sendProgress("Connecting to Mattermost...", 0, 0, "")
+		sendProgress(i18n.T("progress.connecting", "Mattermost"), 0, 0, "")
 
 		// Connect to Mattermost
 		if err := m.orchestrator.ConnectMattermost(); err != nil {
 			return operationCompleteMsg{err: err}
 		}
 
-		sendProgress("Exporting assets...", 0, 0, "")
+		sendProgress(i18n.T("progress.stage_exporting_assets"), 0, 0, "")
 
 		// Run export with live progress updates
 		progress := func(stage string, current, total int, item string) {
@@ -920,20 +920,20 @@ func (m *Model) runExportAssets() tea.Cmd {
 			return operationCompleteMsg{err: err}
 		}
 
-		return operationCompleteMsg{message: "Assets exported successfully!", result: result}
+		return operationCompleteMsg{message: i18n.T("messages.assets_exported"), result: result}
 	}
 }
 
 func (m *Model) runImportAssets() tea.Cmd {
 	return func() tea.Msg {
-		sendProgress("Connecting to Matrix...", 0, 0, "")
+		sendProgress(i18n.T("progress.connecting", "Matrix"), 0, 0, "")
 
 		// Connect to Matrix
 		if err := m.orchestrator.ConnectMatrix(); err != nil {
 			return operationCompleteMsg{err: err}
 		}
 
-		sendProgress("Importing assets...", 0, 0, "")
+		sendProgress(i18n.T("progress.stage_importing_assets"), 0, 0, "")
 
 		// Run import with live progress updates
 		progress := func(stage string, current, total int, item string) {
@@ -945,20 +945,20 @@ func (m *Model) runImportAssets() tea.Cmd {
 			return operationCompleteMsg{err: err}
 		}
 
-		return operationCompleteMsg{message: "Assets imported successfully!", result: result}
+		return operationCompleteMsg{message: i18n.T("messages.assets_imported"), result: result}
 	}
 }
 
 func (m *Model) runExportMemberships() tea.Cmd {
 	return func() tea.Msg {
-		sendProgress("Connecting to Mattermost...", 0, 0, "")
+		sendProgress(i18n.T("progress.connecting", "Mattermost"), 0, 0, "")
 
 		// Connect if not already
 		if err := m.orchestrator.ConnectMattermost(); err != nil {
 			return operationCompleteMsg{err: err}
 		}
 
-		sendProgress("Exporting memberships...", 0, 0, "")
+		sendProgress(i18n.T("progress.stage_exporting_memberships"), 0, 0, "")
 
 		progress := func(stage string, current, total int, item string) {
 			sendProgress(stage, current, total, item)
@@ -969,20 +969,20 @@ func (m *Model) runExportMemberships() tea.Cmd {
 			return operationCompleteMsg{err: err}
 		}
 
-		return operationCompleteMsg{message: "Memberships exported successfully!", result: result}
+		return operationCompleteMsg{message: i18n.T("messages.memberships_exported"), result: result}
 	}
 }
 
 func (m *Model) runImportMemberships() tea.Cmd {
 	return func() tea.Msg {
-		sendProgress("Connecting to Matrix...", 0, 0, "")
+		sendProgress(i18n.T("progress.connecting", "Matrix"), 0, 0, "")
 
 		// Connect if not already
 		if err := m.orchestrator.ConnectMatrix(); err != nil {
 			return operationCompleteMsg{err: err}
 		}
 
-		sendProgress("Importing memberships...", 0, 0, "")
+		sendProgress(i18n.T("progress.stage_importing_memberships"), 0, 0, "")
 
 		progress := func(stage string, current, total int, item string) {
 			sendProgress(stage, current, total, item)
@@ -993,19 +993,19 @@ func (m *Model) runImportMemberships() tea.Cmd {
 			return operationCompleteMsg{err: err}
 		}
 
-		return operationCompleteMsg{message: "Memberships imported successfully!", result: result}
+		return operationCompleteMsg{message: i18n.T("messages.memberships_imported"), result: result}
 	}
 }
 
 func (m *Model) runEnableNotifications() tea.Cmd {
 	return func() tea.Msg {
-		sendProgress("Connecting to Matrix...", 0, 0, "")
+		sendProgress(i18n.T("progress.connecting", "Matrix"), 0, 0, "")
 
 		if err := m.orchestrator.ConnectMatrix(); err != nil {
 			return operationCompleteMsg{err: err}
 		}
 
-		sendProgress("Enabling email notifications...", 0, 0, "")
+		sendProgress(i18n.T("progress.enabling_notifications"), 0, 0, "")
 
 		progress := func(stage string, current, total int, item string) {
 			sendProgress(stage, current, total, item)
@@ -1016,9 +1016,9 @@ func (m *Model) runEnableNotifications() tea.Cmd {
 			return operationCompleteMsg{err: err}
 		}
 
-		msg := fmt.Sprintf("Email notifications enabled for %d user(s).", result.UsersCreated)
+		msg := i18n.T("messages.notifications_enabled", result.UsersCreated)
 		if result.UsersFailed > 0 {
-			msg = fmt.Sprintf("Enabled for %d user(s), %d failed - see the log for the reasons.",
+			msg = i18n.T("messages.notifications_enabled_partial",
 				result.UsersCreated, result.UsersFailed)
 		}
 		return operationCompleteMsg{message: msg, result: result}
@@ -1027,14 +1027,14 @@ func (m *Model) runEnableNotifications() tea.Cmd {
 
 func (m *Model) runLeaveRooms() tea.Cmd {
 	return func() tea.Msg {
-		sendProgress("Connecting to Matrix...", 0, 0, "")
+		sendProgress(i18n.T("progress.connecting", "Matrix"), 0, 0, "")
 
 		// Connect if not already
 		if err := m.orchestrator.ConnectMatrix(); err != nil {
 			return operationCompleteMsg{err: err}
 		}
 
-		sendProgress("Removing migration accounts from rooms...", 0, 0, "")
+		sendProgress(i18n.T("progress.stage_leaving_rooms"), 0, 0, "")
 
 		progress := func(stage string, current, total int, item string) {
 			sendProgress(stage, current, total, item)
@@ -1045,10 +1045,10 @@ func (m *Model) runLeaveRooms() tea.Cmd {
 			return operationCompleteMsg{err: err}
 		}
 
-		msg := fmt.Sprintf("Cleanup done: admin left %d room(s), %d deactivated membership(s) and %d bot membership(s) removed.",
+		msg := i18n.T("messages.leave_rooms_done",
 			result.RoomsLeft, result.DeactivatedRoomsLeft, result.BotRoomsLeft)
 		if failed := result.RoomsLeaveFailed + result.DeactivatedRoomsFailed + result.BotRoomsFailed; failed > 0 {
-			msg = fmt.Sprintf("%s %d removal(s) failed - re-run this step or check the log.", msg, failed)
+			msg = msg + " " + i18n.T("messages.leave_rooms_failures", failed)
 		}
 		return operationCompleteMsg{message: msg, result: result}
 	}
@@ -1056,14 +1056,14 @@ func (m *Model) runLeaveRooms() tea.Cmd {
 
 func (m *Model) runExportMessages() tea.Cmd {
 	return func() tea.Msg {
-		sendProgress("Connecting to Mattermost...", 0, 0, "")
+		sendProgress(i18n.T("progress.connecting", "Mattermost"), 0, 0, "")
 
 		// Connect if not already
 		if err := m.orchestrator.ConnectMattermost(); err != nil {
 			return operationCompleteMsg{err: err}
 		}
 
-		sendProgress("Exporting messages...", 0, 0, "")
+		sendProgress(i18n.T("progress.stage_exporting_messages"), 0, 0, "")
 
 		progress := func(stage string, current, total int, item string) {
 			sendProgress(stage, current, total, item)
@@ -1074,30 +1074,30 @@ func (m *Model) runExportMessages() tea.Cmd {
 			return operationCompleteMsg{err: err}
 		}
 
-		msg := fmt.Sprintf("Messages exported: %d messages, %d files", result.MessagesExported, result.FilesExported)
+		msg := i18n.T("messages.messages_exported_done", result.MessagesExported, result.FilesExported)
 		return operationCompleteMsg{message: msg}
 	}
 }
 
 func (m *Model) runImportMessages() tea.Cmd {
 	return func() tea.Msg {
-		sendProgress("Connecting to Matrix...", 0, 0, "")
+		sendProgress(i18n.T("progress.connecting", "Matrix"), 0, 0, "")
 
 		// Connect if not already
 		if err := m.orchestrator.ConnectMatrix(); err != nil {
 			return operationCompleteMsg{err: err}
 		}
 
-		sendProgress("Importing messages...", 0, 0, "")
+		sendProgress(i18n.T("progress.stage_importing_messages"), 0, 0, "")
 
 		progress := func(current, total int, channelName, status string) {
 			// The reaction and pin passes share this callback but count their own items.
-			label := "Messages"
+			label := i18n.T("progress.label_messages")
 			switch channelName {
 			case matrix.ReactionProgressStage:
-				label = "Reactions"
+				label = i18n.T("progress.label_reactions")
 			case matrix.PinProgressStage:
-				label = "Pinned messages"
+				label = i18n.T("progress.label_pinned")
 			}
 			sendProgress(fmt.Sprintf("%s: %s", label, status), current, total, channelName)
 		}
@@ -1107,7 +1107,7 @@ func (m *Model) runImportMessages() tea.Cmd {
 			return operationCompleteMsg{err: err}
 		}
 
-		msg := fmt.Sprintf("Messages imported: %d imported, %d skipped, %d failed, files linked=%d uploaded=%d skipped=%d too_large=%d, reactions imported=%d skipped=%d failed=%d, pinned rooms_updated=%d events_added=%d failed=%d",
+		msg := i18n.T("messages.messages_imported_done",
 			result.MessagesImported, result.MessagesSkipped, result.MessagesFailed,
 			result.FilesLinked, result.FilesUploaded, result.FilesSkipped, result.FilesTooLarge,
 			result.ReactionsImported, result.ReactionsSkipped, result.ReactionsFailed,

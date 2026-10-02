@@ -86,7 +86,7 @@ func runExportAssets(cmd *cobra.Command, args []string) error {
 	}
 
 	printSuccess(i18n.T("messages.file_saved", result.OutputFile))
-	printInfo(fmt.Sprintf("  Users: %d, Teams: %d, Channels: %d", 
+	printInfo("  %s", i18n.T("messages.export_assets_result",
 		result.UsersExported, result.TeamsExported, result.ChannelsExported))
 	printSuccess(i18n.T("messages.step_completed", "export_assets"))
 
@@ -139,7 +139,7 @@ func runExportMemberships(cmd *cobra.Command, args []string) error {
 	}
 
 	printSuccess(i18n.T("messages.file_saved", result.OutputFile))
-	printInfo(fmt.Sprintf("  Team memberships: %d, Channel memberships: %d", 
+	printInfo("  %s", i18n.T("messages.export_memberships_result",
 		result.TeamMembershipsExported, result.ChannelMembershipsExported))
 	printSuccess(i18n.T("messages.step_completed", "export_memberships"))
 
@@ -177,7 +177,7 @@ func runExportMessages(cmd *cobra.Command, args []string) error {
 	printSuccess(i18n.T("progress.connected", "Mattermost"))
 
 	// Export messages
-	printInfo("Exporting messages...")
+	printInfo("%s", i18n.T("progress.stage_exporting_messages"))
 	progress := func(stage string, current, total int, item string) {
 		if total > 0 {
 			printProgress("%s: %d/%d", stage, current, total)
@@ -192,8 +192,8 @@ func runExportMessages(cmd *cobra.Command, args []string) error {
 	}
 
 	printSuccess(i18n.T("messages.file_saved", result.OutputFile))
-	printInfo(fmt.Sprintf("  Messages exported: %d", result.MessagesExported))
-	printInfo(fmt.Sprintf("  Files exported: %d", result.FilesExported))
+	printInfo("  %s", i18n.T("messages.export_messages_result", result.MessagesExported))
+	printInfo("  %s", i18n.T("messages.export_files_result", result.FilesExported))
 	printSuccess(i18n.T("messages.step_completed", "export_messages"))
 
 	return nil

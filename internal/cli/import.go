@@ -17,9 +17,9 @@ import (
 func progressStageFor(channelName string) (label, unit string) {
 	switch channelName {
 	case matrix.ReactionProgressStage:
-		return "Reactions", "reactions"
+		return i18n.T("progress.label_reactions"), i18n.T("progress.unit_reactions")
 	case matrix.PinProgressStage:
-		return "Pinned messages", "rooms"
+		return i18n.T("progress.label_pinned"), i18n.T("progress.unit_rooms")
 	default:
 		return "", ""
 	}
@@ -185,11 +185,11 @@ func runImportAssets(cmd *cobra.Command, args []string) error {
 	}
 
 	printSuccess(i18n.T("messages.mapping_saved", result.OutputFile))
-	printInfo(fmt.Sprintf("  Users: created=%d, skipped=%d, failed=%d",
+	printInfo("  %s", i18n.T("messages.result_users",
 		result.UsersCreated, result.UsersSkipped, result.UsersFailed))
-	printInfo(fmt.Sprintf("  Spaces: created=%d, skipped=%d, failed=%d",
+	printInfo("  %s", i18n.T("messages.result_spaces",
 		result.SpacesCreated, result.SpacesSkipped, result.SpacesFailed))
-	printInfo(fmt.Sprintf("  Rooms: created=%d, skipped=%d, failed=%d, linked=%d, link_failed=%d",
+	printInfo("  %s", i18n.T("messages.result_rooms",
 		result.RoomsCreated, result.RoomsSkipped, result.RoomsFailed, result.RoomsLinked, result.RoomsLinkFailed))
 	printSuccess(i18n.T("messages.step_completed", "import_assets"))
 
@@ -220,11 +220,11 @@ func runImportMemberships(cmd *cobra.Command, args []string) error {
 	}
 	if step := state.GetStep(migration.StepImportMemberships); step.Status == migration.StatusCompleted {
 		if membershipsSkipCompleted {
-			printInfo("Membership import already completed in state; skipping replay (--skip-completed).")
+			printInfo("%s", i18n.T("messages.membership_already_skip"))
 			printSuccess(i18n.T("messages.migration_completed"))
 			return nil
 		}
-		printInfo("Membership import already completed; re-applying to pick up new members (force-join is idempotent).")
+		printInfo("%s", i18n.T("messages.membership_already_reapply"))
 	}
 
 	// Connect to Matrix
@@ -249,7 +249,7 @@ func runImportMemberships(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	printInfo(fmt.Sprintf("  Members: added=%d, skipped=%d, failed=%d",
+	printInfo("  %s", i18n.T("messages.result_members",
 		result.MembersAdded, result.MembersSkipped, result.MembersFailed))
 	printSuccess(i18n.T("messages.step_completed", "import_memberships"))
 	printSuccess(i18n.T("messages.migration_completed"))
@@ -267,8 +267,8 @@ func runImportMessages(cmd *cobra.Command, args []string) error {
 
 	// Check if AppService is enabled
 	if !cfg.UseAppService() {
-		printWarning("Application Service is not configured. Messages will be imported WITHOUT original timestamps.")
-		printInfo("To preserve timestamps, configure appservice in config.yaml and set MATRIX_AS_TOKEN env var")
+		printWarning("%s", i18n.T("messages.appservice_missing_warning"))
+		printInfo("%s", i18n.T("messages.appservice_missing_hint"))
 	}
 
 	// Create orchestrator
@@ -294,7 +294,7 @@ func runImportMessages(cmd *cobra.Command, args []string) error {
 	printSuccess(i18n.T("progress.connected", "Matrix"))
 
 	// Import messages
-	printInfo("Importing messages...")
+	printInfo("%s", i18n.T("progress.stage_importing_messages"))
 	startedAt := time.Now()
 	lastProgressPrint := time.Time{}
 	const progressPrintInterval = 10 * time.Second
@@ -302,8 +302,8 @@ func runImportMessages(cmd *cobra.Command, args []string) error {
 	// the rate and the ETA all have to start over when either begins - otherwise reactions or
 	// pinned rooms are reported under the previous pass's label, at a rate averaged over a run
 	// that has already finished.
-	label := "Messages"
-	unit := "msg"
+	label := i18n.T("progress.label_messages")
+	unit := i18n.T("progress.unit_messages")
 	progress := func(current, total int, channelName, status string) {
 		if total <= 0 {
 			return
@@ -324,7 +324,7 @@ func runImportMessages(cmd *cobra.Command, args []string) error {
 		elapsed := now.Sub(startedAt)
 		ratePerSec := float64(current) / elapsed.Seconds()
 		remaining := total - current
-		etaText := "calculating..."
+		etaText := i18n.T("progress.eta_calculating")
 		if ratePerSec > 0 && remaining > 0 {
 			etaSeconds := float64(remaining) / ratePerSec
 			etaText = formatETA(time.Duration(etaSeconds * float64(time.Second)))
@@ -332,8 +332,8 @@ func runImportMessages(cmd *cobra.Command, args []string) error {
 			etaText = "00:00:00"
 		}
 
-		printInfo("%s: %d/%d (%.1f%%) | rate: %.1f %s/s | ETA: %s | %s",
-			label, current, total, percent, ratePerSec, unit, etaText, status)
+		printInfo("%s", i18n.T("progress.message_line",
+			label, current, total, percent, ratePerSec, unit, etaText, status))
 		lastProgressPrint = now
 	}
 
@@ -342,15 +342,15 @@ func runImportMessages(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	printInfo(fmt.Sprintf("  Messages: imported=%d, skipped=%d, failed=%d",
+	printInfo("  %s", i18n.T("messages.result_messages",
 		result.MessagesImported, result.MessagesSkipped, result.MessagesFailed))
-	printInfo(fmt.Sprintf("  Replies: imported=%d, failed=%d",
+	printInfo("  %s", i18n.T("messages.result_replies",
 		result.RepliesImported, result.RepliesFailed))
-	printInfo(fmt.Sprintf("  Files: linked=%d, uploaded=%d, skipped=%d, too_large=%d",
+	printInfo("  %s", i18n.T("messages.result_files",
 		result.FilesLinked, result.FilesUploaded, result.FilesSkipped, result.FilesTooLarge))
-	printInfo(fmt.Sprintf("  Reactions: imported=%d, skipped=%d, failed=%d, custom_emoji=%d",
+	printInfo("  %s", i18n.T("messages.result_reactions",
 		result.ReactionsImported, result.ReactionsSkipped, result.ReactionsFailed, result.ReactionsCustomEmoji))
-	printInfo(fmt.Sprintf("  Pinned: rooms_updated=%d unchanged=%d events_added=%d skipped=%d failed=%d",
+	printInfo("  %s", i18n.T("messages.result_pinned",
 		result.PinnedRoomsUpdated, result.PinnedRoomsUnchanged, result.PinnedEventsAdded,
 		result.PinsSkipped, result.PinsFailed))
 
@@ -407,11 +407,11 @@ func runImportLeaveRooms(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	printInfo(fmt.Sprintf("  Deactivated users: checked=%d, removed=%d, kept-as-owner=%d, failed=%d",
+	printInfo("  %s", i18n.T("messages.result_deactivated_users",
 		result.DeactivatedAccounts, result.DeactivatedRoomsLeft, result.DeactivatedRoomsKept, result.DeactivatedRoomsFailed))
-	printInfo(fmt.Sprintf("  Migration bot: rooms-left=%d, kept-as-owner=%d, failed=%d",
+	printInfo("  %s", i18n.T("messages.result_migration_bot",
 		result.BotRoomsLeft, result.BotRoomsKept, result.BotRoomsFailed))
-	printInfo(fmt.Sprintf("  Admin rooms: left=%d, already-out=%d, failed=%d",
+	printInfo("  %s", i18n.T("messages.result_admin_rooms",
 		result.RoomsLeft, result.RoomsLeaveSkip, result.RoomsLeaveFailed))
 	printSuccess(i18n.T("messages.step_completed", "leave_rooms"))
 
@@ -459,7 +459,7 @@ func runImportEnableNotifications(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	printInfo(fmt.Sprintf("  Users: enabled=%d, skipped=%d, failed=%d",
+	printInfo("  %s", i18n.T("messages.result_notification_users",
 		result.UsersCreated, result.UsersSkipped, result.UsersFailed))
 	printSuccess(i18n.T("messages.step_completed", "enable_notifications"))
 

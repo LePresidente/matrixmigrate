@@ -33,79 +33,135 @@ type AppStrings struct {
 
 // MenuStrings contains menu-related strings
 type MenuStrings struct {
-	Title             string `yaml:"title"`
-	ExportAssets      string `yaml:"export_assets"`
-	ImportAssets      string `yaml:"import_assets"`
-	ExportMemberships string `yaml:"export_memberships"`
-	ImportMemberships string `yaml:"import_memberships"`
-	ExportMessages    string `yaml:"export_messages"`
-	ImportMessages    string `yaml:"import_messages"`
-	LeaveRooms        string `yaml:"leave_rooms"`
-	EnableNotifs      string `yaml:"enable_notifications"`
-	TestConnection    string `yaml:"test_connection"`
-	TestMattermost    string `yaml:"test_mattermost"`
-	TestMatrix        string `yaml:"test_matrix"`
-	Settings          string `yaml:"settings"`
-	Status            string `yaml:"status"`
-	Quit              string `yaml:"quit"`
-	Back              string `yaml:"back"`
-	Confirm           string `yaml:"confirm"`
-	Cancel            string `yaml:"cancel"`
+	Title                   string `yaml:"title"`
+	ExportAssets            string `yaml:"export_assets"`
+	ImportAssets            string `yaml:"import_assets"`
+	ExportMemberships       string `yaml:"export_memberships"`
+	ImportMemberships       string `yaml:"import_memberships"`
+	ExportMessages          string `yaml:"export_messages"`
+	ImportMessages          string `yaml:"import_messages"`
+	LeaveRooms              string `yaml:"leave_rooms"`
+	EnableNotifs            string `yaml:"enable_notifications"`
+	TestConnection          string `yaml:"test_connection"`
+	TestMattermost          string `yaml:"test_mattermost"`
+	TestMatrix              string `yaml:"test_matrix"`
+	Settings                string `yaml:"settings"`
+	Status                  string `yaml:"status"`
+	Quit                    string `yaml:"quit"`
+	Back                    string `yaml:"back"`
+	Confirm                 string `yaml:"confirm"`
+	Cancel                  string `yaml:"cancel"`
+	ExportAssetsDesc        string `yaml:"export_assets_desc"`
+	ImportAssetsDesc        string `yaml:"import_assets_desc"`
+	ExportMembershipsDesc   string `yaml:"export_memberships_desc"`
+	ImportMembershipsDesc   string `yaml:"import_memberships_desc"`
+	ExportMessagesDesc      string `yaml:"export_messages_desc"`
+	ImportMessagesDesc      string `yaml:"import_messages_desc"`
+	LeaveRoomsDesc          string `yaml:"leave_rooms_desc"`
+	EnableNotificationsDesc string `yaml:"enable_notifications_desc"`
+	TestConnectionDesc      string `yaml:"test_connection_desc"`
+	StatusDesc              string `yaml:"status_desc"`
+	QuitDesc                string `yaml:"quit_desc"`
 }
 
 // ProgressStrings contains progress-related strings
 type ProgressStrings struct {
-	Connecting           string `yaml:"connecting"`
-	Connected            string `yaml:"connected"`
-	Disconnecting        string `yaml:"disconnecting"`
-	Disconnected         string `yaml:"disconnected"`
-	Exporting            string `yaml:"exporting"`
-	ExportingUsers       string `yaml:"exporting_users"`
-	ExportingTeams       string `yaml:"exporting_teams"`
-	ExportingChannels    string `yaml:"exporting_channels"`
-	ExportingMemberships string `yaml:"exporting_memberships"`
-	Importing            string `yaml:"importing"`
-	CreatingUsers        string `yaml:"creating_users"`
-	CreatingSpaces       string `yaml:"creating_spaces"`
-	CreatingRooms        string `yaml:"creating_rooms"`
-	ApplyingMemberships  string `yaml:"applying_memberships"`
-	LinkingRooms         string `yaml:"linking_rooms"`
-	LeavingRooms         string `yaml:"leaving_rooms"`
-	EnablingNotifs       string `yaml:"enabling_notifications"`
-	SavingFile           string `yaml:"saving_file"`
-	LoadingFile          string `yaml:"loading_file"`
-	Completed            string `yaml:"completed"`
-	Failed               string `yaml:"failed"`
-	Skipped              string `yaml:"skipped"`
-	Retrying             string `yaml:"retrying"`
+	Connecting                string `yaml:"connecting"`
+	Connected                 string `yaml:"connected"`
+	Disconnecting             string `yaml:"disconnecting"`
+	Disconnected              string `yaml:"disconnected"`
+	Exporting                 string `yaml:"exporting"`
+	ExportingUsers            string `yaml:"exporting_users"`
+	ExportingTeams            string `yaml:"exporting_teams"`
+	ExportingChannels         string `yaml:"exporting_channels"`
+	ExportingMemberships      string `yaml:"exporting_memberships"`
+	Importing                 string `yaml:"importing"`
+	CreatingUsers             string `yaml:"creating_users"`
+	CreatingSpaces            string `yaml:"creating_spaces"`
+	CreatingRooms             string `yaml:"creating_rooms"`
+	ApplyingMemberships       string `yaml:"applying_memberships"`
+	LinkingRooms              string `yaml:"linking_rooms"`
+	LeavingRooms              string `yaml:"leaving_rooms"`
+	EnablingNotifs            string `yaml:"enabling_notifications"`
+	SavingFile                string `yaml:"saving_file"`
+	LoadingFile               string `yaml:"loading_file"`
+	Completed                 string `yaml:"completed"`
+	Failed                    string `yaml:"failed"`
+	Skipped                   string `yaml:"skipped"`
+	Retrying                  string `yaml:"retrying"`
+	StageExportingAssets      string `yaml:"stage_exporting_assets"`
+	StageImportingAssets      string `yaml:"stage_importing_assets"`
+	StageExportingMemberships string `yaml:"stage_exporting_memberships"`
+	StageImportingMemberships string `yaml:"stage_importing_memberships"`
+	StageExportingMessages    string `yaml:"stage_exporting_messages"`
+	StageImportingMessages    string `yaml:"stage_importing_messages"`
+	StageLeavingRooms         string `yaml:"stage_leaving_rooms"`
+	LabelMessages             string `yaml:"label_messages"`
+	LabelReactions            string `yaml:"label_reactions"`
+	LabelPinned               string `yaml:"label_pinned"`
+	UnitMessages              string `yaml:"unit_messages"`
+	UnitReactions             string `yaml:"unit_reactions"`
+	UnitRooms                 string `yaml:"unit_rooms"`
+	EtaCalculating            string `yaml:"eta_calculating"`
+	MessageLine               string `yaml:"message_line"`
 }
 
 // MessageStrings contains general message strings
 type MessageStrings struct {
-	Welcome            string `yaml:"welcome"`
-	ConnectionSuccess  string `yaml:"connection_success"`
-	ConnectionFailed   string `yaml:"connection_failed"`
-	FileSaved          string `yaml:"file_saved"`
-	FileLoaded         string `yaml:"file_loaded"`
-	ConfirmProceed     string `yaml:"confirm_proceed"`
-	ConfirmOverwrite   string `yaml:"confirm_overwrite"`
-	NoConfig           string `yaml:"no_config"`
-	MigrationStarted   string `yaml:"migration_started"`
-	MigrationCompleted string `yaml:"migration_completed"`
-	MigrationFailed    string `yaml:"migration_failed"`
-	MigrationCancelled string `yaml:"migration_cancelled"`
-	InterruptReceived  string `yaml:"interrupt_received"`
-	StepStopping       string `yaml:"step_stopping"`
-	StepStopHint       string `yaml:"step_stop_hint"`
-	StepInterrupted    string `yaml:"step_interrupted"`
-	InterruptedTitle   string `yaml:"interrupted_title"`
-	RoomsLinkFailed    string `yaml:"rooms_link_failed"`
-	StepCompleted      string `yaml:"step_completed"`
-	StepFailed         string `yaml:"step_failed"`
-	MappingSaved       string `yaml:"mapping_saved"`
-	MappingLoaded      string `yaml:"mapping_loaded"`
-	AssetsFound        string `yaml:"assets_found"`
-	MembershipsFound   string `yaml:"memberships_found"`
+	Welcome                     string `yaml:"welcome"`
+	ConnectionSuccess           string `yaml:"connection_success"`
+	ConnectionFailed            string `yaml:"connection_failed"`
+	FileSaved                   string `yaml:"file_saved"`
+	FileLoaded                  string `yaml:"file_loaded"`
+	ConfirmProceed              string `yaml:"confirm_proceed"`
+	ConfirmOverwrite            string `yaml:"confirm_overwrite"`
+	MigrationStarted            string `yaml:"migration_started"`
+	MigrationCompleted          string `yaml:"migration_completed"`
+	MigrationFailed             string `yaml:"migration_failed"`
+	MigrationCancelled          string `yaml:"migration_cancelled"`
+	InterruptReceived           string `yaml:"interrupt_received"`
+	StepStopping                string `yaml:"step_stopping"`
+	StepStopHint                string `yaml:"step_stop_hint"`
+	StepInterrupted             string `yaml:"step_interrupted"`
+	InterruptedTitle            string `yaml:"interrupted_title"`
+	RoomsLinkFailed             string `yaml:"rooms_link_failed"`
+	StepCompleted               string `yaml:"step_completed"`
+	StepFailed                  string `yaml:"step_failed"`
+	MappingSaved                string `yaml:"mapping_saved"`
+	MappingLoaded               string `yaml:"mapping_loaded"`
+	AssetsFound                 string `yaml:"assets_found"`
+	MembershipsFound            string `yaml:"memberships_found"`
+	MembershipAlreadySkip       string `yaml:"membership_already_skip"`
+	MembershipAlreadyReapply    string `yaml:"membership_already_reapply"`
+	AppserviceMissingWarning    string `yaml:"appservice_missing_warning"`
+	AppserviceMissingHint       string `yaml:"appservice_missing_hint"`
+	ExportAssetsResult          string `yaml:"export_assets_result"`
+	ExportMembershipsResult     string `yaml:"export_memberships_result"`
+	ExportMessagesResult        string `yaml:"export_messages_result"`
+	ExportFilesResult           string `yaml:"export_files_result"`
+	ResultUsers                 string `yaml:"result_users"`
+	ResultSpaces                string `yaml:"result_spaces"`
+	ResultRooms                 string `yaml:"result_rooms"`
+	ResultMembers               string `yaml:"result_members"`
+	ResultMessages              string `yaml:"result_messages"`
+	ResultReplies               string `yaml:"result_replies"`
+	ResultFiles                 string `yaml:"result_files"`
+	ResultReactions             string `yaml:"result_reactions"`
+	ResultPinned                string `yaml:"result_pinned"`
+	ResultDeactivatedUsers      string `yaml:"result_deactivated_users"`
+	ResultMigrationBot          string `yaml:"result_migration_bot"`
+	ResultAdminRooms            string `yaml:"result_admin_rooms"`
+	ResultNotificationUsers     string `yaml:"result_notification_users"`
+	AssetsExported              string `yaml:"assets_exported"`
+	AssetsImported              string `yaml:"assets_imported"`
+	MembershipsExported         string `yaml:"memberships_exported"`
+	MembershipsImported         string `yaml:"memberships_imported"`
+	NotificationsEnabled        string `yaml:"notifications_enabled"`
+	NotificationsEnabledPartial string `yaml:"notifications_enabled_partial"`
+	LeaveRoomsDone              string `yaml:"leave_rooms_done"`
+	LeaveRoomsFailures          string `yaml:"leave_rooms_failures"`
+	MessagesExportedDone        string `yaml:"messages_exported_done"`
+	MessagesImportedDone        string `yaml:"messages_imported_done"`
 }
 
 // StatusStrings contains status-related strings
@@ -314,6 +370,14 @@ func getMenuString(l *Locale, key string) string {
 		return l.Menu.ExportMemberships
 	case "import_memberships":
 		return l.Menu.ImportMemberships
+	case "export_messages":
+		return l.Menu.ExportMessages
+	case "import_messages":
+		return l.Menu.ImportMessages
+	case "leave_rooms":
+		return l.Menu.LeaveRooms
+	case "enable_notifications":
+		return l.Menu.EnableNotifs
 	case "test_connection":
 		return l.Menu.TestConnection
 	case "test_mattermost":
@@ -332,6 +396,28 @@ func getMenuString(l *Locale, key string) string {
 		return l.Menu.Confirm
 	case "cancel":
 		return l.Menu.Cancel
+	case "export_assets_desc":
+		return l.Menu.ExportAssetsDesc
+	case "import_assets_desc":
+		return l.Menu.ImportAssetsDesc
+	case "export_memberships_desc":
+		return l.Menu.ExportMembershipsDesc
+	case "import_memberships_desc":
+		return l.Menu.ImportMembershipsDesc
+	case "export_messages_desc":
+		return l.Menu.ExportMessagesDesc
+	case "import_messages_desc":
+		return l.Menu.ImportMessagesDesc
+	case "leave_rooms_desc":
+		return l.Menu.LeaveRoomsDesc
+	case "enable_notifications_desc":
+		return l.Menu.EnableNotificationsDesc
+	case "test_connection_desc":
+		return l.Menu.TestConnectionDesc
+	case "status_desc":
+		return l.Menu.StatusDesc
+	case "quit_desc":
+		return l.Menu.QuitDesc
 	}
 	return ""
 }
@@ -384,6 +470,36 @@ func getProgressString(l *Locale, key string) string {
 		return l.Progress.Skipped
 	case "retrying":
 		return l.Progress.Retrying
+	case "stage_exporting_assets":
+		return l.Progress.StageExportingAssets
+	case "stage_importing_assets":
+		return l.Progress.StageImportingAssets
+	case "stage_exporting_memberships":
+		return l.Progress.StageExportingMemberships
+	case "stage_importing_memberships":
+		return l.Progress.StageImportingMemberships
+	case "stage_exporting_messages":
+		return l.Progress.StageExportingMessages
+	case "stage_importing_messages":
+		return l.Progress.StageImportingMessages
+	case "stage_leaving_rooms":
+		return l.Progress.StageLeavingRooms
+	case "label_messages":
+		return l.Progress.LabelMessages
+	case "label_reactions":
+		return l.Progress.LabelReactions
+	case "label_pinned":
+		return l.Progress.LabelPinned
+	case "unit_messages":
+		return l.Progress.UnitMessages
+	case "unit_reactions":
+		return l.Progress.UnitReactions
+	case "unit_rooms":
+		return l.Progress.UnitRooms
+	case "eta_calculating":
+		return l.Progress.EtaCalculating
+	case "message_line":
+		return l.Progress.MessageLine
 	}
 	return ""
 }
@@ -404,8 +520,6 @@ func getMessageString(l *Locale, key string) string {
 		return l.Messages.ConfirmProceed
 	case "confirm_overwrite":
 		return l.Messages.ConfirmOverwrite
-	case "no_config":
-		return l.Messages.NoConfig
 	case "migration_started":
 		return l.Messages.MigrationStarted
 	case "migration_completed":
@@ -438,6 +552,68 @@ func getMessageString(l *Locale, key string) string {
 		return l.Messages.AssetsFound
 	case "memberships_found":
 		return l.Messages.MembershipsFound
+	case "membership_already_skip":
+		return l.Messages.MembershipAlreadySkip
+	case "membership_already_reapply":
+		return l.Messages.MembershipAlreadyReapply
+	case "appservice_missing_warning":
+		return l.Messages.AppserviceMissingWarning
+	case "appservice_missing_hint":
+		return l.Messages.AppserviceMissingHint
+	case "export_assets_result":
+		return l.Messages.ExportAssetsResult
+	case "export_memberships_result":
+		return l.Messages.ExportMembershipsResult
+	case "export_messages_result":
+		return l.Messages.ExportMessagesResult
+	case "export_files_result":
+		return l.Messages.ExportFilesResult
+	case "result_users":
+		return l.Messages.ResultUsers
+	case "result_spaces":
+		return l.Messages.ResultSpaces
+	case "result_rooms":
+		return l.Messages.ResultRooms
+	case "result_members":
+		return l.Messages.ResultMembers
+	case "result_messages":
+		return l.Messages.ResultMessages
+	case "result_replies":
+		return l.Messages.ResultReplies
+	case "result_files":
+		return l.Messages.ResultFiles
+	case "result_reactions":
+		return l.Messages.ResultReactions
+	case "result_pinned":
+		return l.Messages.ResultPinned
+	case "result_deactivated_users":
+		return l.Messages.ResultDeactivatedUsers
+	case "result_migration_bot":
+		return l.Messages.ResultMigrationBot
+	case "result_admin_rooms":
+		return l.Messages.ResultAdminRooms
+	case "result_notification_users":
+		return l.Messages.ResultNotificationUsers
+	case "assets_exported":
+		return l.Messages.AssetsExported
+	case "assets_imported":
+		return l.Messages.AssetsImported
+	case "memberships_exported":
+		return l.Messages.MembershipsExported
+	case "memberships_imported":
+		return l.Messages.MembershipsImported
+	case "notifications_enabled":
+		return l.Messages.NotificationsEnabled
+	case "notifications_enabled_partial":
+		return l.Messages.NotificationsEnabledPartial
+	case "leave_rooms_done":
+		return l.Messages.LeaveRoomsDone
+	case "leave_rooms_failures":
+		return l.Messages.LeaveRoomsFailures
+	case "messages_exported_done":
+		return l.Messages.MessagesExportedDone
+	case "messages_imported_done":
+		return l.Messages.MessagesImportedDone
 	}
 	return ""
 }
