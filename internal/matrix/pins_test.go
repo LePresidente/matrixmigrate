@@ -694,3 +694,22 @@ func TestImportPinsTreatsAnAdmin5xxAsAnOutage(t *testing.T) {
 	}
 }
 
+func TestImportPinsFailsARoomWithoutPowerLevels(t *testing.T) {
+	// Without power levels there is no telling who may pin; guessing could join the admin to
+	// a room for nothing.
+	state := []map[string]any{
+		{"type": EventTypeRoomCreate, "state_key": "", "sender": "@alice:example.com", "content": map[string]any{"room_version": "11"}},
+		{"type": EventTypeRoomMember, "state_key": "@alice:example.com", "sender": "@alice:example.com", "content": map[string]any{"membership": "join"}},
+	}
+	f, c := newFakePinServer(t, state)
+	c.SetASToken("as-token")
+
+	result := runPinPass(c)
+
+	if result.Stats.PinsFailed != 1 || result.Stats.PinnedRoomsUpdated != 0 {
+		t.Fatalf("stats = %+v, want the room counted as failed", result.Stats)
+	}
+	if len(f.attempts) != 0 || f.joins != 0 {
+		t.Fatalf("attempts = %q, joins = %d; want neither", f.attempts, f.joins)
+	}
+}

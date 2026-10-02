@@ -183,10 +183,14 @@ func (c *Client) readRoomPins(roomID string) ([]string, *pinRoomView, error) {
 // step is skipped when the admin was already in the room and refused: joining changes nothing.
 //
 // adminID is the admin's own user ID, "" when it is not known; the admin is then never
-// assumed to be in the room.
+// assumed to be in the room. A room whose state carries no power levels is an error: nobody is
+// tried and the admin is not joined.
 func (c *Client) writeRoomPins(roomID string, eventIDs []string, view *pinRoomView, adminID string) error {
 	if view == nil {
 		return c.PinEvents(roomID, eventIDs)
+	}
+	if view.levels == nil {
+		return fmt.Errorf("room %s has no %s in its state; not guessing who may pin", roomID, EventTypePowerLevels)
 	}
 
 	required := requiredPinPowerLevel(view.levels)
