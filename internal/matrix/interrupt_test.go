@@ -100,7 +100,7 @@ func TestImportMessagesWithCancelledContextSendsNothing(t *testing.T) {
 	posts := interruptTestPosts(4)
 	reactions := &ReactionImport{Reactions: []mattermost.Reaction{{UserID: "u-alice", PostID: "p0", EmojiName: "smile"}}}
 	result, err := i.ImportMessagesWithFiles(posts, map[string]string{"c1": "!r:example.com"}, interruptTestUsers,
-		map[string]string{"p-old": "$old"}, nil, nil, reactions, &PinImport{}, nil)
+		map[string]string{"p-old": "$old"}, nil, nil, nil, reactions, &PinImport{}, nil)
 	if err != nil {
 		t.Fatalf("ImportMessagesWithFiles: %v", err)
 	}
@@ -130,7 +130,7 @@ func TestImportMessagesStopsAfterCurrentItemWhenCancelled(t *testing.T) {
 	i.SetContext(ctx)
 
 	result, err := i.ImportMessagesWithFiles(interruptTestPosts(10), map[string]string{"c1": "!r:example.com"}, interruptTestUsers,
-		nil, nil, nil, nil, nil, nil)
+		nil, nil, nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("ImportMessagesWithFiles: %v", err)
 	}

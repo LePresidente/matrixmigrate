@@ -56,7 +56,7 @@ func TestImportPostFilesOversizedReadIsTooLarge(t *testing.T) {
 	res := &ImportMessagesResult{Stats: &MessageImportStats{}}
 	// The export claims 5 bytes; the file is really 100.
 	files := []mattermost.FileInfo{{ID: "f1", PostID: "p1", Name: "x.bin", Path: "a/x.bin", Size: 5}}
-	n, max := i.importPostFiles(res, "!r:example.com", files, fc, 0, "", "", "")
+	n, max, _ := i.importPostFiles(res, "!r:example.com", files, fc, 0, "", "", "")
 	if n != 1 || max != 100 || res.Stats.FilesTooLarge != 1 || res.Stats.FilesSkipped != 1 || res.Stats.FilesUploaded != 0 {
 		t.Errorf("n=%d max=%d stats=%+v", n, max, res.Stats)
 	}

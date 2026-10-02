@@ -56,12 +56,14 @@ type Importer struct {
 	// persist them. Empty when the policy generates no passwords.
 	generatedCredentials []UserCredential
 
-	// checkpointFn, when set, is called every checkpointEvery imported messages with the
-	// post ID -> event ID mapping so far. Message import runs for days on a large instance;
-	// without this, an interruption loses every message already sent, because the mapping is
-	// only written once the whole run finishes and a restart would re-import them as duplicates.
-	checkpointFn    func(map[string]string)
+	// checkpointFn, when set, is called every checkpointEvery recorded messages and attachments
+	// with the post ID -> event ID and file ID -> event ID mappings so far. Message import runs
+	// for days on a large instance; without this, an interruption loses every message already
+	// sent, because the mapping is only written once the whole run finishes and a restart would
+	// re-import them as duplicates. checkpointMark is the record count at the last checkpoint.
+	checkpointFn    func(messages, files map[string]string)
 	checkpointEvery int
+	checkpointMark  int
 
 	// reactionCheckpointFn mirrors checkpointFn for the reaction pass, which faces the same
 	// problem: a busy instance has thousands of reactions, each one an API call under the rate
@@ -1754,28 +1756,34 @@ type ImportAssetsResult struct {
 	Stats        *ImportStats
 }
 
-// SetMessageCheckpoint installs fn, called every `every` imported messages with the
-// post ID -> event ID mapping accumulated so far. Passing a nil fn or every <= 0 disables
-// checkpointing. The mapping handed to fn is a copy, safe to persist without racing the import.
-func (i *Importer) SetMessageCheckpoint(every int, fn func(map[string]string)) {
+// SetMessageCheckpoint installs fn, called after every `every` recorded messages and
+// attachments with the post ID -> event ID and file ID -> event ID mappings accumulated so far.
+// Passing a nil fn or every <= 0 disables checkpointing. The mappings handed to fn are copies,
+// safe to persist without racing the import.
+func (i *Importer) SetMessageCheckpoint(every int, fn func(messages, files map[string]string)) {
 	i.checkpointEvery = every
 	i.checkpointFn = fn
 }
 
-// maybeCheckpoint hands the current mapping to the checkpoint callback every checkpointEvery
-// messages, so an interrupted import can resume from what it already sent.
-func (i *Importer) maybeCheckpoint(mapping map[string]string) {
+// recordCount is what checkpoint spacing is measured in: messages plus attachments recorded.
+func recordCount(result *ImportMessagesResult) int {
+	return len(result.Mapping) + len(result.FileMapping)
+}
+
+// maybeCheckpoint hands the current mappings to the checkpoint callback once checkpointEvery
+// more messages and attachments have been recorded since the last one, so an interrupted
+// import can resume from what it already sent. Call it between posts, never between a post's
+// attachments and its own mapping entry, so a checkpoint never holds one without the other.
+func (i *Importer) maybeCheckpoint(result *ImportMessagesResult) {
 	if i.checkpointFn == nil || i.checkpointEvery <= 0 {
 		return
 	}
-	if len(mapping)%i.checkpointEvery != 0 {
+	n := recordCount(result)
+	if n-i.checkpointMark < i.checkpointEvery {
 		return
 	}
-	snapshot := make(map[string]string, len(mapping))
-	for k, v := range mapping {
-		snapshot[k] = v
-	}
-	i.checkpointFn(snapshot)
+	i.checkpointMark = n
+	i.checkpointFn(copyMapping(result.Mapping), copyMapping(result.FileMapping))
 }
 
 // SetAssetCheckpoint installs fn, called with the user, space and room mappings so far after
@@ -1981,31 +1989,41 @@ func (i *Importer) sendLinkOrSkip(
 	threadRootEventID string,
 	threadLatestEventID string,
 	reason string,
-) {
+) string {
 	if fileConfig.S3PublicURL == "" {
 		result.Stats.FilesSkipped++
 		result.Errors = append(result.Errors, fmt.Sprintf("Skipped file %s for post %s: %s", file.Name, file.PostID, reason))
-		return
+		return ""
 	}
 	if !isSafeAttachmentPath(file.Path) {
 		recordUnsafeAttachmentPath(result, file)
-		return
+		return ""
 	}
 	fileURL := buildPublicFileURL(fileConfig.S3PublicURL, file.Path)
-	var err error
-	if threadRootEventID != "" {
-		_, err = i.client.SendFileLinkAsReply(roomID, file.Name, fileURL, file.MimeType, file.Size, threadRootEventID, threadLatestEventID, timestamp, senderID)
-	} else {
-		_, err = i.client.SendFileLink(roomID, file.Name, fileURL, file.MimeType, file.Size, timestamp, senderID)
+	resp, recovery, err := i.sendWithMembershipRecovery(roomID, senderID, func(sender string) (*SendMessageResponse, error) {
+		if threadRootEventID != "" {
+			return i.client.SendFileLinkAsReply(roomID, file.Name, fileURL, file.MimeType, file.Size, threadRootEventID, threadLatestEventID, timestamp, sender)
+		}
+		return i.client.SendFileLink(roomID, file.Name, fileURL, file.MimeType, file.Size, timestamp, sender)
+	})
+	if recovery != "" {
+		logger.Info("File %s (post %s): %s", file.ID, file.PostID, recovery)
 	}
 	if err != nil {
 		result.Stats.FilesSkipped++
 		result.Errors = append(result.Errors, fmt.Sprintf("Failed to send file link for %s (post %s): %v", file.Name, file.PostID, err))
-		return
+		return ""
 	}
 	result.Stats.FilesLinked++
+	return resp.EventID
 }
 
+// importPostFiles sends a post's attachments in upload mode, falling back to link events where
+// configured. Each attachment that reaches the room is recorded in result.FileMapping as soon as
+// it is sent; one that does not is left out, so the next run tries it again. It returns the
+// number of files rejected as too large, the largest such size, and the event ID of the first
+// attachment event sent ("" when none was). Sends go through sendWithMembershipRecovery, since
+// for a post with no text the first attachment is the post itself.
 func (i *Importer) importPostFiles(
 	result *ImportMessagesResult,
 	roomID string,
@@ -2015,9 +2033,22 @@ func (i *Importer) importPostFiles(
 	senderID string,
 	threadRootEventID string,
 	threadLatestEventID string,
-) (int, int64) {
+) (int, int64, string) {
 	tooLargeCount := 0
 	var maxTooLargeSize int64
+	firstEventID := ""
+	sent := func(file mattermost.FileInfo, eventID string) {
+		if eventID == "" {
+			return
+		}
+		result.recordFile(file.ID, eventID)
+		if firstEventID == "" {
+			firstEventID = eventID
+		}
+	}
+	linkOrSkip := func(file mattermost.FileInfo, reason string) {
+		sent(file, i.sendLinkOrSkip(result, roomID, file, fileConfig, timestamp, senderID, threadRootEventID, threadLatestEventID, reason))
+	}
 	logger.Debug("importPostFiles: room=%s sender=%s files=%d mode=%s", roomID, senderID, len(files), fileConfig.Mode)
 	rejectTooLarge := func(file mattermost.FileInfo, size int64) {
 		logger.Debug("importPostFiles: file too large id=%s name=%s size=%d max=%d", file.ID, file.Name, size, fileConfig.MaxUploadSize)
@@ -2027,13 +2058,18 @@ func (i *Importer) importPostFiles(
 			maxTooLargeSize = size
 		}
 		if fileConfig.UploadFallbackToLink {
-			i.sendLinkOrSkip(result, roomID, file, fileConfig, timestamp, senderID, threadRootEventID, threadLatestEventID, "file exceeds max_upload_size_mb")
+			linkOrSkip(file, "file exceeds max_upload_size_mb")
 		} else {
 			result.Stats.FilesSkipped++
 			result.Errors = append(result.Errors, fmt.Sprintf("Skipped file %s for post %s: file size %d exceeds max_upload_size_mb (%d bytes)", file.Name, file.PostID, size, fileConfig.MaxUploadSize))
 		}
 	}
 	for _, file := range files {
+		// An attachment left unsent by an interrupt is not recorded, so the next run sends it.
+		if i.isInterrupted() {
+			logger.Warn("Interrupted: attachments of post %s not yet sent are left for the next run", file.PostID)
+			break
+		}
 		if file.IsDeleted() {
 			logger.Debug("importPostFiles: skipping deleted file id=%s name=%s post=%s", file.ID, file.Name, file.PostID)
 			result.Stats.FilesSkipped++
@@ -2046,7 +2082,7 @@ func (i *Importer) importPostFiles(
 		if fileConfig.LocalDataPath == "" {
 			logger.Debug("importPostFiles: local_data_path empty for file id=%s name=%s", file.ID, file.Name)
 			if fileConfig.UploadFallbackToLink {
-				i.sendLinkOrSkip(result, roomID, file, fileConfig, timestamp, senderID, threadRootEventID, threadLatestEventID, "mattermost.files.local_data_path is empty")
+				linkOrSkip(file, "mattermost.files.local_data_path is empty")
 			} else {
 				result.Stats.FilesSkipped++
 				result.Errors = append(result.Errors, fmt.Sprintf("Skipped file %s for post %s: mattermost.files.local_data_path is empty", file.Name, file.PostID))
@@ -2069,7 +2105,7 @@ func (i *Importer) importPostFiles(
 		if err != nil {
 			logger.Debug("importPostFiles: read failed id=%s name=%s err=%v", file.ID, file.Name, err)
 			if fileConfig.UploadFallbackToLink {
-				i.sendLinkOrSkip(result, roomID, file, fileConfig, timestamp, senderID, threadRootEventID, threadLatestEventID, fmt.Sprintf("cannot read attachment bytes from %s: %v", file.Path, err))
+				linkOrSkip(file, fmt.Sprintf("cannot read attachment bytes from %s: %v", file.Path, err))
 			} else {
 				result.Stats.FilesSkipped++
 				result.Errors = append(result.Errors, fmt.Sprintf("Skipped file %s for post %s: cannot read attachment bytes from %s: %v", file.Name, file.PostID, file.Path, err))
@@ -2089,7 +2125,7 @@ func (i *Importer) importPostFiles(
 		if err != nil {
 			logger.Debug("importPostFiles: upload failed id=%s name=%s err=%v", file.ID, file.Name, err)
 			if fileConfig.UploadFallbackToLink {
-				i.sendLinkOrSkip(result, roomID, file, fileConfig, timestamp, senderID, threadRootEventID, threadLatestEventID, fmt.Sprintf("upload failed: %v", err))
+				linkOrSkip(file, fmt.Sprintf("upload failed: %v", err))
 			} else {
 				result.Stats.FilesSkipped++
 				result.Errors = append(result.Errors, fmt.Sprintf("Skipped file %s for post %s: upload failed: %v", file.Name, file.PostID, err))
@@ -2097,15 +2133,19 @@ func (i *Importer) importPostFiles(
 			continue
 		}
 		logger.Debug("importPostFiles: upload success id=%s name=%s mxc=%s", file.ID, file.Name, uploadResp.ContentURI)
-		if threadRootEventID != "" {
-			_, err = i.client.SendUploadedFileAsReply(roomID, uploadResp.ContentURI, file.Name, mimeType, file.Size, file.Width, file.Height, threadRootEventID, threadLatestEventID, timestamp, senderID)
-		} else {
-			_, err = i.client.SendUploadedFile(roomID, uploadResp.ContentURI, file.Name, mimeType, file.Size, file.Width, file.Height, timestamp, senderID)
+		resp, recovery, err := i.sendWithMembershipRecovery(roomID, senderID, func(sender string) (*SendMessageResponse, error) {
+			if threadRootEventID != "" {
+				return i.client.SendUploadedFileAsReply(roomID, uploadResp.ContentURI, file.Name, mimeType, file.Size, file.Width, file.Height, threadRootEventID, threadLatestEventID, timestamp, sender)
+			}
+			return i.client.SendUploadedFile(roomID, uploadResp.ContentURI, file.Name, mimeType, file.Size, file.Width, file.Height, timestamp, sender)
+		})
+		if recovery != "" {
+			logger.Info("File %s (post %s): %s", file.ID, file.PostID, recovery)
 		}
 		if err != nil {
 			logger.Debug("importPostFiles: send uploaded file failed id=%s name=%s err=%v", file.ID, file.Name, err)
 			if fileConfig.UploadFallbackToLink {
-				i.sendLinkOrSkip(result, roomID, file, fileConfig, timestamp, senderID, threadRootEventID, threadLatestEventID, fmt.Sprintf("send uploaded file failed: %v", err))
+				linkOrSkip(file, fmt.Sprintf("send uploaded file failed: %v", err))
 			} else {
 				result.Stats.FilesSkipped++
 				result.Errors = append(result.Errors, fmt.Sprintf("Skipped file %s for post %s: send uploaded file failed: %v", file.Name, file.PostID, err))
@@ -2114,8 +2154,9 @@ func (i *Importer) importPostFiles(
 		}
 		logger.Debug("importPostFiles: sent uploaded file event id=%s name=%s room=%s", file.ID, file.Name, roomID)
 		result.Stats.FilesUploaded++
+		sent(file, resp.EventID)
 	}
-	return tooLargeCount, maxTooLargeSize
+	return tooLargeCount, maxTooLargeSize, firstEventID
 }
 
 // MessageImportCallback is called for each message imported
@@ -2129,6 +2170,18 @@ type ImportMessagesResult struct {
 	// ReactionMapping records the reactions sent by this run, keyed by mattermost.Reaction.Key().
 	// Mattermost reactions have no ID of their own, so this is what makes a re-run idempotent.
 	ReactionMapping map[string]string
+	// FileMapping records every attachment known to be sent - the ones passed in as already
+	// sent plus the ones this run sent - as Mattermost file ID -> event ID. An attachment that
+	// failed is absent, so the next run sends it again.
+	FileMapping map[string]string
+}
+
+// recordFile notes that an attachment has been sent as eventID.
+func (r *ImportMessagesResult) recordFile(fileID, eventID string) {
+	if r.FileMapping == nil {
+		r.FileMapping = make(map[string]string)
+	}
+	r.FileMapping[fileID] = eventID
 }
 
 // ImportMessages imports messages from Mattermost posts to Matrix rooms
@@ -2164,6 +2217,7 @@ func (i *Importer) ImportMessages(
 	for k, v := range existingMapping {
 		result.Mapping[k] = v
 	}
+	i.checkpointMark = recordCount(result)
 
 	// Sort posts by timestamp (they should already be sorted, but just in case)
 	// This ensures parent messages are imported before replies
@@ -2278,7 +2332,7 @@ func (i *Importer) ImportMessages(
 		// Store mapping
 		result.Mapping[post.ID] = eventID
 		result.Stats.MessagesImported++
-		i.maybeCheckpoint(result.Mapping)
+		i.maybeCheckpoint(result)
 
 		if progress != nil {
 			progress(idx+1, total, post.ChannelID, "imported")
@@ -2293,14 +2347,17 @@ func (i *Importer) ImportMessages(
 	return result, nil
 }
 
-// ImportMessagesWithFiles imports messages with file attachments
-// filesByPost maps post ID to list of file infos
+// ImportMessagesWithFiles imports messages with file attachments.
+// filesByPost maps post ID to list of file infos; existingFiles holds the attachments earlier
+// runs sent (file ID -> event ID). In upload mode an already-imported post still gets those of
+// its attachments that are not in existingFiles.
 func (i *Importer) ImportMessagesWithFiles(
 	posts []mattermost.Post,
 	channelToRoom map[string]string,
 	userMapping map[string]string,
 	existingMapping map[string]string,
 	filesByPost map[string][]mattermost.FileInfo,
+	existingFiles map[string]string,
 	fileConfig *FileConfig,
 	reactionImport *ReactionImport,
 	pinImport *PinImport,
@@ -2311,6 +2368,7 @@ func (i *Importer) ImportMessagesWithFiles(
 		Mapping:         make(map[string]string),
 		Errors:          []string{},
 		ReactionMapping: make(map[string]string),
+		FileMapping:     copyMapping(existingFiles),
 	}
 
 	if !i.client.HasASToken() {
@@ -2344,6 +2402,7 @@ func (i *Importer) ImportMessagesWithFiles(
 	for k, v := range existingMapping {
 		result.Mapping[k] = v
 	}
+	i.checkpointMark = recordCount(result)
 
 	// Newest Matrix event per Mattermost thread root, so a thread's compatibility reply
 	// points at the previous message rather than always at the root. Posts arrive in
@@ -2372,9 +2431,20 @@ func (i *Importer) ImportMessagesWithFiles(
 		if i.stopForInterrupt("message import", idx, total) {
 			break
 		}
+		files := filesByPost[post.ID]
+
 		// Check if already imported
 		if _, exists := existingMapping[post.ID]; exists {
 			result.Stats.MessagesSkipped++
+			// An earlier run may have stopped before all of the post's attachments were sent.
+			if fileConfig.Mode == "upload" {
+				tooLargeCount, maxTooLargeSize := i.sendUnrecordedPostFiles(result, post, files, channelToRoom, userMapping, fileConfig)
+				totalTooLarge += tooLargeCount
+				if maxTooLargeSize > largestTooLargeSize {
+					largestTooLargeSize = maxTooLargeSize
+				}
+				i.maybeCheckpoint(result)
+			}
 			if progress != nil {
 				progress(idx+1, total, post.ChannelID, "skipped")
 			}
@@ -2402,19 +2472,10 @@ func (i *Importer) ImportMessagesWithFiles(
 			continue
 		}
 
-		// Get sender
-		senderID, userExists := userMapping[post.UserID]
-		if !userExists {
-			senderID = ""
-			logger.Warn("No user mapping for user %s, message will be sent as AS bot", post.UserID)
-			if err := i.ensureFallbackSenderInRoom(roomID); err != nil {
-				logger.Warn("Fallback sender cannot post to room %s: %v", roomID, err)
-			}
-		}
+		senderID := i.resolveSender(post, roomID, userMapping)
 
 		// Build message content with files
 		messageContent := i.normalizeMatrixMentions(post.Message)
-		files := filesByPost[post.ID]
 
 		// Append file links if mode is "link"
 		if fileConfig.Mode == "link" && len(files) > 0 && fileConfig.S3PublicURL != "" {
@@ -2427,6 +2488,35 @@ func (i *Importer) ImportMessagesWithFiles(
 				messageContent += fmt.Sprintf("\n\n📎 [%s](%s)", file.Name, fileURL)
 				result.Stats.FilesLinked++
 			}
+		}
+
+		// A post with no text of its own must not become a blank event, since that blank event is
+		// what replies, reactions and pins would then point at.
+		liveFiles := liveAttachments(files)
+		noText := strings.TrimSpace(messageContent) == "" && len(liveFiles) > 0
+		if noText && fileConfig.Mode == "upload" {
+			// The attachments are the post: the first one sent stands for it.
+			if !i.importAttachmentsAsPost(result, post, roomID, senderID, files, fileConfig, threadLatest, &totalTooLarge, &largestTooLargeSize) {
+				if i.isInterrupted() {
+					// Nothing was sent and nothing is recorded; the next run sends the post.
+					continue
+				}
+				result.Stats.MessagesFailed++
+				result.Errors = append(result.Errors, fmt.Sprintf("Failed to send message %s: the post has no text and none of its attachments could be sent", post.ID))
+				if progress != nil {
+					progress(idx+1, total, post.ChannelID, "failed:send_error")
+				}
+				continue
+			}
+			i.maybeCheckpoint(result)
+			if progress != nil {
+				progress(idx+1, total, post.ChannelID, "imported")
+			}
+			continue
+		}
+		if noText {
+			// No attachment event will carry it: name the files instead of sending nothing.
+			messageContent = attachmentNamesBody(liveFiles)
 		}
 
 		// Handle reply
@@ -2495,22 +2585,21 @@ func (i *Importer) ImportMessagesWithFiles(
 		// Store mapping
 		result.Mapping[post.ID] = eventID
 		result.Stats.MessagesImported++
-		i.maybeCheckpoint(result.Mapping)
-
-		if progress != nil {
-			progress(idx+1, total, post.ChannelID, "imported")
-		}
 
 		// Upload or link files after the message event is imported.
 		// Matrix file attachments are sent as separate m.room.message events.
 		if fileConfig.Mode == "upload" && len(files) > 0 {
-			tooLargeCount, maxTooLargeSize := i.importPostFiles(result, roomID, files, fileConfig, post.CreateAt, senderID, attachmentReplyToEventID, threadLatest[post.RootID])
+			tooLargeCount, maxTooLargeSize, _ := i.importPostFiles(result, roomID, files, fileConfig, post.CreateAt, senderID, attachmentReplyToEventID, threadLatest[post.RootID])
 			totalTooLarge += tooLargeCount
 			if maxTooLargeSize > largestTooLargeSize {
 				largestTooLargeSize = maxTooLargeSize
 			}
 		}
+		i.maybeCheckpoint(result)
 
+		if progress != nil {
+			progress(idx+1, total, post.ChannelID, "imported")
+		}
 	}
 
 	// An interrupted run skips the reaction and pin passes: both are replayed from the saved
@@ -2541,6 +2630,122 @@ func (i *Importer) ImportMessagesWithFiles(
 	}
 
 	return result, nil
+}
+
+// resolveSender returns the Matrix user a post is sent as, or "" for the fallback sender when
+// its author has no mapping - in which case the fallback sender is joined to the room first.
+func (i *Importer) resolveSender(post mattermost.Post, roomID string, userMapping map[string]string) string {
+	if senderID, ok := userMapping[post.UserID]; ok {
+		return senderID
+	}
+	logger.Warn("No user mapping for user %s, message will be sent as AS bot", post.UserID)
+	if err := i.ensureFallbackSenderInRoom(roomID); err != nil {
+		logger.Warn("Fallback sender cannot post to room %s: %v", roomID, err)
+	}
+	return ""
+}
+
+// liveAttachments returns the files that have not been deleted in Mattermost.
+func liveAttachments(files []mattermost.FileInfo) []mattermost.FileInfo {
+	var live []mattermost.FileInfo
+	for _, f := range files {
+		if !f.IsDeleted() {
+			live = append(live, f)
+		}
+	}
+	return live
+}
+
+// attachmentNamesBody is the text sent for a post that has attachments but no text, when no
+// attachment event will exist to stand for it.
+func attachmentNamesBody(files []mattermost.FileInfo) string {
+	names := make([]string, len(files))
+	for idx, f := range files {
+		names[idx] = f.Name
+	}
+	return "📎 " + strings.Join(names, ", ")
+}
+
+// importAttachmentsAsPost sends the attachments of a post that has no text, in place of a text
+// event. The first attachment event sent becomes the post's event, so replies, reactions and
+// pins resolve to it, and a reply's thread advances to it. It reports whether the post was
+// mapped; when it was not, nothing about the post is recorded and a later run retries it.
+func (i *Importer) importAttachmentsAsPost(
+	result *ImportMessagesResult,
+	post mattermost.Post,
+	roomID, senderID string,
+	files []mattermost.FileInfo,
+	fileConfig *FileConfig,
+	threadLatest map[string]string,
+	totalTooLarge *int,
+	largestTooLargeSize *int64,
+) bool {
+	threadRoot := ""
+	if post.IsReply() {
+		if parentEventID, ok := result.Mapping[post.RootID]; ok {
+			threadRoot = parentEventID
+		} else {
+			result.Stats.RepliesFailed++
+			result.Errors = append(result.Errors, fmt.Sprintf("Parent post %s not found for reply %s", post.RootID, post.ID))
+		}
+	}
+
+	tooLargeCount, maxTooLargeSize, eventID := i.importPostFiles(result, roomID, files, fileConfig, post.CreateAt, senderID, threadRoot, threadLatest[post.RootID])
+	*totalTooLarge += tooLargeCount
+	if maxTooLargeSize > *largestTooLargeSize {
+		*largestTooLargeSize = maxTooLargeSize
+	}
+	if eventID == "" {
+		return false
+	}
+
+	result.Mapping[post.ID] = eventID
+	result.Stats.MessagesImported++
+	if threadRoot != "" {
+		threadLatest[post.RootID] = eventID
+		result.Stats.RepliesImported++
+	}
+	return true
+}
+
+// sendUnrecordedPostFiles sends the attachments of an already-imported post that no earlier run
+// recorded as sent - because its upload failed, or the run stopped before reaching it. They go
+// out exactly as on a first run: same room, sender and timestamp, and in the post's thread when
+// it is a reply, with the post's own event as the reply fallback.
+func (i *Importer) sendUnrecordedPostFiles(
+	result *ImportMessagesResult,
+	post mattermost.Post,
+	files []mattermost.FileInfo,
+	channelToRoom map[string]string,
+	userMapping map[string]string,
+	fileConfig *FileConfig,
+) (int, int64) {
+	var pending []mattermost.FileInfo
+	for _, f := range liveAttachments(files) {
+		if _, sent := result.FileMapping[f.ID]; !sent {
+			pending = append(pending, f)
+		}
+	}
+	if len(pending) == 0 {
+		return 0, 0
+	}
+	roomID, ok := channelToRoom[post.ChannelID]
+	if !ok {
+		return 0, 0
+	}
+	senderID := i.resolveSender(post, roomID, userMapping)
+
+	threadRoot, threadLatestEventID := "", ""
+	if post.IsReply() {
+		if parentEventID, ok := result.Mapping[post.RootID]; ok {
+			threadRoot = parentEventID
+			threadLatestEventID = result.Mapping[post.ID]
+		}
+	}
+
+	logger.Info("Post %s was imported earlier; sending %d attachment(s) not yet recorded as sent", post.ID, len(pending))
+	tooLargeCount, maxTooLargeSize, _ := i.importPostFiles(result, roomID, pending, fileConfig, post.CreateAt, senderID, threadRoot, threadLatestEventID)
+	return tooLargeCount, maxTooLargeSize
 }
 
 // ReactionProgressStage is passed in the channel slot of MessageImportCallback while the

@@ -211,7 +211,7 @@ func TestImportRecoversReplyFromAbsentAuthor(t *testing.T) {
 	res, err := i.ImportMessagesWithFiles(posts,
 		map[string]string{"c1": "!room"},
 		map[string]string{"u_alice": "@alice:example.com", "u_bob": "@bob_dev:example.com"},
-		nil, nil, nil, nil, nil, nil)
+		nil, nil, nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("import failed: %v", err)
 	}

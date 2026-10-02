@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aligundogdu/matrixmigrate/internal/mattermost"
 	"github.com/aligundogdu/matrixmigrate/pkg/archive"
 )
 
@@ -68,7 +69,16 @@ type MessageMapping struct {
 	// and Matrix does not deduplicate annotations, so without this a second run would stack a
 	// duplicate of every reaction on top of the first.
 	Reactions map[string]string `json:"reactions,omitempty"`
-	mu        sync.RWMutex      `json:"-"`
+	// Files records which attachments have been sent: Mattermost file ID -> event ID of the
+	// event that carried it, or "" for a file taken as sent when this record was introduced
+	// (see adoptLegacyFileTracking). An attachment missing from it is sent by the next run.
+	//
+	// omitzero rather than omitempty: an empty map must still be written, because a mapping
+	// with no "files" key is read as one that predates file tracking.
+	Files map[string]string `json:"files,omitzero"`
+	// filesUntracked is set when the file this mapping was loaded from had no "files" key.
+	filesUntracked bool
+	mu             sync.RWMutex `json:"-"`
 }
 
 // MessageMapEntry represents a single message mapping
@@ -95,6 +105,7 @@ func NewMessageMapping(homeserver string) *MessageMapping {
 		Homeserver: homeserver,
 		Messages:   make(map[string]*MessageMapEntry),
 		Reactions:  make(map[string]string),
+		Files:      make(map[string]string),
 	}
 }
 
@@ -165,6 +176,78 @@ func (m *MessageMapping) ReactionKeys() map[string]string {
 		out[k] = v
 	}
 	return out
+}
+
+// AddFile records a sent attachment under its Mattermost file ID.
+func (m *MessageMapping) AddFile(fileID, matrixEventID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.Files == nil {
+		m.Files = make(map[string]string)
+	}
+	m.Files[fileID] = matrixEventID
+	m.UpdatedAt = time.Now().UnixMilli()
+}
+
+// HasFile reports whether an attachment has already been sent.
+func (m *MessageMapping) HasFile(fileID string) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	_, exists := m.Files[fileID]
+	return exists
+}
+
+// FileCount returns the number of recorded attachments.
+func (m *MessageMapping) FileCount() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return len(m.Files)
+}
+
+// FileIDs returns a copy of the recorded attachments and their event IDs, for handing to an
+// import run as the set it should not send again.
+func (m *MessageMapping) FileIDs() map[string]string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	out := make(map[string]string, len(m.Files))
+	for k, v := range m.Files {
+		out[k] = v
+	}
+	return out
+}
+
+// adoptLegacyFileTracking brings a mapping written before attachments were tracked up to date:
+// every file whose post is already in the mapping is marked as sent, with no event ID. Nothing
+// is known about which of those attachments made it, and assuming none did would upload every
+// old attachment a second time. It returns how many files it marked; a mapping that already
+// tracks files is left alone, and so is one that has been adopted before.
+func adoptLegacyFileTracking(m *MessageMapping, files []mattermost.FileInfo) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if !m.filesUntracked {
+		return 0
+	}
+	m.filesUntracked = false
+	if m.Files == nil {
+		m.Files = make(map[string]string)
+	}
+	marked := 0
+	for idx := range files {
+		f := &files[idx]
+		if _, imported := m.Messages[f.PostID]; !imported {
+			continue
+		}
+		if _, known := m.Files[f.ID]; known {
+			continue
+		}
+		m.Files[f.ID] = ""
+		marked++
+	}
+	return marked
 }
 
 // GetMatrixEventID returns the Matrix event ID for a Mattermost post
@@ -269,6 +352,12 @@ func LoadMessageMapping(filepath string) (*MessageMapping, error) {
 	// Mapping files written before reactions existed have no such key.
 	if mapping.Reactions == nil {
 		mapping.Reactions = make(map[string]string)
+	}
+	// Nor did files written before attachments were tracked - and there the absence means
+	// something: see adoptLegacyFileTracking.
+	if mapping.Files == nil {
+		mapping.filesUntracked = true
+		mapping.Files = make(map[string]string)
 	}
 	
 	return &mapping, nil

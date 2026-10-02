@@ -1729,13 +1729,27 @@ func (o *Orchestrator) ImportMessages(progress matrix.MessageImportCallback) (*I
 	// this the mapping only lands when the whole run finishes: any interruption would leave
 	// every sent message unrecorded, so a restart would import them a second time.
 	mappingFile := GenerateMessageMappingFilename(o.config.Data.MappingsDir)
-	importer.SetMessageCheckpoint(messageCheckpointInterval, func(partial map[string]string) {
+
+	// A mapping written before attachments were tracked says nothing about which of them were
+	// sent. Take every attachment of an already-imported post as sent, or this run would upload
+	// all of them a second time, and save that before anything else happens.
+	if marked := adoptLegacyFileTracking(msgMapping, messages.Files); marked > 0 {
+		logger.Info("Message mapping predates attachment tracking: %d attachment(s) of already-imported posts taken as sent", marked)
+		if err := SaveMessageMapping(msgMapping, mappingFile); err != nil {
+			logger.Warn("Failed to save message mapping: %v", err)
+		}
+	}
+
+	importer.SetMessageCheckpoint(messageCheckpointInterval, func(partial, files map[string]string) {
 		addMessageEntries(msgMapping, partial, postByID, assetMapping)
+		for fileID, eventID := range files {
+			msgMapping.AddFile(fileID, eventID)
+		}
 		if err := SaveMessageMapping(msgMapping, mappingFile); err != nil {
 			logger.Warn("Checkpoint: failed to save message mapping: %v", err)
 			return
 		}
-		logger.Info("Checkpoint: message mapping saved with %d entries to %s", len(msgMapping.Messages), mappingFile)
+		logger.Info("Checkpoint: message mapping saved with %d entries and %d attachments to %s", len(msgMapping.Messages), msgMapping.FileCount(), mappingFile)
 	})
 
 	// Reactions ride along with the message import: they need the event IDs it produces.
@@ -1797,6 +1811,7 @@ func (o *Orchestrator) ImportMessages(progress matrix.MessageImportCallback) (*I
 		assetMapping.Users,    // userID -> matrixUserID
 		existingMapping,       // existing message mapping
 		filesByPost,           // post ID -> files
+		msgMapping.FileIDs(),  // attachments already sent
 		fileConfig,            // file migration settings
 		reactionImport,        // reactions, or nil to skip them
 		pinImport,             // pinned messages, or nil to skip them
@@ -1826,6 +1841,9 @@ func (o *Orchestrator) ImportMessages(progress matrix.MessageImportCallback) (*I
 	addMessageEntries(msgMapping, result.Mapping, postByID, assetMapping)
 	for key, eventID := range result.ReactionMapping {
 		msgMapping.AddReaction(key, eventID)
+	}
+	for fileID, eventID := range result.FileMapping {
+		msgMapping.AddFile(fileID, eventID)
 	}
 
 	mappingErr := SaveMessageMapping(msgMapping, mappingFile)
