@@ -3,6 +3,8 @@ package cli
 import (
 	"bytes"
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -59,5 +61,28 @@ func TestAnnounceInterruptSilentWhenCommandFinishes(t *testing.T) {
 	}
 	if out.Len() != 0 {
 		t.Errorf("printed %q after a normal finish, want nothing", out.String())
+	}
+}
+
+// A config file that cannot be loaded is an error in TUI mode too, not a "no config" notice
+// with exit status 0.
+func TestRootCommandReturnsConfigLoadError(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte("matrix: [unclosed\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	rootCmd.SetOut(&out)
+	rootCmd.SetErr(&out)
+	rootCmd.SetArgs([]string{"--config", path})
+	t.Cleanup(func() {
+		rootCmd.SetOut(nil)
+		rootCmd.SetErr(nil)
+		rootCmd.SetArgs(nil)
+		cfgFile = ""
+	})
+
+	if err := rootCmd.Execute(); err == nil {
+		t.Fatal("root command returned no error for a config file that does not parse")
 	}
 }

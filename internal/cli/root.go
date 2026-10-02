@@ -54,14 +54,11 @@ Examples:
 	},
 	RunE: func(cmd *cobra.Command, args []string) error {
 		// Load config
+		// A missing config.yaml already falls back to defaults inside config.Load, so an
+		// error here is a file that exists but does not parse or validate: report it in
+		// both modes rather than exit successfully.
 		cfg, err := config.Load(cfgFile)
 		if err != nil {
-			// If no config and we're in TUI mode, show a message
-			if !batch {
-				fmt.Println(i18n.T("messages.no_config"))
-				fmt.Println("Please create a config.yaml file. See config.example.yaml for reference.")
-				return nil
-			}
 			return err
 		}
 
