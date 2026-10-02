@@ -662,14 +662,14 @@ func (c *Config) EnsureDataDirs() error {
 	dirs := []string{c.Data.AssetsDir, c.Data.MappingsDir}
 
 	for _, dir := range dirs {
-		if err := os.MkdirAll(dir, 0755); err != nil {
+		if err := os.MkdirAll(dir, 0700); err != nil {
 			return fmt.Errorf("failed to create directory %s: %w", dir, err)
 		}
 	}
 
 	// Ensure state file directory exists
 	stateDir := filepath.Dir(c.Data.StateFile)
-	if err := os.MkdirAll(stateDir, 0755); err != nil {
+	if err := os.MkdirAll(stateDir, 0700); err != nil {
 		return fmt.Errorf("failed to create state directory %s: %w", stateDir, err)
 	}
 

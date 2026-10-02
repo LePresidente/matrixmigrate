@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/aligundogdu/matrixmigrate/pkg/archive"
 )
 
 // Mapping represents the ID mappings between Mattermost and Matrix
@@ -95,7 +97,7 @@ type MappingStats struct {
 func SaveMapping(mapping *Mapping, filePath string) error {
 	// Ensure directory exists
 	dir := filepath.Dir(filePath)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0700); err != nil {
 		return fmt.Errorf("failed to create directory: %w", err)
 	}
 
@@ -104,7 +106,7 @@ func SaveMapping(mapping *Mapping, filePath string) error {
 		return fmt.Errorf("failed to marshal mapping: %w", err)
 	}
 
-	if err := os.WriteFile(filePath, data, 0644); err != nil {
+	if err := archive.WriteFileAtomic(filePath, data, 0600); err != nil {
 		return fmt.Errorf("failed to write mapping file: %w", err)
 	}
 

@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/aligundogdu/matrixmigrate/pkg/archive"
 )
 
 // StepStatus represents the status of a migration step
@@ -254,7 +256,7 @@ func (s *MigrationState) Summary() StateSummary {
 func SaveState(state *MigrationState, filePath string) error {
 	// Ensure directory exists
 	dir := filepath.Dir(filePath)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0700); err != nil {
 		return fmt.Errorf("failed to create directory: %w", err)
 	}
 
@@ -263,7 +265,7 @@ func SaveState(state *MigrationState, filePath string) error {
 		return fmt.Errorf("failed to marshal state: %w", err)
 	}
 
-	if err := os.WriteFile(filePath, data, 0644); err != nil {
+	if err := archive.WriteFileAtomic(filePath, data, 0600); err != nil {
 		return fmt.Errorf("failed to write state file: %w", err)
 	}
 

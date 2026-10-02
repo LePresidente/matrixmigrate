@@ -1476,18 +1476,14 @@ func (o *Orchestrator) ImportMessages(progress matrix.MessageImportCallback) (*I
 
 	// Load or create message mapping for resume support
 	msgMappingFile, _ := GetLatestMessageMappingFile(o.config.Data.MappingsDir)
-	var msgMapping *MessageMapping
-
+	msgMapping, err := loadOrCreateMessageMapping(msgMappingFile, o.config.Matrix.Homeserver)
+	if err != nil {
+		o.state.FailStep(StepImportMessages, err)
+		o.SaveState()
+		return nil, err
+	}
 	if msgMappingFile != "" {
-		msgMapping, err = LoadMessageMapping(msgMappingFile)
-		if err != nil {
-			logger.Warn("Failed to load existing message mapping, starting fresh: %v", err)
-			msgMapping = NewMessageMapping(o.config.Matrix.Homeserver)
-		} else {
-			logger.Info("Resuming from existing mapping with %d messages", msgMapping.Count())
-		}
-	} else {
-		msgMapping = NewMessageMapping(o.config.Matrix.Homeserver)
+		logger.Info("Resuming from existing mapping with %d messages", msgMapping.Count())
 	}
 
 	// Set up AS token if configured

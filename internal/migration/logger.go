@@ -39,10 +39,11 @@ func NewLogger(dataDir string) (*Logger, error) {
 	}
 
 	// Open file in append mode
-	file, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	file, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open log file: %w", err)
 	}
+	_ = file.Chmod(0600) // tighten a pre-existing, possibly world-readable log
 
 	return &Logger{
 		file:     file,
@@ -122,10 +123,11 @@ func (l *Logger) rotate() error {
 	}
 
 	// Open new file
-	file, err := os.OpenFile(l.filePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	file, err := os.OpenFile(l.filePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
 	if err != nil {
 		return fmt.Errorf("failed to create new log file: %w", err)
 	}
+	_ = file.Chmod(0600)
 
 	l.file = file
 	l.size = 0

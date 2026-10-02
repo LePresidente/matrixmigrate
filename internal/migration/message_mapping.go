@@ -8,6 +8,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/aligundogdu/matrixmigrate/pkg/archive"
 )
 
 // GenerateMessageErrorsFilename returns a timestamped path for the message-error log.
@@ -24,7 +26,7 @@ func WriteMessageErrors(dir string, errs []string) (string, error) {
 		b.WriteString(e)
 		b.WriteByte('\n')
 	}
-	if err := os.WriteFile(path, []byte(b.String()), 0o640); err != nil {
+	if err := archive.WriteFileAtomic(path, []byte(b.String()), 0o600); err != nil {
 		return "", err
 	}
 	return path, nil
@@ -215,8 +217,8 @@ type MessageMappingStats struct {
 
 // SaveMessageMapping saves the message mapping to a file
 func SaveMessageMapping(mapping *MessageMapping, filepath string) error {
-	mapping.mu.RLock()
-	defer mapping.mu.RUnlock()
+	mapping.mu.Lock()
+	defer mapping.mu.Unlock()
 	
 	mapping.UpdatedAt = time.Now().UnixMilli()
 	
@@ -225,11 +227,28 @@ func SaveMessageMapping(mapping *MessageMapping, filepath string) error {
 		return fmt.Errorf("failed to marshal message mapping: %w", err)
 	}
 	
-	if err := os.WriteFile(filepath, data, 0644); err != nil {
+	if err := archive.WriteFileAtomic(filepath, data, 0600); err != nil {
 		return fmt.Errorf("failed to write message mapping file: %w", err)
 	}
 	
 	return nil
+}
+
+// loadOrCreateMessageMapping returns a fresh mapping when no mapping file exists
+// (path is empty). If a file exists but cannot be loaded it fails rather than
+// starting empty: an empty mapping would make the import resend every message
+// that was already imported.
+func loadOrCreateMessageMapping(path, homeserver string) (*MessageMapping, error) {
+	if path == "" {
+		return NewMessageMapping(homeserver), nil
+	}
+	m, err := LoadMessageMapping(path)
+	if err != nil {
+		return nil, fmt.Errorf("message mapping file %s could not be loaded: %w; the import was NOT started, "+
+			"because starting without it would send every already-imported message a second time; "+
+			"restore the file, or move it away if a fresh import is really intended", path, err)
+	}
+	return m, nil
 }
 
 // LoadMessageMapping loads a message mapping from a file
