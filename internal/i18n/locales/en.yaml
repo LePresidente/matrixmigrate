@@ -61,6 +61,7 @@ messages:
   migration_completed: "Migration completed successfully"
   migration_failed: "Migration failed"
   migration_cancelled: "Migration cancelled"
+  interrupt_received: "Interrupt received - finishing the current item and saving progress. Press Ctrl+C again to abort immediately."
   step_completed: "Step %s completed"
   step_failed: "Step %s failed: %s"
   mapping_saved: "Mapping file saved: %s"

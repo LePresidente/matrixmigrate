@@ -153,6 +153,7 @@ func runImportAssets(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to create orchestrator: %w", err)
 	}
 	defer orch.Close()
+	orch.SetContext(cmd.Context())
 
 	// Check prerequisites
 	state := orch.GetState()
@@ -209,6 +210,7 @@ func runImportMemberships(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to create orchestrator: %w", err)
 	}
 	defer orch.Close()
+	orch.SetContext(cmd.Context())
 
 	// Check prerequisites
 	state := orch.GetState()
@@ -276,6 +278,7 @@ func runImportMessages(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to create orchestrator: %w", err)
 	}
 	defer orch.Close()
+	orch.SetContext(cmd.Context())
 
 	// Check prerequisites
 	state := orch.GetState()
@@ -375,6 +378,7 @@ func runImportLeaveRooms(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to create orchestrator: %w", err)
 	}
 	defer orch.Close()
+	orch.SetContext(cmd.Context())
 
 	// Check prerequisites
 	state := orch.GetState()
@@ -428,6 +432,7 @@ func runImportEnableNotifications(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to create orchestrator: %w", err)
 	}
 	defer orch.Close()
+	orch.SetContext(cmd.Context())
 
 	state := orch.GetState()
 	canRun, reason := state.CanRunStep(migration.StepEnableNotifications)

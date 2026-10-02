@@ -1,8 +1,12 @@
 ﻿package cli
 
 import (
+	"context"
 	"fmt"
+	"io"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/spf13/cobra"
 
@@ -83,9 +87,40 @@ Examples:
 	},
 }
 
-// Execute runs the root command
+// Execute runs the root command.
+//
+// SIGINT and SIGTERM cancel the context the commands run under: an import step then finishes
+// the item in flight, saves its progress and returns migration.ErrInterrupted. A second signal
+// gets the default behaviour and kills the process at once.
 func Execute() error {
-	return rootCmd.Execute()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	// Closed before the deferred stop() runs, so the cancellation stop() causes on a normal
+	// exit is not mistaken for an interrupt.
+	finished := make(chan struct{})
+	defer close(finished)
+	go announceInterrupt(ctx, stop, finished, os.Stderr)
+
+	return rootCmd.ExecuteContext(ctx)
+}
+
+// announceInterrupt waits for the first interrupt, then restores the default signal handling
+// (so a second Ctrl+C kills the process) and tells the user what is happening. It returns
+// without a word once finished is closed.
+func announceInterrupt(ctx context.Context, stop func(), finished <-chan struct{}, out io.Writer) {
+	select {
+	case <-finished:
+		return
+	case <-ctx.Done():
+	}
+	select {
+	case <-finished:
+		return
+	default:
+	}
+	stop()
+	fmt.Fprintf(out, "⚠ %s\n", i18n.T("messages.interrupt_received"))
 }
 
 func init() {

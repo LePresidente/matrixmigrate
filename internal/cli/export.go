@@ -61,6 +61,7 @@ func runExportAssets(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to create orchestrator: %w", err)
 	}
 	defer orch.Close()
+	orch.SetContext(cmd.Context())
 
 	// Connect to Mattermost
 	printInfo(i18n.T("progress.connecting", "Mattermost"))
@@ -106,6 +107,7 @@ func runExportMemberships(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to create orchestrator: %w", err)
 	}
 	defer orch.Close()
+	orch.SetContext(cmd.Context())
 
 	// Check prerequisites
 	state := orch.GetState()
@@ -158,6 +160,7 @@ func runExportMessages(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to create orchestrator: %w", err)
 	}
 	defer orch.Close()
+	orch.SetContext(cmd.Context())
 
 	// Check prerequisites
 	state := orch.GetState()

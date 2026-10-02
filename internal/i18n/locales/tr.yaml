@@ -61,6 +61,7 @@ messages:
   migration_completed: "Taşıma başarıyla tamamlandı"
   migration_failed: "Taşıma başarısız oldu"
   migration_cancelled: "Taşıma iptal edildi"
+  interrupt_received: "Kesme sinyali alındı - mevcut öğe tamamlanıyor ve ilerleme kaydediliyor. Hemen durdurmak için Ctrl+C'ye tekrar basın."
   step_completed: "Adım %s tamamlandı"
   step_failed: "Adım %s başarısız: %s"
   mapping_saved: "Eşleme dosyası kaydedildi: %s"

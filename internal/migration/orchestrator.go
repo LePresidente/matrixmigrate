@@ -1,6 +1,8 @@
 package migration
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -28,6 +30,42 @@ type Orchestrator struct {
 	// forceMembershipReplay re-applies channel/team memberships even when the step already
 	// completed, so members who joined after the first run get added on a later run.
 	forceMembershipReplay bool
+
+	// ctx is cancelled when the user interrupts the run. See SetContext.
+	ctx context.Context
+}
+
+// ErrInterrupted marks a step that stopped early because the run was interrupted. The work
+// done up to that point has been saved, so running the same step again resumes it.
+var ErrInterrupted = errors.New("interrupted")
+
+// SetContext installs the context whose cancellation interrupts the running step. Import
+// steps stop after the item in flight, save their progress, and return an error wrapping
+// ErrInterrupted. Without a call the context is context.Background() and nothing interrupts.
+func (o *Orchestrator) SetContext(ctx context.Context) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	o.ctx = ctx
+	if o.mxClient != nil {
+		o.mxClient.SetContext(ctx)
+	}
+}
+
+// interrupted reports whether the context installed with SetContext has been cancelled.
+func (o *Orchestrator) interrupted() bool {
+	return o.ctx != nil && o.ctx.Err() != nil
+}
+
+// failInterrupted records step as failed with err, which must wrap ErrInterrupted, and returns
+// err for the caller to hand back.
+func (o *Orchestrator) failInterrupted(step StepName, err error) error {
+	logger.Warn("%v", err)
+	o.state.FailStep(step, err)
+	if serr := o.SaveState(); serr != nil {
+		logger.Error("Failed to save state after interrupt: %v", serr)
+	}
+	return err
 }
 
 // SetForceMembershipReplay controls whether a completed membership step is re-applied on
@@ -57,6 +95,7 @@ func NewOrchestrator(cfg *config.Config) (*Orchestrator, error) {
 		config:        cfg,
 		state:         state,
 		tunnelManager: ssh.NewTunnelManager(),
+		ctx:           context.Background(),
 	}, nil
 }
 
@@ -155,6 +194,7 @@ type OperationResult struct {
 func (o *Orchestrator) newImporter() *matrix.Importer {
 	importer := matrix.NewImporter(o.mxClient)
 	importer.SetDeletedUserMode(o.config.GetDeletedUserMode())
+	importer.SetContext(o.ctx)
 	return importer
 }
 
@@ -359,6 +399,7 @@ func (o *Orchestrator) ConnectMatrix() error {
 		RetryBaseDelay:    time.Duration(cfg.RateLimit.RetryBaseDelay) * time.Millisecond,
 	}
 	client := matrix.NewClientWithRateLimit(baseURL, accessToken, cfg.Homeserver, rlConfig)
+	client.SetContext(o.ctx)
 
 	// Test connection
 	if err := client.TestConnection(); err != nil {
@@ -707,8 +748,11 @@ func (o *Orchestrator) ImportAssets(progress ProgressCallback) (*OperationResult
 		}
 	}
 
-	// Import direct message channels as Matrix DMs when enabled
-	if o.config.Matrix.Import.ImportDirectMessages && len(assets.DirectChannels) > 0 {
+	// Import direct message channels as Matrix DMs when enabled. An interrupted run goes
+	// straight to saving what it has.
+	if o.interrupted() {
+		logger.Warn("Import assets interrupted: skipping direct message import and room linking")
+	} else if o.config.Matrix.Import.ImportDirectMessages && len(assets.DirectChannels) > 0 {
 		logger.Info("Import direct messages: processing %d direct channels as DMs", len(assets.DirectChannels))
 		existingRoomMapping := make(map[string]string)
 		if existingMappings != nil {
@@ -750,9 +794,22 @@ func (o *Orchestrator) ImportAssets(progress ProgressCallback) (*OperationResult
 	// Save mapping
 	mappingFile := GenerateMappingFilename(o.config.Data.MappingsDir)
 	if err := SaveMapping(mapping, mappingFile); err != nil {
+		if o.interrupted() {
+			return nil, o.failInterrupted(StepImportAssets,
+				fmt.Errorf("asset import %w, and saving what was created so far failed: %v", ErrInterrupted, err))
+		}
 		o.state.FailStep(StepImportAssets, err)
 		o.SaveState()
 		return nil, fmt.Errorf("failed to save mapping: %w", err)
+	}
+
+	// Checked again after linking, which an interrupt can also cut short.
+	interruptedAfterSave := func() error {
+		return o.failInterrupted(StepImportAssets,
+			fmt.Errorf("asset import %w: everything created so far is recorded in %s; run the same command again to resume", ErrInterrupted, mappingFile))
+	}
+	if o.interrupted() {
+		return nil, interruptedAfterSave()
 	}
 
 	// Link rooms to spaces (pass userMapping and defaultSpaceOwnerID so admin can be invited into spaces/rooms before linking)
@@ -773,6 +830,9 @@ func (o *Orchestrator) ImportAssets(progress ProgressCallback) (*OperationResult
 	linkResult, err := importer.LinkRoomsToSpaces(assets.Channels, importResult.SpaceMapping, importResult.RoomMapping, importResult.UserMapping, defaultSpaceOwnerID, o.config.GetPublicRoomJoinRules(), importProgress)
 	if err == nil && linkResult != nil {
 		result.RoomsLinked = linkResult.RoomsLinked
+	}
+	if o.interrupted() {
+		return nil, interruptedAfterSave()
 	}
 
 	// Complete step
@@ -1012,6 +1072,11 @@ func (o *Orchestrator) ImportMemberships(progress ProgressCallback) (*OperationR
 	logger.Info("Import memberships cleanup: admin left spaces=%d leave_failures=%d attempted=%d",
 		leftSpaces, failedLeaveSpaces, len(spacesToLeaveAfterMembershipImport))
 
+	if o.interrupted() {
+		return nil, o.failInterrupted(StepImportMemberships,
+			fmt.Errorf("membership import %w; memberships are safe to re-apply, run the same command again to finish", ErrInterrupted))
+	}
+
 	// Fill result stats
 	result.MembersAdded = teamStats.MembersAdded + channelStats.MembersAdded
 	result.MembersSkipped = teamStats.MembersSkipped + channelStats.MembersSkipped
@@ -1119,6 +1184,11 @@ func (o *Orchestrator) LeaveRooms(progress ProgressCallback) (*OperationResult, 
 		o.state.FailStep(StepLeaveRooms, err)
 		o.SaveState()
 		return nil, fmt.Errorf("failed to leave rooms: %w", err)
+	}
+
+	if o.interrupted() {
+		return nil, o.failInterrupted(StepLeaveRooms,
+			fmt.Errorf("leaving rooms %w; run the same command again to finish", ErrInterrupted))
 	}
 
 	result.RoomsLeft = stats.RoomsLeft
@@ -1231,6 +1301,11 @@ func (o *Orchestrator) EnableEmailNotifications(progress ProgressCallback) (*Ope
 		o.state.FailStep(StepEnableNotifications, err)
 		o.SaveState()
 		return nil, err
+	}
+
+	if o.interrupted() {
+		return nil, o.failInterrupted(StepEnableNotifications,
+			fmt.Errorf("enabling email notifications %w; run the same command again to finish", ErrInterrupted))
 	}
 
 	result.UsersCreated = stats.UsersCreated
@@ -1638,8 +1713,9 @@ func (o *Orchestrator) ImportMessages(progress matrix.MessageImportCallback) (*I
 		msgMapping.AddReaction(key, eventID)
 	}
 
-	if err := SaveMessageMapping(msgMapping, mappingFile); err != nil {
-		logger.Warn("Failed to save message mapping: %v", err)
+	mappingErr := SaveMessageMapping(msgMapping, mappingFile)
+	if mappingErr != nil {
+		logger.Warn("Failed to save message mapping: %v", mappingErr)
 	} else {
 		logger.Info("Message mapping saved to %s", mappingFile)
 	}
@@ -1661,6 +1737,15 @@ func (o *Orchestrator) ImportMessages(progress matrix.MessageImportCallback) (*I
 	if cleanup := importer.LeaveHistoryMemberships(); cleanup != nil && (cleanup.Left > 0 || cleanup.Kept > 0 || cleanup.Failed > 0) {
 		logger.Info("Membership cleanup: left=%d, kept_owners=%d, failed=%d",
 			cleanup.Left, cleanup.Kept, cleanup.Failed)
+	}
+
+	if o.interrupted() {
+		if mappingErr != nil {
+			return nil, o.failInterrupted(StepImportMessages,
+				fmt.Errorf("message import %w, and saving the message mapping failed (%v); a re-run resumes from the last checkpoint in %s, if one was written", ErrInterrupted, mappingErr, mappingFile))
+		}
+		return nil, o.failInterrupted(StepImportMessages,
+			fmt.Errorf("message import %w: progress saved to %s (%d messages); run the same command again to resume", ErrInterrupted, mappingFile, len(msgMapping.Messages)))
 	}
 
 	logger.Success("Message import completed successfully")
