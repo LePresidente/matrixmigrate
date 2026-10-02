@@ -1,7 +1,12 @@
 package matrix
 
 import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
+	"strings"
+	"sync"
 	"testing"
 
 	"github.com/aligundogdu/matrixmigrate/internal/mattermost"
@@ -274,5 +279,147 @@ func TestJoinedFromStateReadsMembership(t *testing.T) {
 	}
 	if len(joined) != 1 {
 		t.Fatalf("joinedFromState = %v, want only alice", joined)
+	}
+}
+
+const pinTestRoom = "!room:example.com"
+
+// pinWrite is one m.room.pinned_events PUT the fake homeserver received.
+type pinWrite struct {
+	asUser string // "" when the admin token wrote it
+	pinned []string
+}
+
+// fakePinServer is a homeserver that knows one room. It serves that room's state through the
+// Synapse admin API, accepts joins, and records pin writes — refusing them for the users
+// listed in refuse, and cutting the connection for the users listed in hangUp.
+type fakePinServer struct {
+	mu         sync.Mutex
+	state      []map[string]any
+	stateReads int
+	joins      int
+	writes     []pinWrite
+	attempts   []string // every pin write attempted, by sender ("" for the admin)
+	refuse     map[string]refusal
+	hangUp     map[string]bool
+}
+
+type refusal struct {
+	status  int
+	errcode string
+}
+
+const pinTestAdmin = "@matrix-admin:example.com"
+
+func newFakePinServer(t *testing.T, state []map[string]any) (*fakePinServer, *Client) {
+	t.Helper()
+	f := &fakePinServer{state: state, refuse: map[string]refusal{}, hangUp: map[string]bool{}}
+	srv := httptest.NewServer(http.HandlerFunc(f.serve))
+	t.Cleanup(srv.Close)
+	c := NewClient(srv.URL, "admin-token", "example.com")
+	c.rateLimit = 0
+	c.maxRetries = 0
+	return f, c
+}
+
+func (f *fakePinServer) serve(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	path := r.URL.Path
+
+	switch {
+	case path == "/_matrix/client/v3/account/whoami":
+		json.NewEncoder(w).Encode(map[string]any{"user_id": pinTestAdmin})
+
+	case strings.HasPrefix(path, "/_synapse/admin/v1/rooms/") && strings.HasSuffix(path, "/state"):
+		f.stateReads++
+		json.NewEncoder(w).Encode(map[string]any{"state": f.state})
+
+	case strings.HasPrefix(path, "/_synapse/admin/v1/rooms/"):
+		json.NewEncoder(w).Encode(map[string]any{})
+
+	case strings.HasPrefix(path, "/_synapse/admin/v1/join/") || strings.HasSuffix(path, "/join"):
+		f.joins++
+		json.NewEncoder(w).Encode(map[string]any{"room_id": pinTestRoom})
+
+	case strings.HasSuffix(path, "/state/"+EventTypePinnedEvents) && r.Method == http.MethodPut:
+		sender := r.URL.Query().Get("user_id")
+		f.attempts = append(f.attempts, sender)
+		if f.hangUp[sender] {
+			conn, _, _ := w.(http.Hijacker).Hijack()
+			conn.Close()
+			return
+		}
+		if ref, ok := f.refuse[sender]; ok {
+			w.WriteHeader(ref.status)
+			json.NewEncoder(w).Encode(map[string]any{"errcode": ref.errcode, "error": "refused"})
+			return
+		}
+		var content PinnedEventsContent
+		json.NewDecoder(r.Body).Decode(&content)
+		f.writes = append(f.writes, pinWrite{asUser: sender, pinned: content.Pinned})
+		w.Write([]byte(`{"event_id":"$pin"}`))
+
+	case strings.Contains(path, "/state/"):
+		// A client-side state read: answer from the same state the admin API serves.
+		eventType := path[strings.LastIndex(path, "/state/")+len("/state/"):]
+		for _, event := range f.state {
+			if event["type"] == eventType {
+				json.NewEncoder(w).Encode(event["content"])
+				return
+			}
+		}
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(map[string]any{"errcode": "M_NOT_FOUND", "error": "no such state"})
+
+	default:
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(map[string]any{"errcode": "M_UNRECOGNIZED", "error": path})
+	}
+}
+
+func TestPinAsCandidatesMovesPastRefusedCandidates(t *testing.T) {
+	// A locked account answers 401 M_USER_LOCKED, a member without power 403 M_FORBIDDEN.
+	// Both are the homeserver saying "not this one", and the next candidate may well succeed.
+	f, c := newFakePinServer(t, nil)
+	c.SetASToken("as-token")
+	f.refuse["@alice:example.com"] = refusal{http.StatusUnauthorized, "M_USER_LOCKED"}
+	f.refuse["@bob_dev:example.com"] = refusal{http.StatusForbidden, "M_FORBIDDEN"}
+
+	err := c.pinAsCandidates(pinTestRoom, []string{"$a"},
+		[]string{"@alice:example.com", "@bob_dev:example.com", "@carol:example.com"})
+	if err != nil {
+		t.Fatalf("pinAsCandidates returned %v, want success as carol", err)
+	}
+	if len(f.writes) != 1 || f.writes[0].asUser != "@carol:example.com" {
+		t.Fatalf("writes = %+v, want one write as carol", f.writes)
+	}
+}
+
+func TestPinAsCandidatesReturnsTheLastRefusalWhenEveryoneIsRefused(t *testing.T) {
+	f, c := newFakePinServer(t, nil)
+	c.SetASToken("as-token")
+	f.refuse["@alice:example.com"] = refusal{http.StatusForbidden, "M_FORBIDDEN"}
+	f.refuse["@bob_dev:example.com"] = refusal{http.StatusUnauthorized, "M_USER_LOCKED"}
+
+	err := c.pinAsCandidates(pinTestRoom, []string{"$a"}, []string{"@alice:example.com", "@bob_dev:example.com"})
+	if err == nil || !strings.Contains(err.Error(), "M_USER_LOCKED") {
+		t.Fatalf("pinAsCandidates returned %v, want the last refusal (M_USER_LOCKED)", err)
+	}
+}
+
+func TestPinAsCandidatesStopsOnATransportFailure(t *testing.T) {
+	// A connection that dies is not an answer about alice; it says the homeserver is not
+	// reachable, and trying everyone else against it would only repeat the failure.
+	f, c := newFakePinServer(t, nil)
+	c.SetASToken("as-token")
+	f.hangUp["@alice:example.com"] = true
+
+	err := c.pinAsCandidates(pinTestRoom, []string{"$a"}, []string{"@alice:example.com", "@bob_dev:example.com"})
+	if err == nil {
+		t.Fatal("pinAsCandidates succeeded, want the transport error")
+	}
+	if want := []string{"@alice:example.com"}; !reflect.DeepEqual(f.attempts, want) {
+		t.Fatalf("attempts = %v, want %v (bob_dev must not be tried)", f.attempts, want)
 	}
 }

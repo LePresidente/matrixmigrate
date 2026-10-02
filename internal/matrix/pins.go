@@ -2,6 +2,7 @@ package matrix
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -108,21 +109,30 @@ func (c *Client) PinEvents(roomID string, eventIDs []string) error {
 		return fmt.Errorf("admin lacks power to pin in %s and no joined local member has power level %d: %w", roomID, required, err)
 	}
 
-	// Power outlives membership: a room's power_levels keeps its entry for someone who has
-	// left, and the migration bot is usually the highest-powered name in it long after
-	// leave-rooms withdrew it. Walking the list beats trusting the first name on it.
+	logger.Debug("PinEvents: room=%s needs power %d; candidates %v", roomID, required, candidates)
+	return c.pinAsCandidates(roomID, eventIDs, candidates)
+}
+
+// pinAsCandidates writes the pin list through the Application Service as each candidate in
+// turn, stopping at the first that succeeds. A refusal moves on to the next candidate; a
+// transport failure ends the walk. When every candidate is refused the last refusal is
+// returned.
+//
+// Power outlives membership: a room's power_levels keeps its entry for someone who has
+// left, and the migration bot is usually the highest-powered name in it long after
+// leave-rooms withdrew it. Walking the list beats trusting the first name on it.
+func (c *Client) pinAsCandidates(roomID string, eventIDs, candidates []string) error {
 	var lastErr error
 	for _, sender := range candidates {
-		logger.Debug("PinEvents: pinning in room=%s as %s (needs power %d)", roomID, sender, required)
 		asErr := c.setPinnedEventsAsUser(roomID, eventIDs, sender)
 		if asErr == nil {
 			return nil
 		}
 		lastErr = asErr
-		if !strings.Contains(asErr.Error(), "M_FORBIDDEN") {
+		if !isPinRefusal(asErr) {
 			return asErr
 		}
-		logger.Debug("PinEvents: %s could not pin in room=%s (%v); trying the next candidate", sender, roomID, asErr)
+		logger.Debug("pinAsCandidates: %s could not pin in room=%s (%v); trying the next candidate", sender, roomID, asErr)
 	}
 	return lastErr
 }
@@ -321,9 +331,30 @@ func (c *Client) putPinnedEvents(endpoint string, eventIDs []string, token strin
 	if statusCode != http.StatusOK {
 		var resp GenericResponse
 		json.Unmarshal(body, &resp)
-		return fmt.Errorf("API error (%d): %s - %s", statusCode, resp.Errcode, resp.Error)
+		return &pinRefusal{status: statusCode, errcode: resp.Errcode, message: resp.Error}
 	}
 	return nil
+}
+
+// pinRefusal is the homeserver answering a pin write with an error response: a locked or
+// deactivated account, a sender without the power, a room it will not touch. It is an answer
+// about that sender in that room, unlike a transport failure, which says nothing about the
+// sender and everything about whether the next request will get through.
+type pinRefusal struct {
+	status  int
+	errcode string
+	message string
+}
+
+func (e *pinRefusal) Error() string {
+	return fmt.Sprintf("API error (%d): %s - %s", e.status, e.errcode, e.message)
+}
+
+// isPinRefusal reports whether err is the homeserver refusing a pin write, as opposed to the
+// request failing to get an answer at all.
+func isPinRefusal(err error) bool {
+	var refusal *pinRefusal
+	return errors.As(err, &refusal)
 }
 
 // requiredPinPowerLevel reports the power level needed to send m.room.pinned_events.
