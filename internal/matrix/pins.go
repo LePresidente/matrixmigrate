@@ -110,8 +110,8 @@ func (c *Client) PinEvents(roomID string, eventIDs []string) error {
 }
 
 // pinAsCandidates writes the pin list through the Application Service as each candidate in
-// turn, stopping at the first that succeeds. A refusal moves on to the next candidate; a
-// transport failure ends the walk. When every candidate is refused the last refusal is
+// turn, stopping at the first that succeeds. A refusal (4xx) moves on to the next candidate; a
+// transport failure or a 5xx ends the walk. When every candidate is refused the last refusal is
 // returned.
 //
 // Power outlives membership: a room's power_levels keeps its entry for someone who has
@@ -484,15 +484,20 @@ func (c *Client) putPinnedEvents(endpoint string, eventIDs []string, token strin
 	if statusCode != http.StatusOK {
 		var resp GenericResponse
 		json.Unmarshal(body, &resp)
+		if statusCode >= http.StatusInternalServerError {
+			// A 5xx, often a proxy in front of an unreachable homeserver, says nothing about
+			// the sender: it is handled like a transport failure, not a refusal.
+			return fmt.Errorf("API error (%d): %s - %s", statusCode, resp.Errcode, resp.Error)
+		}
 		return &pinRefusal{status: statusCode, errcode: resp.Errcode, message: resp.Error}
 	}
 	return nil
 }
 
-// pinRefusal is the homeserver answering a pin write with an error response: a locked or
-// deactivated account, a sender without the power, a room it will not touch. It is an answer
-// about that sender in that room, unlike a transport failure, which says nothing about the
-// sender and everything about whether the next request will get through.
+// pinRefusal is the homeserver answering a pin write with a 4xx: a locked or deactivated
+// account, a sender without the power, a room it will not touch. It is an answer about that
+// sender in that room, unlike a transport failure or a 5xx, which say nothing about the sender
+// and everything about whether the next request will get through.
 type pinRefusal struct {
 	status  int
 	errcode string

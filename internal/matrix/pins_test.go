@@ -652,3 +652,45 @@ func TestImportPinsDoesNotRejoinAnAdminThatWasRefusedInTheRoom(t *testing.T) {
 		t.Fatalf("joins = %d, attempts = %q; want no join and a single admin write", f.joins, f.attempts)
 	}
 }
+
+func TestImportPinsTreatsA5xxAsAnOutageNotARefusal(t *testing.T) {
+	// A 502 from a proxy says nothing about alice. Trying everyone else, then joining the
+	// admin, would act on an outage as if it were an answer.
+	state := pinRoomState("@alice:example.com",
+		map[string]any{"users_default": 50, "users": map[string]any{"@alice:example.com": 100}},
+		[]string{"@alice:example.com", "@bob_dev:example.com"}, nil)
+	f, c := newFakePinServer(t, state)
+	c.SetASToken("as-token")
+	f.refuse["@alice:example.com"] = refusal{http.StatusBadGateway, ""}
+
+	result := runPinPass(c)
+
+	if result.Stats.PinsFailed != 1 || result.Stats.PinnedRoomsUpdated != 0 {
+		t.Fatalf("stats = %+v, want the room counted as failed", result.Stats)
+	}
+	if want := []string{"@alice:example.com"}; !reflect.DeepEqual(f.attempts, want) {
+		t.Fatalf("attempts = %q, want %q (nobody after the 502)", f.attempts, want)
+	}
+	if f.joins != 0 {
+		t.Fatalf("the admin was joined %d time(s) during an outage, want none", f.joins)
+	}
+}
+
+func TestImportPinsTreatsAnAdmin5xxAsAnOutage(t *testing.T) {
+	state := pinRoomState(pinTestAdmin,
+		map[string]any{"users": map[string]any{pinTestAdmin: 100, "@alice:example.com": 100}},
+		[]string{pinTestAdmin, "@alice:example.com"}, nil)
+	f, c := newFakePinServer(t, state)
+	c.SetASToken("as-token")
+	f.refuse[""] = refusal{http.StatusServiceUnavailable, ""}
+
+	result := runPinPass(c)
+
+	if result.Stats.PinsFailed != 1 {
+		t.Fatalf("stats = %+v, want the room counted as failed", result.Stats)
+	}
+	if f.joins != 0 || len(f.attempts) != 1 {
+		t.Fatalf("joins = %d, attempts = %q; want no join and only the admin's write", f.joins, f.attempts)
+	}
+}
+
