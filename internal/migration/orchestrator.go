@@ -25,7 +25,12 @@ type Orchestrator struct {
 	mmClient  *mattermost.Client
 	mxClient  *matrix.Client
 	masClient *matrix.MASClient // set only when MAS is enabled
-	mxToken   string            // Matrix access token (from login or config)
+
+	// mxToken is the access token of a session this tool opened with a username/password
+	// login, and mxLoginBaseURL the API address the login used. Close revokes it. Both stay
+	// empty when the token is the configured admin token.
+	mxToken        string
+	mxLoginBaseURL string
 
 	// forceMembershipReplay re-applies channel/team memberships even when the step already
 	// completed, so members who joined after the first run get added on a later run.
@@ -68,12 +73,6 @@ func (o *Orchestrator) failInterrupted(step StepName, err error) error {
 	return err
 }
 
-// SetForceMembershipReplay controls whether a completed membership step is re-applied on
-// re-run (to pick up members added since the first run). Force-join is idempotent.
-func (o *Orchestrator) SetForceMembershipReplay(force bool) {
-	o.forceMembershipReplay = force
-}
-
 // NewOrchestrator creates a new migration orchestrator
 func NewOrchestrator(cfg *config.Config) (*Orchestrator, error) {
 	// Initialize logger
@@ -99,13 +98,67 @@ func NewOrchestrator(cfg *config.Config) (*Orchestrator, error) {
 	}, nil
 }
 
-// Close closes all connections
+// Close ends the session: it logs out a Matrix session this tool opened with a password
+// login, then closes the database connection and every SSH tunnel. Calling it again is safe.
 func (o *Orchestrator) Close() error {
-	logger.Close()
+	// The logout has to go out before the tunnel it may travel through is closed.
+	o.endLoginSession()
 	if o.mmClient != nil {
 		o.mmClient.Close()
+		o.mmClient = nil
 	}
-	return o.tunnelManager.CloseAll()
+	o.mxClient = nil
+	err := o.tunnelManager.CloseAll()
+	logger.Close()
+	return err
+}
+
+// SetForceMembershipReplay controls whether a completed membership step is re-applied on
+// re-run (to pick up members added since the first run). Force-join is idempotent.
+func (o *Orchestrator) SetForceMembershipReplay(force bool) {
+	o.forceMembershipReplay = force
+}
+
+// setLoginSession records a session opened by a password login so Close can revoke it.
+func (o *Orchestrator) setLoginSession(baseURL, token string) {
+	o.mxLoginBaseURL = baseURL
+	o.mxToken = token
+}
+
+// endLoginSession revokes the session recorded by setLoginSession, if any. A failure is
+// logged, not returned: the session expires on its own and nothing else depends on it.
+func (o *Orchestrator) endLoginSession() {
+	if o.mxToken == "" {
+		return
+	}
+	if err := matrix.Logout(o.mxLoginBaseURL, o.mxToken); err != nil {
+		logger.Warn("Could not log out the Matrix session: %v", err)
+	} else {
+		logger.Info("Logged out the Matrix session")
+	}
+	o.mxToken = ""
+	o.mxLoginBaseURL = ""
+}
+
+// connectionState is what a Connect call finds already in place.
+type connectionState int
+
+const (
+	connAbsent connectionState = iota // no client: connect from scratch
+	connLive                          // a client that still answers: reuse it
+	connStale                         // a client that no longer answers: discard and reconnect
+)
+
+// classifyConnection decides what to do with an existing client. ping is called only when
+// there is a client.
+func classifyConnection(hasClient bool, ping func() error) connectionState {
+	if !hasClient {
+		return connAbsent
+	}
+	if err := ping(); err != nil {
+		return connStale
+	}
+	return connLive
 }
 
 // waitForTunnel waits for the SSH tunnel to be ready by making HTTP requests
@@ -201,8 +254,19 @@ func (o *Orchestrator) newImporter() *matrix.Importer {
 	return importer
 }
 
-// ConnectMattermost establishes connection to Mattermost
+// ConnectMattermost establishes connection to Mattermost. It is idempotent: a connection
+// that still answers is kept, and one that does not is closed, with its tunnel, and replaced.
 func (o *Orchestrator) ConnectMattermost() error {
+	switch classifyConnection(o.mmClient != nil, func() error { return o.mmClient.Ping() }) {
+	case connLive:
+		return nil
+	case connStale:
+		logger.Warn("Mattermost database connection no longer answers; reconnecting")
+		o.mmClient.Close()
+		o.mmClient = nil
+		o.tunnelManager.CloseTunnel("mattermost")
+	}
+
 	cfg := o.config.Mattermost
 	passphrase := o.config.GetSSHKeyPassphrase("mattermost")
 	sshPassword := o.config.GetSSHPassword("mattermost")
@@ -307,8 +371,14 @@ func (o *Orchestrator) ConnectMattermost() error {
 	return nil
 }
 
-// ConnectMatrix establishes connection to Matrix
-func (o *Orchestrator) ConnectMatrix() error {
+// ConnectMatrix establishes connection to Matrix. It is idempotent: once a client is set,
+// later calls return at once rather than open another tunnel, log in again or re-verify. A
+// call that fails part-way closes the tunnel it opened and revokes a session it logged in.
+func (o *Orchestrator) ConnectMatrix() (err error) {
+	if o.mxClient != nil {
+		return nil
+	}
+
 	cfg := o.config.Matrix
 
 	// Direct mode: no ssh.host means the Matrix API is reachable from here, so talk to
@@ -317,6 +387,19 @@ func (o *Orchestrator) ConnectMatrix() error {
 	direct := cfg.SSH.Host == ""
 
 	var baseURL string
+
+	// A connect that fails part-way leaves nothing behind: the session it logged in is
+	// revoked while the tunnel it travels through is still open, then the tunnel is closed.
+	defer func() {
+		if err == nil {
+			return
+		}
+		o.endLoginSession()
+		o.masClient = nil
+		if !direct {
+			o.tunnelManager.CloseTunnel("matrix")
+		}
+	}()
 
 	if direct {
 		baseURL = o.config.MatrixAPIURL()
@@ -356,7 +439,6 @@ func (o *Orchestrator) ConnectMatrix() error {
 
 		// Verify tunnel is working by attempting a simple HTTP request
 		if err := o.waitForTunnel(baseURL, 5*time.Second); err != nil {
-			o.tunnelManager.CloseTunnel("matrix")
 			return fmt.Errorf("SSH tunnel to Matrix API is not responding on port %d: %w (is Synapse running and listening on port %d?)", remotePort, err, remotePort)
 		}
 	}
@@ -371,17 +453,15 @@ func (o *Orchestrator) ConnectMatrix() error {
 		// Login with username/password
 		password := o.config.GetMatrixPassword()
 		if password == "" {
-			o.tunnelManager.CloseTunnel("matrix")
 			return fmt.Errorf("Matrix password not found in environment variable %s", cfg.Auth.PasswordEnv)
 		}
 
 		loginResp, err := matrix.Login(baseURL, cfg.Auth.Username, password)
 		if err != nil {
-			o.tunnelManager.CloseTunnel("matrix")
 			return fmt.Errorf("failed to login to Matrix: %w", err)
 		}
 		accessToken = loginResp.AccessToken
-		o.mxToken = accessToken
+		o.setLoginSession(baseURL, accessToken)
 	}
 
 	// Create Matrix client with rate limiting from config
@@ -395,7 +475,6 @@ func (o *Orchestrator) ConnectMatrix() error {
 
 	// Test connection
 	if err := client.TestConnection(); err != nil {
-		o.tunnelManager.CloseTunnel("matrix")
 		return fmt.Errorf("failed to connect to Matrix API: %w", err)
 	}
 
@@ -414,7 +493,6 @@ func (o *Orchestrator) ConnectMatrix() error {
 		clientID := o.config.GetMASClientID()
 		clientSecret := o.config.GetMASClientSecret()
 		if clientID == "" || clientSecret == "" {
-			o.tunnelManager.CloseTunnel("matrix")
 			return fmt.Errorf("matrix.mas is enabled but %s and/or %s are not set",
 				o.config.Matrix.MAS.ClientIDEnv, o.config.Matrix.MAS.ClientSecretEnv)
 		}
@@ -441,7 +519,6 @@ func (o *Orchestrator) ConnectMatrix() error {
 	// creation degrades to the admin user, and a room's creator cannot be changed
 	// afterwards, so a partial run leaves permanently mis-owned rooms behind.
 	if err := o.verifyCredentials(client); err != nil {
-		o.tunnelManager.CloseTunnel("matrix")
 		return err
 	}
 
