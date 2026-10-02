@@ -5,6 +5,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 
@@ -48,19 +49,19 @@ func NewTunnel(cfg TunnelConfig) (*Tunnel, error) {
 		return nil, fmt.Errorf("failed to connect to SSH server: %w", err)
 	}
 
-	// Create local listener
-	localAddr := fmt.Sprintf("127.0.0.1:%d", cfg.LocalPort)
-	listener, err := net.Listen("tcp", localAddr)
+	// Create local listener. LocalPort 0 lets the kernel pick a free port while holding it,
+	// so nothing can take it between choosing and binding; LocalAddr reports the result.
+	listener, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", cfg.LocalPort))
 	if err != nil {
 		client.Close()
 		return nil, fmt.Errorf("failed to create local listener: %w", err)
 	}
 
-	remoteAddr := fmt.Sprintf("%s:%d", cfg.RemoteHost, cfg.RemotePort)
+	remoteAddr := net.JoinHostPort(cfg.RemoteHost, strconv.Itoa(cfg.RemotePort))
 
 	tunnel := &Tunnel{
 		client:     client,
-		localAddr:  localAddr,
+		localAddr:  listener.Addr().String(),
 		remoteAddr: remoteAddr,
 		listener:   listener,
 		done:       make(chan struct{}),
@@ -199,6 +200,11 @@ func (t *Tunnel) LocalAddr() string {
 	return t.localAddr
 }
 
+// LocalPort returns the local port the tunnel listens on
+func (t *Tunnel) LocalPort() int {
+	return t.listener.Addr().(*net.TCPAddr).Port
+}
+
 // RemoteAddr returns the remote address of the tunnel
 func (t *Tunnel) RemoteAddr() string {
 	return t.remoteAddr
@@ -222,13 +228,14 @@ func (t *Tunnel) Close() error {
 		t.listener.Close()
 	}
 
-	// Wait for all goroutines to finish
-	t.wg.Wait()
-
-	// Close SSH client
+	// Close the SSH client before waiting: it ends the forwarded connections, which would
+	// otherwise keep their goroutines alive for as long as the peers keep them open.
 	if t.client != nil {
 		t.client.Close()
 	}
+
+	// Wait for all goroutines to finish
+	t.wg.Wait()
 
 	return nil
 }
@@ -327,14 +334,4 @@ func (tm *TunnelManager) CloseAll() error {
 	}
 
 	return lastErr
-}
-
-// GetLocalPort returns an available local port
-func GetLocalPort() (int, error) {
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return 0, err
-	}
-	defer listener.Close()
-	return listener.Addr().(*net.TCPAddr).Port, nil
 }

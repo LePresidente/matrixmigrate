@@ -263,28 +263,23 @@ func (o *Orchestrator) ConnectMattermost() error {
 	if direct {
 		logger.Info("Connecting directly to Mattermost database at %s:%d", dbHost, dbPort)
 	} else {
-		// Get an available local port for the tunnel
-		localPort, err := ssh.GetLocalPort()
-		if err != nil {
-			return fmt.Errorf("failed to get local port: %w", err)
-		}
-
-		// Create SSH tunnel to database
+		// Create SSH tunnel to database. LocalPort 0 lets the tunnel bind a free port itself;
+		// the address comes from the tunnel returned, which may be an existing one.
 		tunnelCfg := ssh.TunnelConfig{
 			SSHConfig:  cfg.SSH,
-			LocalPort:  localPort,
+			LocalPort:  0,
 			RemoteHost: dbHost,
 			RemotePort: dbPort,
 			Passphrase: passphrase,
 			Password:   sshPassword,
 		}
 
-		_, err = o.tunnelManager.CreateTunnel("mattermost", tunnelCfg)
+		tunnel, err := o.tunnelManager.CreateTunnel("mattermost", tunnelCfg)
 		if err != nil {
 			return fmt.Errorf("failed to create SSH tunnel: %w", err)
 		}
 
-		connHost, connPort = "127.0.0.1", localPort
+		connHost, connPort = "127.0.0.1", tunnel.LocalPort()
 	}
 
 	sslMode := config.ResolveDBSSLMode(cfg.Database.SSLMode, dbSSLMode, connHost)
@@ -330,37 +325,31 @@ func (o *Orchestrator) ConnectMatrix() error {
 		passphrase := o.config.GetSSHKeyPassphrase("matrix")
 		sshPassword := o.config.GetSSHPassword("matrix")
 
-		// Get an available local port for the tunnel
-		localPort, err := ssh.GetLocalPort()
-		if err != nil {
-			return fmt.Errorf("failed to get local port: %w", err)
-		}
-
 		// Get remote API port from config (default: 8008)
 		remotePort := cfg.API.Port
 		if remotePort == 0 {
 			remotePort = 8008
 		}
 
-		// Create SSH tunnel to Matrix API
+		// Create SSH tunnel to Matrix API. LocalPort 0 lets the tunnel bind a free port
+		// itself; the address comes from the tunnel returned, which may be an existing one.
 		tunnelCfg := ssh.TunnelConfig{
 			SSHConfig:  cfg.SSH,
-			LocalPort:  localPort,
+			LocalPort:  0,
 			RemoteHost: "127.0.0.1",
 			RemotePort: remotePort,
 			Passphrase: passphrase,
 			Password:   sshPassword,
 		}
 
-		logger.Info("Creating SSH tunnel to Matrix API (local:%d -> remote:127.0.0.1:%d)", localPort, remotePort)
-
-		_, err = o.tunnelManager.CreateTunnel("matrix", tunnelCfg)
+		tunnel, err := o.tunnelManager.CreateTunnel("matrix", tunnelCfg)
 		if err != nil {
 			return fmt.Errorf("failed to create SSH tunnel: %w", err)
 		}
+		logger.Info("SSH tunnel to Matrix API: %s -> remote:127.0.0.1:%d", tunnel.LocalAddr(), remotePort)
 
 		// Use local tunnel URL
-		baseURL = fmt.Sprintf("http://127.0.0.1:%d", localPort)
+		baseURL = "http://" + tunnel.LocalAddr()
 
 		// Wait a moment for the tunnel to be ready
 		time.Sleep(500 * time.Millisecond)

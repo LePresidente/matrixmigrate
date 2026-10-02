@@ -481,17 +481,6 @@ func runMatrixTests(cfg *config.Config, callback TestCallback) []TestStep {
 	var tunnel *ssh.Tunnel
 
 	if sshEnabled {
-		localPort, err := ssh.GetLocalPort()
-		if err != nil {
-			step.Status = TestFailed
-			step.Error = err.Error()
-			if callback != nil {
-				callback("matrix", &step)
-			}
-			steps = append(steps, step)
-			return steps
-		}
-
 		remotePort := cfg.Matrix.API.Port
 		if remotePort == 0 {
 			remotePort = 8008
@@ -499,7 +488,7 @@ func runMatrixTests(cfg *config.Config, callback TestCallback) []TestStep {
 
 		tunnelCfg := ssh.TunnelConfig{
 			SSHConfig:  cfg.Matrix.SSH,
-			LocalPort:  localPort,
+			LocalPort:  0, // bind a free port; the address comes from the tunnel
 			RemoteHost: "127.0.0.1",
 			RemotePort: remotePort,
 			Passphrase: passphrase,
@@ -517,7 +506,7 @@ func runMatrixTests(cfg *config.Config, callback TestCallback) []TestStep {
 			return steps
 		}
 		tunnel = t
-		baseURL = fmt.Sprintf("http://127.0.0.1:%d", localPort)
+		baseURL = "http://" + t.LocalAddr()
 	} else {
 		baseURL = cfg.MatrixAPIURL()
 	}
