@@ -255,12 +255,14 @@ func TestRetryWaitEndsWhenContextCancelled(t *testing.T) {
 	}
 }
 
-// After an interrupt the cleanup calls (leaving rooms, admin withdrawal) must still go out, so
-// a cancelled context cuts the rate-limit wait short instead of failing the request.
-func TestRateLimitWaitStillSendsWhenContextCancelled(t *testing.T) {
+// After an interrupt the cleanup calls (leaving rooms, admin withdrawal) must still go out,
+// and still be spaced by the rate limiter so they do not provoke 429s that can no longer be
+// retried.
+func TestRateLimitSpacingKeptWhenContextCancelled(t *testing.T) {
+	const interval = 100 * time.Millisecond
 	rc := &requestCounter{}
 	srv := newRequestCounter(t, rc)
-	c := NewClientWithRateLimit(srv.URL, "admin-token", "example.com", RateLimitConfig{RequestsPerSecond: 0.2})
+	c := NewClientWithRateLimit(srv.URL, "admin-token", "example.com", RateLimitConfig{RequestsPerSecond: 10})
 	c.SetContext(cancelledContext())
 
 	start := time.Now()
@@ -270,10 +272,13 @@ func TestRateLimitWaitStillSendsWhenContextCancelled(t *testing.T) {
 		}
 	}
 	// The counter answers {} with no content_uri, so the upload reports an error; what matters
-	// here is only that it was sent.
+	// here is only that it was sent, after its slot.
 	_, _ = c.UploadMedia([]byte("x"), "a.txt", "text/plain")
-	if elapsed := time.Since(start); elapsed > 2*time.Second {
-		t.Errorf("4 requests took %v; the rate-limit wait ignored the cancellation", elapsed)
+	elapsed := time.Since(start)
+
+	// The first request goes at once; the other three each wait for a slot.
+	if want := 3 * interval; elapsed < want-10*time.Millisecond {
+		t.Errorf("4 requests took %v, want at least %v: the rate-limit spacing was skipped", elapsed, want)
 	}
 	if total, _ := rc.counts(); total != 4 {
 		t.Errorf("server saw %d requests, want 4", total)

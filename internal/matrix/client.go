@@ -197,9 +197,10 @@ func NewClientWithRateLimit(baseURL, adminToken, homeserver string, rlConfig Rat
 // SetContext installs the context whose cancellation marks the run as interrupted. Call it
 // before issuing requests; without it the client never considers itself interrupted.
 //
-// Cancellation only shortens waits. A request waiting to retry gives up with the context's
-// error, and a request waiting for its rate-limit slot is sent at once - so the cleanup an
-// interrupted step still performs (leaving rooms, withdrawing memberships) keeps working.
+// Cancellation only ends retry waits: a request waiting to retry after a 429 or a transport
+// error gives up with the context's error. Every request is still sent once, after its normal
+// rate-limit spacing, so the cleanup an interrupted step still performs (leaving rooms,
+// withdrawing memberships) keeps working and stays throttled.
 func (c *Client) SetContext(ctx context.Context) {
 	c.ctx = ctx
 }
@@ -285,14 +286,15 @@ func (c *Client) interruptContext() context.Context {
 }
 
 // waitForRateLimitSlot blocks until the minimum gap since the previous request has passed.
-// An interrupt ends the wait at once and the request is still sent: the calls made after an
-// interrupt are the cleanup that has to happen anyway.
+// It ignores the interrupt context on purpose: the gap is short, and the cleanup calls made
+// after an interrupt (leaving rooms, withdrawing memberships) must stay throttled so they do
+// not provoke 429s that could no longer be retried.
 func (c *Client) waitForRateLimitSlot() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.rateLimit > 0 {
 		if wait := c.rateLimit - time.Since(c.lastRequest); wait > 0 {
-			_ = sleepUnlessDone(c.interruptContext(), wait)
+			time.Sleep(wait)
 		}
 	}
 	c.lastRequest = time.Now()
