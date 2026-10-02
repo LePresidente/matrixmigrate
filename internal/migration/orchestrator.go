@@ -164,6 +164,9 @@ type OperationResult struct {
 	RoomsFailed   int
 	RoomsLinked   int
 
+	// RoomsLinkFailed counts rooms that could not be added to their parent space.
+	RoomsLinkFailed int
+
 	// Membership stats
 	TeamMembershipsExported    int
 	ChannelMembershipsExported int
@@ -584,6 +587,45 @@ func (o *Orchestrator) ExportAssets(progress ProgressCallback) (*OperationResult
 	return result, o.SaveState()
 }
 
+// loadExistingAssetMappings returns the union of the mapping file recorded in state (may be
+// empty) and the newest asset-mapping file in dir, the newer one winning on conflict. It
+// returns nil when neither can be loaded.
+func loadExistingAssetMappings(recordedFile, dir string) *matrix.ExistingMappings {
+	var sources []*Mapping
+	recorded := ""
+	if recordedFile != "" {
+		if m, err := LoadMapping(recordedFile); err == nil {
+			sources = append(sources, m)
+			recorded = recordedFile
+		}
+	}
+	if latest, _ := GetLatestMappingFile(dir); latest != "" && latest != recorded {
+		if m, err := LoadMapping(latest); err == nil {
+			sources = append(sources, m)
+		}
+	}
+	if len(sources) == 0 {
+		return nil
+	}
+	out := &matrix.ExistingMappings{
+		Users:  make(map[string]string),
+		Spaces: make(map[string]string),
+		Rooms:  make(map[string]string),
+	}
+	for _, m := range sources {
+		for k, v := range m.Users {
+			out.Users[k] = v
+		}
+		for k, v := range m.Teams {
+			out.Spaces[k] = v
+		}
+		for k, v := range m.Channels {
+			out.Rooms[k] = v
+		}
+	}
+	return out
+}
+
 // ImportAssets imports assets to Matrix
 func (o *Orchestrator) ImportAssets(progress ProgressCallback) (*OperationResult, error) {
 	result := &OperationResult{}
@@ -629,33 +671,21 @@ func (o *Orchestrator) ImportAssets(progress ProgressCallback) (*OperationResult
 		}
 	}
 
-	// Try to load existing mapping to skip already imported items
-	var existingMappings *matrix.ExistingMappings
-	existingMappingFile := o.state.GetStepOutputFile(StepImportAssets)
-	if existingMappingFile != "" {
-		existingMapping, err := LoadMapping(existingMappingFile)
-		if err == nil {
-			existingMappings = &matrix.ExistingMappings{
-				Users:  existingMapping.Users,
-				Spaces: existingMapping.Teams,
-				Rooms:  existingMapping.Channels,
-			}
-		}
-	}
+	// Existing mappings let a re-run skip what was already created: the union of the file the
+	// last completed run recorded and the newest mapping on disk, which may be a checkpoint
+	// from an interrupted run that never reached the state file.
+	existingMappings := loadExistingAssetMappings(o.state.GetStepOutputFile(StepImportAssets), o.config.Data.MappingsDir)
 
-	// Also check for latest mapping file in mappings directory
-	if existingMappings == nil {
-		latestMapping, _ := GetLatestMappingFile(o.config.Data.MappingsDir)
-		if latestMapping != "" {
-			existingMapping, err := LoadMapping(latestMapping)
-			if err == nil {
-				existingMappings = &matrix.ExistingMappings{
-					Users:  existingMapping.Users,
-					Spaces: existingMapping.Teams,
-					Rooms:  existingMapping.Channels,
-				}
-			}
-		}
+	// One file name for the whole run: the checkpoints and the final save all write it, so a
+	// crash leaves the latest state in the newest asset-mapping file.
+	mappingFile := GenerateMappingFilename(o.config.Data.MappingsDir)
+	homeserver := o.mxClient.GetHomeserver()
+	saveAssetMapping := func(users, spaces, rooms map[string]string) error {
+		m := NewMapping(homeserver)
+		m.MergeUsers(users)
+		m.MergeTeams(spaces)
+		m.MergeChannels(rooms)
+		return SaveMapping(m, mappingFile)
 	}
 
 	// Build room import options from config.
@@ -718,6 +748,12 @@ func (o *Orchestrator) ImportAssets(progress ProgressCallback) (*OperationResult
 	default:
 		logger.Info("User import: generating a random %d-character password per user", o.config.GetUserPasswordLength())
 	}
+
+	importer.SetAssetCheckpoint(func(users, spaces, rooms map[string]string) {
+		if err := saveAssetMapping(users, spaces, rooms); err != nil {
+			logger.Warn("Could not checkpoint the asset mapping to %s: %v", mappingFile, err)
+		}
+	})
 
 	// Import callback
 	var importProgress matrix.ImportProgressCallback
@@ -785,15 +821,9 @@ func (o *Orchestrator) ImportAssets(progress ProgressCallback) (*OperationResult
 	result.RoomsSkipped = importResult.Stats.RoomsSkipped
 	result.RoomsFailed = importResult.Stats.RoomsFailed
 
-	// Create mapping
-	mapping := NewMapping(o.config.Matrix.Homeserver)
-	mapping.MergeUsers(importResult.UserMapping)
-	mapping.MergeTeams(importResult.SpaceMapping)
-	mapping.MergeChannels(importResult.RoomMapping)
-
-	// Save mapping
-	mappingFile := GenerateMappingFilename(o.config.Data.MappingsDir)
-	if err := SaveMapping(mapping, mappingFile); err != nil {
+	// Save mapping (the same file the checkpoints wrote). It records the homeserver the client
+	// actually talked to, which may differ from the configured one after detection.
+	if err := saveAssetMapping(importResult.UserMapping, importResult.SpaceMapping, importResult.RoomMapping); err != nil {
 		if o.interrupted() {
 			return nil, o.failInterrupted(StepImportAssets,
 				fmt.Errorf("asset import %w, and saving what was created so far failed: %v", ErrInterrupted, err))
@@ -830,6 +860,10 @@ func (o *Orchestrator) ImportAssets(progress ProgressCallback) (*OperationResult
 	linkResult, err := importer.LinkRoomsToSpaces(assets.Channels, importResult.SpaceMapping, importResult.RoomMapping, importResult.UserMapping, defaultSpaceOwnerID, o.config.GetPublicRoomJoinRules(), importProgress)
 	if err == nil && linkResult != nil {
 		result.RoomsLinked = linkResult.RoomsLinked
+		result.RoomsLinkFailed = linkResult.RoomsLinkFailed
+		if linkResult.RoomsLinkFailed > 0 {
+			logger.Warn("Import assets: %d rooms could not be linked to their space; re-run import assets to retry them", linkResult.RoomsLinkFailed)
+		}
 	}
 	if o.interrupted() {
 		return nil, interruptedAfterSave()

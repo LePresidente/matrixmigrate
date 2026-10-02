@@ -189,8 +189,8 @@ func runImportAssets(cmd *cobra.Command, args []string) error {
 		result.UsersCreated, result.UsersSkipped, result.UsersFailed))
 	printInfo(fmt.Sprintf("  Spaces: created=%d, skipped=%d, failed=%d",
 		result.SpacesCreated, result.SpacesSkipped, result.SpacesFailed))
-	printInfo(fmt.Sprintf("  Rooms: created=%d, skipped=%d, failed=%d, linked=%d",
-		result.RoomsCreated, result.RoomsSkipped, result.RoomsFailed, result.RoomsLinked))
+	printInfo(fmt.Sprintf("  Rooms: created=%d, skipped=%d, failed=%d, linked=%d, link_failed=%d",
+		result.RoomsCreated, result.RoomsSkipped, result.RoomsFailed, result.RoomsLinked, result.RoomsLinkFailed))
 	printSuccess(i18n.T("messages.step_completed", "import_assets"))
 
 	return nil
