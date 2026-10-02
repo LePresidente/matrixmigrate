@@ -304,37 +304,65 @@ func postColumns(hasIsPinned bool) string {
 			` + pinned
 }
 
-// inspectPosts reports which optional columns the posts table offers.
+// relationColumnsQuery lists the live columns of the relation a table name resolves to, the
+// way an unqualified FROM in this session would resolve it. Filtering information_schema on
+// current_schema() is not the same thing: a name can resolve through a later schema on the
+// search path, and a same-named table elsewhere must not be mistaken for it.
 //
-// The schema filter matters: without it a same-named table in another schema would be mistaken
-// for this one, and the query could then reference a column the table on the search path lacks.
-func (c *Client) inspectPosts() (postsSchema, error) {
-	var schema postsSchema
+// The LEFT JOIN keeps one row even when the name resolves to nothing, so "no such table" and
+// "a table with these columns" come back from the same query. to_regclass exists from
+// PostgreSQL 9.4 and returns NULL rather than failing for a name that does not resolve.
+//
+// This is the only place the probe's SQL lives; it cannot be unit-tested without a database.
+const relationColumnsQuery = `
+	SELECT r.oid IS NOT NULL, a.attname
+	FROM (SELECT to_regclass($1) AS oid) r
+	LEFT JOIN pg_attribute a
+		ON a.attrelid = r.oid AND a.attnum > 0 AND NOT a.attisdropped
+`
 
-	rows, err := c.db.Query(`
-		SELECT column_name FROM information_schema.columns
-		WHERE table_schema = current_schema() AND table_name = 'posts'
-	`)
+// relationColumns reports whether name resolves to a relation and, if it does, which columns
+// it has.
+func (c *Client) relationColumns(name string) (map[string]bool, bool, error) {
+	rows, err := c.db.Query(relationColumnsQuery, name)
 	if err != nil {
-		return schema, fmt.Errorf("failed to inspect posts table: %w", err)
+		return nil, false, fmt.Errorf("failed to inspect %s table: %w", name, err)
 	}
 	defer rows.Close()
 
+	columns := make(map[string]bool)
+	resolved := false
 	for rows.Next() {
-		var column string
-		if err := rows.Scan(&column); err != nil {
-			return schema, fmt.Errorf("failed to scan posts column name: %w", err)
+		var column sql.NullString
+		if err := rows.Scan(&resolved, &column); err != nil {
+			return nil, false, fmt.Errorf("failed to scan %s column name: %w", name, err)
 		}
-		if column == "ispinned" {
-			schema.hasIsPinned = true
+		if column.Valid {
+			columns[column.String] = true
 		}
 	}
-
 	if err := rows.Err(); err != nil {
-		return schema, fmt.Errorf("error iterating posts columns: %w", err)
+		return nil, false, fmt.Errorf("error iterating %s columns: %w", name, err)
 	}
+	return columns, resolved, nil
+}
 
-	return schema, nil
+// inspectPosts reports which optional columns the posts table offers.
+func (c *Client) inspectPosts() (postsSchema, error) {
+	columns, resolved, err := c.relationColumns("posts")
+	if err != nil {
+		return postsSchema{}, err
+	}
+	return postsSchemaFromColumns(columns, resolved)
+}
+
+// postsSchemaFromColumns turns the probe's answer into a postsSchema. A posts table that does
+// not resolve is an error: there is nothing to export from.
+func postsSchemaFromColumns(columns map[string]bool, resolved bool) (postsSchema, error) {
+	if !resolved {
+		return postsSchema{}, fmt.Errorf("posts table not found on the search path")
+	}
+	return postsSchema{hasIsPinned: columns["ispinned"]}, nil
 }
 
 // GetPosts retrieves all posts from the database (excluding deleted and system messages)
@@ -590,38 +618,21 @@ type reactionsSchema struct {
 }
 
 // inspectReactions reports what the reactions table offers on this server.
-//
-// The schema filter matters: without it a same-named table in another schema would be
-// mistaken for this one, and the resulting query could then reference columns that the table
-// actually on the search path does not have.
 func (c *Client) inspectReactions() (reactionsSchema, error) {
-	var schema reactionsSchema
-
-	rows, err := c.db.Query(`
-		SELECT column_name FROM information_schema.columns
-		WHERE table_schema = current_schema() AND table_name = 'reactions'
-	`)
+	columns, resolved, err := c.relationColumns("reactions")
 	if err != nil {
-		return schema, fmt.Errorf("failed to inspect reactions table: %w", err)
+		return reactionsSchema{}, err
 	}
-	defer rows.Close()
+	return reactionsSchemaFromColumns(columns, resolved), nil
+}
 
-	for rows.Next() {
-		var column string
-		if err := rows.Scan(&column); err != nil {
-			return schema, fmt.Errorf("failed to scan reactions column name: %w", err)
-		}
-		schema.exists = true
-		if column == "deleteat" {
-			schema.hasDeleteAt = true
-		}
+// reactionsSchemaFromColumns turns the probe's answer into a reactionsSchema. A reactions
+// table that does not resolve means an installation without reactions, not an error.
+func reactionsSchemaFromColumns(columns map[string]bool, resolved bool) reactionsSchema {
+	if !resolved {
+		return reactionsSchema{}
 	}
-
-	if err := rows.Err(); err != nil {
-		return schema, fmt.Errorf("error iterating reactions columns: %w", err)
-	}
-
-	return schema, nil
+	return reactionsSchema{exists: true, hasDeleteAt: columns["deleteat"]}
 }
 
 // GetReactions retrieves all emoji reactions on posts.
