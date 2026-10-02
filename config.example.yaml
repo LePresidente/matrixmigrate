@@ -345,60 +345,60 @@ data:
 # ------------------------------------
 # mattermost:
 #   ssh:
-#     host: "mm.company.com"
+#     host: "mattermost.example.com"
 #     user: "admin"
 #     key_path: "~/.ssh/id_rsa"
 #   config_path: "/opt/mattermost/config/config.json"
 #
 # matrix:
 #   ssh:
-#     host: "matrix.company.com"
+#     host: "matrix.example.com"
 #     user: "admin"
 #     key_path: "~/.ssh/id_rsa"
 #   auth:
 #     username: "admin"
 #     password_env: "MATRIX_ADMIN_PASSWORD"
-#   homeserver: "company.com"
+#   homeserver: "example.com"
 
 
 # Example 2: Mattermost with root password, Matrix with key
 # ---------------------------------------------------------
 # mattermost:
 #   ssh:
-#     host: "mm.company.com"
+#     host: "mattermost.example.com"
 #     user: "root"
 #     password_env: "MM_SSH_PASSWORD"  # export MM_SSH_PASSWORD="rootpass"
 #   config_path: "/opt/mattermost/config/config.json"
 #
 # matrix:
 #   ssh:
-#     host: "matrix.company.com"
+#     host: "matrix.example.com"
 #     user: "admin"
 #     key_path: "~/.ssh/id_rsa"
 #   auth:
 #     username: "admin"
 #     password_env: "MATRIX_ADMIN_PASSWORD"
-#   homeserver: "company.com"
+#   homeserver: "example.com"
 
 
 # Example 3: Both with password auth
 # ----------------------------------
 # mattermost:
 #   ssh:
-#     host: "mm.company.com"
+#     host: "mattermost.example.com"
 #     user: "root"
 #     password_env: "MM_SSH_PASSWORD"
 #   config_path: "/opt/mattermost/config/config.json"
 #
 # matrix:
 #   ssh:
-#     host: "matrix.company.com"
+#     host: "matrix.example.com"
 #     user: "root"
 #     password_env: "MX_SSH_PASSWORD"
 #   auth:
 #     username: "admin"
 #     password_env: "MATRIX_ADMIN_PASSWORD"
-#   homeserver: "company.com"
+#   homeserver: "example.com"
 
 
 # Example 4: GitLab-bundled Mattermost -> Element Server Suite (no SSH on either side)
@@ -429,15 +429,15 @@ data:
 # matrix:
 #   ssh: {}                                  # direct mode
 #   api:
-#     base_url: "https://matrix.company.com"
+#     base_url: "https://matrix.example.com"
 #     admin_token_env: "MATRIX_ADMIN_TOKEN"
-#   homeserver: "company.com"
+#   homeserver: "example.com"
 #   appservice:
 #     enabled: true                          # needed for timestamps and DMs
 #     as_token_env: "MATRIX_AS_TOKEN"
 #   mas:
 #     enabled: true
-#     endpoint: "https://account.company.com"
+#     endpoint: "https://account.example.com"
 #     client_id_env: "MAS_CLIENT_ID"
 #     client_secret_env: "MAS_CLIENT_SECRET"
 #   import:

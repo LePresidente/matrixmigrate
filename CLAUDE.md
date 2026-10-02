@@ -73,7 +73,8 @@ Artifacts under `data/` (paths from `DataConfig`):
 |---|---|
 | `assets/mattermost-{assets,memberships,messages}-<ts>.json.gz` | export steps |
 | `mappings/asset-mapping-<ts>.json` | `import_assets` |
-| `mappings/message-mapping-<ts>.json` | `import_messages` |
+| `mappings/message-mapping-<ts>.json` | `import_messages` (also records which attachments were sent) |
+| `mappings/history-joins.json` | `import_messages` and `import leave-rooms`: journal of memberships created only to replay history, so an interrupted run can withdraw them later |
 | `assets/message-errors-<ts>.log` | `import_messages`, on failures |
 | `state.json` | every step |
 
