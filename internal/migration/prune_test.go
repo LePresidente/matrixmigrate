@@ -294,14 +294,18 @@ func TestPruneMappingFilesDoesNotTreatTheDirectoryAsAPattern(t *testing.T) {
 	assertAllExist(t, sibling, names...)
 }
 
-func TestImportAssetsPrunesOldAssetMappings(t *testing.T) {
+// newAssetImportFixture is an orchestrator ready to run ImportAssets for one public channel
+// against a fake homeserver, with data.keep_mappings set to keep. It returns the orchestrator
+// and its mappings directory.
+func newAssetImportFixture(t *testing.T, keep int) (*Orchestrator, string) {
+	t.Helper()
 	dir := t.TempDir()
 	cfg := &config.Config{}
 	cfg.Data = config.DataConfig{
 		AssetsDir:    filepath.Join(dir, "assets"),
 		MappingsDir:  filepath.Join(dir, "mappings"),
 		StateFile:    filepath.Join(dir, "state.json"),
-		KeepMappings: 2,
+		KeepMappings: keep,
 	}
 	cfg.Matrix.Homeserver = "example.com"
 	for _, d := range []string{cfg.Data.AssetsDir, cfg.Data.MappingsDir} {
@@ -316,17 +320,6 @@ func TestImportAssetsPrunesOldAssetMappings(t *testing.T) {
 	if err := archive.SaveGzipJSON(assetFile, assets); err != nil {
 		t.Fatal(err)
 	}
-	oldAssetMappings := []string{
-		"asset-mapping-20200101-000000.json",
-		"asset-mapping-20200102-000000.json",
-		"asset-mapping-20200103-000000.json",
-	}
-	for _, name := range oldAssetMappings {
-		if err := SaveMapping(NewMapping("example.com"), filepath.Join(cfg.Data.MappingsDir, name)); err != nil {
-			t.Fatal(err)
-		}
-	}
-	writeFiles(t, cfg.Data.MappingsDir, emptyMessageMapping, "message-mapping-20200101-000000.json")
 	state := NewMigrationState()
 	state.CompleteStep(StepExportAssets, assetFile)
 
@@ -345,6 +338,30 @@ func TestImportAssetsPrunesOldAssetMappings(t *testing.T) {
 		tunnelManager: ssh.NewTunnelManager(),
 		mxClient:      matrix.NewClientWithRateLimit(srv.URL, "admin-token", "example.com", matrix.RateLimitConfig{}),
 	}
+	return o, cfg.Data.MappingsDir
+}
+
+var oldAssetMappings = []string{
+	"asset-mapping-20200101-000000.json",
+	"asset-mapping-20200102-000000.json",
+	"asset-mapping-20200103-000000.json",
+}
+
+// saveAssetMappings writes an empty, loadable asset mapping under each name in dir.
+func saveAssetMappings(t *testing.T, dir string, names ...string) {
+	t.Helper()
+	for _, name := range names {
+		if err := SaveMapping(NewMapping("example.com"), filepath.Join(dir, name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestImportAssetsPrunesOldAssetMappings(t *testing.T) {
+	o, mappingsDir := newAssetImportFixture(t, 2)
+	saveAssetMappings(t, mappingsDir, oldAssetMappings...)
+	writeFiles(t, mappingsDir, emptyMessageMapping, "message-mapping-20200101-000000.json")
+
 	result, err := o.ImportAssets(nil)
 	if err != nil {
 		t.Fatal(err)
@@ -356,7 +373,35 @@ func TestImportAssetsPrunesOldAssetMappings(t *testing.T) {
 		"message-mapping-20200101-000000.json",
 	}
 	sort.Strings(want)
-	if got := fileNames(t, cfg.Data.MappingsDir); !reflect.DeepEqual(got, want) {
+	if got := fileNames(t, mappingsDir); !reflect.DeepEqual(got, want) {
 		t.Errorf("files left = %v, want %v", got, want)
 	}
+}
+
+func TestImportAssetsDoesNotPruneWhenAnotherMappingSortsLast(t *testing.T) {
+	o, mappingsDir := newAssetImportFixture(t, 1)
+	saveAssetMappings(t, mappingsDir, oldAssetMappings...)
+	saveAssetMappings(t, mappingsDir, "asset-mapping-29990101-000000.json")
+
+	if _, err := o.ImportAssets(nil); err != nil {
+		t.Fatal(err)
+	}
+
+	assertAllExist(t, mappingsDir, oldAssetMappings...)
+	assertAllExist(t, mappingsDir, "asset-mapping-29990101-000000.json")
+}
+
+func TestInterruptedAssetImportPrunesNothing(t *testing.T) {
+	o, mappingsDir := newAssetImportFixture(t, 1)
+	saveAssetMappings(t, mappingsDir, oldAssetMappings...)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	o.SetContext(ctx)
+
+	_, err := o.ImportAssets(nil)
+	if !errors.Is(err, ErrInterrupted) {
+		t.Fatalf("ImportAssets error = %v, want ErrInterrupted", err)
+	}
+
+	assertAllExist(t, mappingsDir, oldAssetMappings...)
 }
