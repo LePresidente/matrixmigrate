@@ -71,9 +71,6 @@ type Model struct {
 	// Operation result for detailed stats
 	operationResult *migration.OperationResult
 
-	// Program reference for sending messages from goroutines
-	program *tea.Program
-
 	// ctx is the parent of every step's context; cancelling it stops a running step.
 	ctx context.Context
 

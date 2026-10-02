@@ -188,11 +188,6 @@ func loadConfig() (*config.Config, error) {
 	return cfg, nil
 }
 
-// printError prints an error message
-func printError(format string, args ...interface{}) {
-	fmt.Fprintf(os.Stderr, "Error: "+format+"\n", args...)
-}
-
 // printSuccess prints a success message
 func printSuccess(format string, args ...interface{}) {
 	fmt.Printf("✓ "+format+"\n", args...)
