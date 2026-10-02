@@ -87,6 +87,7 @@ messages:
   migration_failed: "Taşıma başarısız oldu"
   migration_cancelled: "Taşıma iptal edildi"
   interrupt_received: "Kesme sinyali alındı - mevcut öğe tamamlanıyor ve ilerleme kaydediliyor. Hemen durdurmak için Ctrl+C'ye tekrar basın."
+  interrupted_exit: "Kesme sinyaliyle durduruldu: çağıran betik bir sonraki adıma geçmesin diye hata durumuyla çıkılıyor."
   step_stopping: "Durduruluyor - mevcut öğenin bitmesi bekleniyor ve ilerleme kaydediliyor..."
   step_stop_hint: "Lütfen bekleyin... (ctrl+c: bu adımı durdur)"
   step_interrupted: "Adım yarıda kesildi. Şu ana kadarki ilerleme kaydedildi; devam etmek için adımı yeniden çalıştırın."

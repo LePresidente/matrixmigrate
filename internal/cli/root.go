@@ -13,6 +13,7 @@ import (
 
 	"github.com/aligundogdu/matrixmigrate/internal/config"
 	"github.com/aligundogdu/matrixmigrate/internal/i18n"
+	"github.com/aligundogdu/matrixmigrate/internal/migration"
 	"github.com/aligundogdu/matrixmigrate/internal/tui"
 	"github.com/aligundogdu/matrixmigrate/internal/version"
 )
@@ -89,11 +90,13 @@ Examples:
 
 // Execute runs the root command.
 //
-// SIGINT and SIGTERM cancel the context the commands run under: an import step then finishes
-// the item in flight, saves its progress and returns migration.ErrInterrupted. A second signal
-// gets the default behaviour and kills the process at once.
+// SIGINT, SIGTERM and SIGHUP (a dropped SSH session) cancel the context the commands run
+// under: an import step then finishes the item in flight, saves its progress and returns
+// migration.ErrInterrupted. A second signal gets the default behaviour and kills the process at
+// once. A command that runs to the end regardless, such as an export, still exits non-zero
+// after a signal, so a calling script stops rather than starting the next step.
 func Execute() error {
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	defer stop()
 
 	// Closed before the deferred stop() runs, so the cancellation stop() causes on a normal
@@ -102,7 +105,22 @@ func Execute() error {
 	defer close(finished)
 	go announceInterrupt(ctx, stop, finished, os.Stderr)
 
-	return rootCmd.ExecuteContext(ctx)
+	err := rootCmd.ExecuteContext(ctx)
+	// Only a signal cancels ctx before this point: stop() runs on the first signal or on return.
+	result := interruptedExit(ctx.Err() != nil, err)
+	if err == nil && result != nil {
+		fmt.Fprintf(os.Stderr, "⚠ %s\n", i18n.T("messages.interrupted_exit"))
+	}
+	return result
+}
+
+// interruptedExit is the result of a run: err unchanged, except that a command that returned
+// nil after a signal reports ErrInterrupted.
+func interruptedExit(signalled bool, err error) error {
+	if err != nil || !signalled {
+		return err
+	}
+	return fmt.Errorf("stopped by a signal: %w", migration.ErrInterrupted)
 }
 
 // tuiRunning is set while the TUI owns the terminal. The TUI reports an interrupt itself;

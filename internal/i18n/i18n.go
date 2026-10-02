@@ -120,6 +120,7 @@ type MessageStrings struct {
 	MigrationFailed             string `yaml:"migration_failed"`
 	MigrationCancelled          string `yaml:"migration_cancelled"`
 	InterruptReceived           string `yaml:"interrupt_received"`
+	InterruptedExit             string `yaml:"interrupted_exit"`
 	StepStopping                string `yaml:"step_stopping"`
 	StepStopHint                string `yaml:"step_stop_hint"`
 	StepInterrupted             string `yaml:"step_interrupted"`
@@ -530,6 +531,8 @@ func getMessageString(l *Locale, key string) string {
 		return l.Messages.MigrationCancelled
 	case "interrupt_received":
 		return l.Messages.InterruptReceived
+	case "interrupted_exit":
+		return l.Messages.InterruptedExit
 	case "step_stopping":
 		return l.Messages.StepStopping
 	case "step_stop_hint":

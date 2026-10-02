@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/aligundogdu/matrixmigrate/internal/i18n"
+	"github.com/aligundogdu/matrixmigrate/internal/migration"
 )
 
 func TestAnnounceInterruptPrintsOnceAndRestoresDefaultHandling(t *testing.T) {
@@ -115,5 +117,23 @@ func TestAnnounceInterruptSilentWhileTUIRunning(t *testing.T) {
 	}
 	if out.Len() != 0 {
 		t.Errorf("printed %q while the TUI was running", out.String())
+	}
+}
+
+// A command that finished after a signal - an export, which is not interruptible - must still
+// exit non-zero, so a wrapper script stops instead of starting the next step.
+func TestInterruptedExit(t *testing.T) {
+	if err := interruptedExit(true, nil); !errors.Is(err, migration.ErrInterrupted) {
+		t.Errorf("signal + nil: got %v, want an error wrapping ErrInterrupted", err)
+	}
+	if err := interruptedExit(false, nil); err != nil {
+		t.Errorf("no signal + nil: got %v, want nil", err)
+	}
+	other := errors.New("boom")
+	if err := interruptedExit(true, other); err != other {
+		t.Errorf("signal + error: got %v, want that error unchanged", err)
+	}
+	if err := interruptedExit(false, other); err != other {
+		t.Errorf("no signal + error: got %v, want that error unchanged", err)
 	}
 }

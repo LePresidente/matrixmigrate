@@ -87,6 +87,7 @@ messages:
   migration_failed: "Migration failed"
   migration_cancelled: "Migration cancelled"
   interrupt_received: "Interrupt received - finishing the current item and saving progress. Press Ctrl+C again to abort immediately."
+  interrupted_exit: "Stopped by the interrupt: exiting with an error status so a calling script does not go on to the next step."
   step_stopping: "Stopping - waiting for the current item to finish and saving progress..."
   step_stop_hint: "Please wait... (ctrl+c: stop this step)"
   step_interrupted: "The step was interrupted. Progress so far has been saved; run the step again to resume."
