@@ -310,6 +310,13 @@ type DataConfig struct {
 	AssetsDir   string `mapstructure:"assets_dir"`
 	MappingsDir string `mapstructure:"mappings_dir"`
 	StateFile   string `mapstructure:"state_file"`
+
+	// KeepMappings is how many asset-mapping and message-mapping files to keep in
+	// MappingsDir, counted per kind, newest first. Older ones are deleted once the step that
+	// writes that kind has completed. 0 (the default) keeps every file: a message mapping
+	// grows with the instance and a new one is written per run, so an unattended nightly
+	// sync fills the disk unless this is set.
+	KeepMappings int `mapstructure:"keep_mappings"`
 }
 
 // Load loads configuration from the specified file or default locations
@@ -398,6 +405,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("data.assets_dir", "./data/assets")
 	v.SetDefault("data.mappings_dir", "./data/mappings")
 	v.SetDefault("data.state_file", "./data/state.json")
+	v.SetDefault("data.keep_mappings", 0) // 0 = keep every mapping file
 }
 
 // loadDefaults creates a config with default values
@@ -582,6 +590,10 @@ func (c *Config) Validate() error {
 	}
 	if c.GetFileMode() == "upload" && c.Mattermost.Files.LocalDataPath == "" {
 		return fmt.Errorf("mattermost.files.local_data_path is required when mattermost.files.mode is \"upload\"")
+	}
+
+	if c.Data.KeepMappings < 0 {
+		return fmt.Errorf("data.keep_mappings must be 0 (keep every mapping file) or a positive number of files to keep, got %d", c.Data.KeepMappings)
 	}
 
 	// Validate the database sslmode against what lib/pq accepts, rather than letting an
